@@ -1,0 +1,36 @@
+# ── Wine: runtime + third-party source/build trees (not part of this project) ──
+/wine
+/wine-src/
+/wine-build/
+/wine-stock/
+/wine-custom/
+/wine-staging-src/
+
+# Convenience symlinks created by setup.sh (point into wine/)
+/bin
+/lib
+/share
+
+# ── Build artifacts (build from source with `make`) ──
+
+
+steamwebhelper_wrapper.exe
+/Mist.app/
+/dist/
+*.dylib
+
+# ── Kept local, intentionally NOT published ───────────────────────────
+# Anti-cheat circumvention code + anything documenting it.
+/patches/
+proc_emulator.c
+proc_emulator.dylib
+/launch-eac-debug.sh
+/EAC_PORTING_STATUS.md
+/tests/
+/ARCHITECTURE.md
+/REVIEW.md
+
+# ── macOS junk / logs ──
+.DS_Store
+*.swp
+*.log
