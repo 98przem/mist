@@ -91,8 +91,8 @@ mist_wait_wineserver() {
 }
 
 # Set up (once) and select a dedicated GPTK/D3DMetal Wine prefix in GPTK_PREFIX.
-# GPTK ships Wine 7.7; giving it its own prefix means it never reconfigures the
-# bundled Wine 11.7 prefix (no version churn) and the bundled prefix's DXVK
+# GPTK ships its own Wine; giving it its own prefix means it never reconfigures
+# the bundled CX Wine prefix (no version churn) and the bundled prefix's DXVK
 # overrides can't leak in. The Steam + Epic game libraries are symlinked in so
 # games are shared (no re-download) and keep the same C:\ paths.
 # Args: $1 = bundled/shared WINEPREFIX, $2 = GPTK wine64 binary. Sets GPTK_PREFIX.

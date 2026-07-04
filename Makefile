@@ -62,17 +62,8 @@ bundle: wrapper
 	@echo '<key>CFBundleVersion</key><string>2.0</string>' >> "$(BUNDLE_CONTENTS)/Info.plist"
 	@echo '<key>NSAppleEventsUsageDescription</key><string>Mist needs accessibility to dismiss game dialogs.</string>' >> "$(BUNDLE_CONTENTS)/Info.plist"
 	@echo '</dict></plist>' >> "$(BUNDLE_CONTENTS)/Info.plist"
-	# Copy runtime resources
-	cp common.sh "$(BUNDLE_RESOURCES)/"
-	cp launch-steam.sh "$(BUNDLE_RESOURCES)/"
-	cp launch-steam-game.sh "$(BUNDLE_RESOURCES)/"
-	cp launch-steam-gptk.sh "$(BUNDLE_RESOURCES)/"
-	cp launch-epic-game.sh "$(BUNDLE_RESOURCES)/"
-	cp setup.sh "$(BUNDLE_RESOURCES)/"
-	cp dismiss-dialogs.sh "$(BUNDLE_RESOURCES)/"
+	# Copy runtime resources (webhelper wrapper only — all setup/launch logic is native Swift)
 	cp steamwebhelper_wrapper.exe "$(BUNDLE_RESOURCES)/"
-	cp mist "$(BUNDLE_RESOURCES)/mist"
-	chmod +x "$(BUNDLE_RESOURCES)"/*.sh "$(BUNDLE_RESOURCES)/mist"
 	# Ad-hoc code sign
 	codesign --force --deep -s - "$(BUNDLE)"
 	@echo ""
