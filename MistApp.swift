@@ -2295,6 +2295,77 @@ struct SetupView: View {
     }
 }
 
+// A single sidebar entry: colored icon tile, label, optional trailing count
+// badge or "needs attention" dot, with its own hover + selected background.
+struct SidebarRow: View {
+    let title: String
+    let systemImage: String
+    let tint: Color
+    var count: Int? = nil
+    var needsAttention: Bool = false
+    let isSelected: Bool
+    let action: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(tint.gradient)
+                        .frame(width: 26, height: 26)
+                    Image(systemName: systemImage)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(.white)
+                }
+                Text(title)
+                    .font(.system(size: 13, weight: isSelected ? .semibold : .regular))
+                    .foregroundColor(.primary)
+                Spacer(minLength: 4)
+                if needsAttention {
+                    Circle()
+                        .fill(.orange)
+                        .frame(width: 6, height: 6)
+                }
+                if let count {
+                    Text("\(count)")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(.secondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.primary.opacity(0.06))
+                        .clipShape(Capsule())
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(isSelected ? Color.accentColor.opacity(0.16)
+                          : (isHovering ? Color.primary.opacity(0.05) : .clear))
+            )
+        }
+        .buttonStyle(.plain)
+        .focusEffectDisabled()
+        .onHover { isHovering = $0 }
+    }
+}
+
+struct SidebarSectionLabel: View {
+    let title: String
+    var body: some View {
+        Text(title.uppercased())
+            .font(.system(size: 10.5, weight: .semibold))
+            .tracking(0.6)
+            .foregroundColor(.secondary)
+            .padding(.horizontal, 8)
+            .padding(.top, 14)
+            .padding(.bottom, 2)
+    }
+}
+
 struct SidebarView: View {
     @Binding var selection: String?
     let steamCount: Int
@@ -2303,44 +2374,47 @@ struct SidebarView: View {
     let steamLoggedIn: Bool
 
     var body: some View {
-        List(selection: $selection) {
-            Section("Library") {
-                Label("All Games", systemImage: "gamecontroller.fill")
-                    .tag("all")
-                Label("Steam (\(steamCount))", systemImage: "cloud.fill")
-                    .tag("steam")
-                Label {
-                    HStack {
-                        Text("Epic (\(epicCount))")
-                        if !epicLoggedIn {
-                            Circle()
-                                .fill(.orange)
-                                .frame(width: 6, height: 6)
-                        }
-                    }
-                } icon: {
-                    Image(systemName: "bolt.fill")
+        VStack(alignment: .leading, spacing: 0) {
+            // Brand header
+            HStack(spacing: 8) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(LinearGradient(colors: [.purple, .blue], startPoint: .topLeading, endPoint: .bottomTrailing))
+                        .frame(width: 28, height: 28)
+                    Image(systemName: "cloud.fog.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(.white)
                 }
-                .tag("epic")
+                Text("Mist")
+                    .font(.system(size: 16, weight: .bold))
+                Spacer()
             }
+            .padding(.horizontal, 10)
+            .padding(.top, 10)
+            .padding(.bottom, 4)
 
-            Section {
-                Label {
-                    HStack {
-                        Text("Settings")
-                        if !steamLoggedIn || !epicLoggedIn {
-                            Circle()
-                                .fill(.orange)
-                                .frame(width: 6, height: 6)
-                        }
-                    }
-                } icon: {
-                    Image(systemName: "gearshape")
-                }
-                .tag("settings")
+            SidebarSectionLabel(title: "Library")
+            VStack(spacing: 2) {
+                SidebarRow(title: "All Games", systemImage: "square.grid.2x2.fill", tint: .indigo,
+                          isSelected: selection == "all") { selection = "all" }
+                SidebarRow(title: "Steam", systemImage: "cloud.fill", tint: .blue, count: steamCount,
+                          isSelected: selection == "steam") { selection = "steam" }
+                SidebarRow(title: "Epic", systemImage: "bolt.fill", tint: .purple, count: epicCount,
+                          needsAttention: !epicLoggedIn, isSelected: selection == "epic") { selection = "epic" }
             }
+            .padding(.horizontal, 8)
+
+            Spacer()
+            Divider()
+            VStack(spacing: 2) {
+                SidebarRow(title: "Settings", systemImage: "gearshape.fill", tint: .gray,
+                          needsAttention: !steamLoggedIn || !epicLoggedIn,
+                          isSelected: selection == "settings") { selection = "settings" }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 8)
         }
-        .listStyle(.sidebar)
+        .background(.thinMaterial)
     }
 }
 
