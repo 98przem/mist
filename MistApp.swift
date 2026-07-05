@@ -1088,6 +1088,63 @@ enum MistManifest {
     }
 }
 
+// Per-game preferences (currently just custom launch arguments), keyed by
+// Game.id (appid for Steam, app_name for Epic). Separate from MistManifest
+// since it applies to every game, not just ones Mist itself installed.
+private struct GameLaunchSettings: Codable {
+    var customArgs: String = ""
+}
+
+enum GameSettingsStore {
+    private static var fileURL: URL {
+        MistEnv.supportDir.appendingPathComponent("game_settings.json")
+    }
+
+    private static func load() -> [String: GameLaunchSettings] {
+        guard let data = try? Data(contentsOf: fileURL),
+              let dict = try? JSONDecoder().decode([String: GameLaunchSettings].self, from: data) else { return [:] }
+        return dict
+    }
+
+    private static func save(_ dict: [String: GameLaunchSettings]) {
+        guard let data = try? JSONEncoder().encode(dict) else { return }
+        try? FileManager.default.createDirectory(at: MistEnv.supportDir, withIntermediateDirectories: true)
+        try? data.write(to: fileURL)
+    }
+
+    static func customArgs(for gameID: String) -> String {
+        load()[gameID]?.customArgs ?? ""
+    }
+
+    static func setCustomArgs(_ args: String, for gameID: String) {
+        var dict = load()
+        var entry = dict[gameID] ?? GameLaunchSettings()
+        entry.customArgs = args
+        dict[gameID] = entry
+        save(dict)
+    }
+
+    // Naive shell-style tokenizer: splits on whitespace, honoring double quotes
+    // for args containing spaces (e.g. custom paths). Good enough for the
+    // simple flag-style arguments games typically take.
+    static func tokenize(_ args: String) -> [String] {
+        var tokens: [String] = []
+        var current = ""
+        var inQuotes = false
+        for char in args {
+            if char == "\"" {
+                inQuotes.toggle()
+            } else if char.isWhitespace && !inQuotes {
+                if !current.isEmpty { tokens.append(current); current = "" }
+            } else {
+                current.append(char)
+            }
+        }
+        if !current.isEmpty { tokens.append(current) }
+        return tokens
+    }
+}
+
 final class SteamDownloadManager: ObservableObject {
     @Published var isDownloading = false
     @Published var downloadingAppID: String?
@@ -1547,7 +1604,7 @@ class ProcessManager: ObservableObject {
                     "launch", game.id,
                     "--wine", wineBin,
                     "--wine-prefix", MistEnv.winePrefix.path,
-                ], env: env)
+                ] + GameSettingsStore.tokenize(GameSettingsStore.customArgs(for: game.id)), env: env)
             }
         }
     }
@@ -1566,7 +1623,8 @@ class ProcessManager: ObservableObject {
         env["EOS_USE_ANTICHEATCLIENTNULL"] = "1"
         env["DOTNET_EnableWriteXorExecute"] = "0"
         MistEnv.killWineserver()
-        runProcess(path: MistEnv.wineBinary.path, arguments: [exe], env: env,
+        let args = [exe] + GameSettingsStore.tokenize(GameSettingsStore.customArgs(for: game.id))
+        runProcess(path: MistEnv.wineBinary.path, arguments: args, env: env,
                    cwd: URL(fileURLWithPath: exe).deletingLastPathComponent())
         startDialogKiller()
     }
@@ -1624,7 +1682,8 @@ class ProcessManager: ObservableObject {
             return
         }
         outputLog += "Exe: \(exe)\nRenderer: D3DMetal (GPTK)\n\n"
-        runProcess(path: gptkWinePath, arguments: [exe], env: env,
+        let args = [exe] + GameSettingsStore.tokenize(GameSettingsStore.customArgs(for: game.id))
+        runProcess(path: gptkWinePath, arguments: args, env: env,
                    cwd: URL(fileURLWithPath: exe).deletingLastPathComponent())
         startDialogKiller()
     }
@@ -2993,6 +3052,71 @@ struct QuickInstallButton: View {
     }
 }
 
+struct LaunchOptionsView: View {
+    let game: Game
+    let onShowInFinder: () -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var customArgs: String
+
+    init(game: Game, onShowInFinder: @escaping () -> Void) {
+        self.game = game
+        self.onShowInFinder = onShowInFinder
+        _customArgs = State(initialValue: GameSettingsStore.customArgs(for: game.id))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Launch Options")
+                        .font(.title2.bold())
+                    Text(game.name)
+                        .font(.callout)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                Button("Done") {
+                    GameSettingsStore.setCustomArgs(customArgs, for: game.id)
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Custom Launch Arguments")
+                    .font(.subheadline.weight(.semibold))
+                TextField("e.g. -window -novid", text: $customArgs)
+                    .textFieldStyle(.roundedBorder)
+                Text("Passed directly to the game's executable on launch.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Install Location")
+                    .font(.subheadline.weight(.semibold))
+                HStack {
+                    Text(game.installDir)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .textSelection(.enabled)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                    Spacer()
+                    Button("Show in Finder", action: onShowInFinder)
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                }
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(24)
+        .frame(width: 440, height: 260)
+    }
+}
+
 struct RunningGameView: View {
     @ObservedObject var processManager: ProcessManager
     let onDismiss: () -> Void
@@ -3365,6 +3489,11 @@ struct ContentView: View {
             Button("Cancel", role: .cancel) { pendingUninstall = nil }
         } message: {
             Text("This deletes the game's installed files from disk. You can reinstall it later.")
+        }
+        .sheet(item: $gameForLaunchOptions) { game in
+            LaunchOptionsView(game: game, onShowInFinder: {
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: game.installDir)])
+            })
         }
     }
 }
