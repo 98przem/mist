@@ -1251,13 +1251,64 @@ final class SteamDownloadManager: ObservableObject {
         }
     }
 
+    // Workshop items download through the exact same DepotDownloader session
+    // (QR/reuse/watchdog logic all shared via runDepotDownloader below) — the only
+    // difference is the "-pubfile" flag instead of a plain app download, and a
+    // workshop-shaped destination folder instead of steamapps/common.
+    //
+    // Caveat: this places files where Steam's own client would (steamapps/workshop/
+    // content/<appid>/<pubfileid>/), but whether a given game actually reads mods
+    // from there is entirely up to that game — many query Steam's ISteamUGC API at
+    // runtime instead of scanning the folder directly, and Mist doesn't (and can't,
+    // without running a real Steam client) implement that API. Works for games that
+    // load workshop content straight off disk; does nothing for ones that don't.
+    func installWorkshopItem(appid: String, pubfileID: String, gameName: String,
+                              steamAccountName: String, onComplete: @escaping () -> Void) {
+        guard !isDownloading else { return }
+        isDownloading = true
+        downloadingAppID = appid
+        downloadingName = "\(gameName) — Workshop Item \(pubfileID)"
+        downloadError = nil
+        downloadQRURL = nil
+        downloadQRImage = nil
+        downloadProgress = nil
+        downloadStatusText = "Preparing…"
+        connectionRetryCount = 0
+
+        Task {
+            do {
+                try await DepotDownloaderManager.ensureInstalled { [weak self] status in
+                    Task { @MainActor in self?.downloadStatusText = status }
+                }
+                await MainActor.run {
+                    self.runDepotDownloader(appid: appid, name: downloadingName ?? gameName,
+                                            steamAccountName: steamAccountName, pubfileID: pubfileID,
+                                            onComplete: onComplete)
+                }
+            } catch {
+                await MainActor.run {
+                    self.isDownloading = false
+                    self.downloadingAppID = nil
+                    self.downloadingName = nil
+                    self.downloadError = error.localizedDescription
+                }
+            }
+        }
+    }
+
     private func runDepotDownloader(appid: String, name: String, steamAccountName: String,
-                                    forceQR: Bool = false, onComplete: @escaping () -> Void) {
+                                    forceQR: Bool = false, pubfileID: String? = nil,
+                                    onComplete: @escaping () -> Void) {
         let tool = DepotDownloaderManager.installPath.path
         downloadStatusText = "Starting download…"
 
-        let safeName = name.replacingOccurrences(of: "/", with: "-")
-        let installDir = steamAppsDir.appendingPathComponent("common").appendingPathComponent(safeName)
+        let installDir: URL
+        if let pubfileID {
+            installDir = steamAppsDir.appendingPathComponent("workshop/content/\(appid)/\(pubfileID)")
+        } else {
+            let safeName = name.replacingOccurrences(of: "/", with: "-")
+            installDir = steamAppsDir.appendingPathComponent("common").appendingPathComponent(safeName)
+        }
         try? FileManager.default.createDirectory(at: installDir, withIntermediateDirectories: true)
 
         // Try to reuse DepotDownloader's own cached session (see
@@ -1270,7 +1321,8 @@ final class SteamDownloadManager: ObservableObject {
         // with no stdin to satisfy it. The watchdog below detects that stall and
         // falls back to -qr rather than hanging the UI forever.
         let reuse = !forceQR && Self.canReuseSession(for: steamAccountName)
-        let args: [String]
+        let pubfileArgs = pubfileID.map { ["-pubfile", $0] } ?? []
+        var args: [String]
         if reuse {
             args = ["-app", appid, "-os", "windows", "-dir", installDir.path,
                     "-username", steamAccountName, "-remember-password"]
@@ -1278,6 +1330,7 @@ final class SteamDownloadManager: ObservableObject {
         } else {
             args = ["-app", appid, "-os", "windows", "-dir", installDir.path, "-remember-password", "-qr"]
         }
+        args += pubfileArgs
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: tool)
@@ -1399,7 +1452,7 @@ final class SteamDownloadManager: ObservableObject {
 
                 if fallingBackToQR {
                     self.runDepotDownloader(appid: appid, name: name, steamAccountName: steamAccountName,
-                                            forceQR: true, onComplete: onComplete)
+                                            forceQR: true, pubfileID: pubfileID, onComplete: onComplete)
                     return
                 }
 
@@ -1413,9 +1466,11 @@ final class SteamDownloadManager: ObservableObject {
                     self.connectionRetryCount = 0
                     self.downloadStatusText = "Done!"
                     Self.markSessionReusable(for: steamAccountName)
-                    let size = Self.directorySize(installDir)
-                    MistManifest.add(MistInstalledGame(appid: appid, name: name, installDir: installDir.path, sizeBytes: size),
-                                     steamAppsDir: self.steamAppsDir)
+                    if pubfileID == nil {
+                        let size = Self.directorySize(installDir)
+                        MistManifest.add(MistInstalledGame(appid: appid, name: name, installDir: installDir.path, sizeBytes: size),
+                                         steamAppsDir: self.steamAppsDir)
+                    }
                     onComplete()
                     return
                 }
@@ -1430,7 +1485,7 @@ final class SteamDownloadManager: ObservableObject {
                     Self.forgetReusableSession(for: steamAccountName)
                     self.downloadStatusText = "Saved session no longer valid — scan again…"
                     self.runDepotDownloader(appid: appid, name: name, steamAccountName: steamAccountName,
-                                            forceQR: true, onComplete: onComplete)
+                                            forceQR: true, pubfileID: pubfileID, onComplete: onComplete)
                 } else if looksLikeConnectionHiccup && self.connectionRetryCount < self.maxConnectionRetries {
                     self.connectionRetryCount += 1
                     self.downloadStatusText = "Steam connection hiccup — retrying (\(self.connectionRetryCount)/\(self.maxConnectionRetries))…"
@@ -1439,7 +1494,7 @@ final class SteamDownloadManager: ObservableObject {
                     self.downloadProgress = nil
                     DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
                         self.runDepotDownloader(appid: appid, name: name, steamAccountName: steamAccountName,
-                                                onComplete: onComplete)
+                                                pubfileID: pubfileID, onComplete: onComplete)
                     }
                 } else {
                     self.isDownloading = false
@@ -2065,6 +2120,7 @@ struct GameCardView: View {
     var onUninstall: () -> Void = {}
     var onShowInFinder: () -> Void = {}
     var onLaunchOptions: () -> Void = {}
+    var onInstallWorkshopItem: () -> Void = {}
 
     @State private var isHovering = false
 
@@ -2120,6 +2176,11 @@ struct GameCardView: View {
                 }
                 Button(action: onLaunchOptions) {
                     Label("Launch Options…", systemImage: "slider.horizontal.3")
+                }
+                if game.source == .steam {
+                    Button(action: onInstallWorkshopItem) {
+                        Label("Install Workshop Item…", systemImage: "shippingbox")
+                    }
                 }
                 Divider()
                 Button(role: .destructive, action: onUninstall) {
@@ -2190,6 +2251,11 @@ struct GameCardView: View {
             }
             Button(action: onLaunchOptions) {
                 Label("Launch Options…", systemImage: "slider.horizontal.3")
+            }
+            if game.source == .steam {
+                Button(action: onInstallWorkshopItem) {
+                    Label("Install Workshop Item…", systemImage: "shippingbox")
+                }
             }
             Divider()
             Button(role: .destructive, action: onUninstall) {
@@ -2522,6 +2588,7 @@ struct GameGridView: View {
     var onUninstall: (Game) -> Void = { _ in }
     var onShowInFinder: (Game) -> Void = { _ in }
     var onLaunchOptions: (Game) -> Void = { _ in }
+    var onInstallWorkshopItem: (Game) -> Void = { _ in }
 
     @State private var sortOrder: GameSortOrder = .installedFirst
 
@@ -2594,7 +2661,8 @@ struct GameGridView: View {
                                 onInstall: { onInstall(g) },
                                 onUninstall: { onUninstall(g) },
                                 onShowInFinder: { onShowInFinder(g) },
-                                onLaunchOptions: { onLaunchOptions(g) }
+                                onLaunchOptions: { onLaunchOptions(g) },
+                                onInstallWorkshopItem: { onInstallWorkshopItem(g) }
                             )
                         }
                     }
@@ -3126,6 +3194,75 @@ struct LaunchOptionsView: View {
     }
 }
 
+struct WorkshopInstallView: View {
+    let game: Game
+    let onInstall: (String) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var input: String = ""
+
+    // Accepts either a bare numeric ID or a full workshop URL
+    // (steamcommunity.com/sharedfiles/filedetails/?id=<N>).
+    static func extractPubfileID(from input: String) -> String? {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if !trimmed.isEmpty, trimmed.allSatisfy(\.isNumber) { return trimmed }
+        if let comps = URLComponents(string: trimmed),
+           let idValue = comps.queryItems?.first(where: { $0.name == "id" })?.value,
+           !idValue.isEmpty, idValue.allSatisfy(\.isNumber) {
+            return idValue
+        }
+        return nil
+    }
+
+    private var extractedID: String? { Self.extractPubfileID(from: input) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Install Workshop Item")
+                        .font(.title2.bold())
+                    Text(game.name)
+                        .font(.callout)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                Button("Install") {
+                    guard let id = extractedID else { return }
+                    onInstall(id)
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(extractedID == nil)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Workshop URL or Item ID")
+                    .font(.subheadline.weight(.semibold))
+                TextField("e.g. https://steamcommunity.com/sharedfiles/filedetails/?id=123456789",
+                         text: $input)
+                    .textFieldStyle(.roundedBorder)
+                if !input.isEmpty && extractedID == nil {
+                    Text("Couldn't find a workshop item ID in that.")
+                        .font(.caption)
+                        .foregroundColor(.red)
+                }
+            }
+
+            Label(
+                "Downloads to the same folder Steam itself would use. Whether \(game.name) actually loads mods from there depends on the game — some read the Steam Workshop API directly instead of scanning the folder, which Mist doesn't implement.",
+                systemImage: "info.circle"
+            )
+            .font(.caption)
+            .foregroundColor(.secondary)
+
+            Spacer(minLength: 0)
+        }
+        .padding(24)
+        .frame(width: 460, height: 280)
+    }
+}
+
 struct RunningGameView: View {
     @ObservedObject var processManager: ProcessManager
     let onDismiss: () -> Void
@@ -3243,6 +3380,7 @@ struct ContentView: View {
     @State private var searchText = ""
     @State private var pendingUninstall: Game?
     @State private var gameForLaunchOptions: Game?
+    @State private var gameForWorkshopInstall: Game?
 
     init() {
         let lib = GameLibrary()
@@ -3410,6 +3548,9 @@ struct ContentView: View {
                                 },
                                 onLaunchOptions: { game in
                                     gameForLaunchOptions = game
+                                },
+                                onInstallWorkshopItem: { game in
+                                    gameForWorkshopInstall = game
                                 }
                             )
                         }
@@ -3543,6 +3684,14 @@ struct ContentView: View {
             LaunchOptionsView(game: game, onShowInFinder: {
                 NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: game.installDir)])
             })
+        }
+        .sheet(item: $gameForWorkshopInstall) { game in
+            WorkshopInstallView(game: game) { pubfileID in
+                downloadManager.installWorkshopItem(appid: game.id, pubfileID: pubfileID, gameName: game.name,
+                                                    steamAccountName: steamAuth.accountName) {
+                    library.scan()
+                }
+            }
         }
         .focusedSceneValue(\.rescanAction, { library.scan() })
         .focusedSceneValue(\.showSettingsAction, { sidebarSelection = "settings" })
