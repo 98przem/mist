@@ -2320,52 +2320,64 @@ struct SetupView: View {
     @ObservedObject var setup: SetupManager
 
     var body: some View {
-        VStack(spacing: 20) {
-            Image(systemName: "cloud.fog.fill")
-                .font(.system(size: 64))
-                .foregroundColor(.purple)
-
-            Text("Welcome to Mist")
-                .font(.largeTitle.bold())
-
-            Text("Mist needs to download the Wine engine and its runtime libraries.\nThis is a one-time setup (~200 MB).")
-                .multilineTextAlignment(.center)
-                .foregroundColor(.secondary)
-
-            Label("Wine engine (CrossOver 24)",
-                  systemImage: setup.wineInstalled ? "checkmark.circle.fill" : "circle")
-                .foregroundColor(setup.wineInstalled ? .green : .secondary)
-                .font(.callout)
-
-            if setup.isWorking {
-                VStack(spacing: 8) {
-                    if let progress = setup.downloadProgress {
-                        ProgressView(value: progress)
-                            .progressViewStyle(.linear)
-                    } else {
-                        ProgressView()
-                            .progressViewStyle(.linear)
-                    }
-                    Text(setup.statusText)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-                .frame(width: 320)
-            } else {
-                if let err = setup.errorText {
-                    Label(err, systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundColor(.red)
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: 360)
-                }
-                Button(setup.errorText == nil ? "Download & Install" : "Try Again") {
-                    setup.runFullSetup()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.purple)
-                .controlSize(.large)
+        VStack(spacing: 22) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .fill(LinearGradient(colors: [.purple, .blue], startPoint: .topLeading, endPoint: .bottomTrailing))
+                    .frame(width: 72, height: 72)
+                Image(systemName: "cloud.fog.fill")
+                    .font(.system(size: 32, weight: .medium))
+                    .foregroundColor(.white)
             }
+            .shadow(color: .purple.opacity(0.3), radius: 16, y: 6)
+
+            VStack(spacing: 6) {
+                Text("Welcome to Mist")
+                    .font(.system(size: 26, weight: .bold))
+                Text("Mist needs to download the Wine engine and its runtime libraries.\nThis is a one-time setup (~200 MB).")
+                    .multilineTextAlignment(.center)
+                    .foregroundColor(.secondary)
+            }
+
+            VStack(spacing: 14) {
+                Label("Wine engine (CrossOver 24)",
+                      systemImage: setup.wineInstalled ? "checkmark.circle.fill" : "circle")
+                    .foregroundColor(setup.wineInstalled ? .green : .secondary)
+                    .font(.callout)
+
+                if setup.isWorking {
+                    VStack(spacing: 8) {
+                        if let progress = setup.downloadProgress {
+                            ProgressView(value: progress)
+                                .progressViewStyle(.linear)
+                        } else {
+                            ProgressView()
+                                .progressViewStyle(.linear)
+                        }
+                        Text(setup.statusText)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .frame(width: 320)
+                } else {
+                    if let err = setup.errorText {
+                        Label(err, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundColor(.red)
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: 360)
+                    }
+                    Button(setup.errorText == nil ? "Download & Install" : "Try Again") {
+                        setup.runFullSetup()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.purple)
+                    .controlSize(.large)
+                }
+            }
+            .padding(20)
+            .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(.regularMaterial))
+            .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Color.primary.opacity(0.06)))
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(40)
