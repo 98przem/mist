@@ -2863,7 +2863,7 @@ struct EpicStoreView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
             // Login section
-                GroupBox {
+                Group {
                     VStack(alignment: .leading, spacing: 12) {
                         HStack {
                             Image(systemName: processManager.epicLoggedIn
@@ -2954,9 +2954,6 @@ struct EpicStoreView: View {
                                 .foregroundColor(.red)
                         }
                     }
-                    .padding(4)
-                } label: {
-                    Label("Account", systemImage: "person.fill")
                 }
 
                 // Install game section
@@ -3175,6 +3172,54 @@ struct RunningGameView: View {
     }
 }
 
+struct SettingsCard<Content: View>: View {
+    let title: String
+    let systemImage: String
+    let tint: Color
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(tint.gradient)
+                        .frame(width: 22, height: 22)
+                    Image(systemName: systemImage)
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.white)
+                }
+                Text(title)
+                    .font(.system(size: 13, weight: .semibold))
+            }
+            content
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(.regularMaterial))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Color.primary.opacity(0.06)))
+    }
+}
+
+struct SettingsInfoRow: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        HStack(alignment: .top) {
+            Text(label)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundColor(.secondary)
+                .frame(width: 50, alignment: .leading)
+            Text(value)
+                .font(.system(.caption, design: .monospaced))
+                .textSelection(.enabled)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+    }
+}
+
 struct ContentView: View {
     @StateObject private var library: GameLibrary
     @StateObject private var processManager: ProcessManager
@@ -3257,11 +3302,17 @@ struct ContentView: View {
                             })
                         } else if sidebarSelection == "settings" {
                             ScrollView {
-                                VStack(alignment: .leading, spacing: 20) {
-                                    Text("Settings")
-                                        .font(.largeTitle.bold())
+                                VStack(alignment: .leading, spacing: 16) {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("Settings")
+                                            .font(.system(size: 26, weight: .bold))
+                                        Text("Accounts, storage, and dependencies")
+                                            .font(.callout)
+                                            .foregroundColor(.secondary)
+                                    }
+                                    .padding(.bottom, 4)
 
-                                    GroupBox("Steam Account") {
+                                    SettingsCard(title: "Steam Account", systemImage: "cloud.fill", tint: .blue) {
                                         VStack(alignment: .leading, spacing: 8) {
                                             SteamLoginView(auth: steamAuth)
                                             if let err = library.lastError {
@@ -3270,63 +3321,49 @@ struct ContentView: View {
                                                     .foregroundColor(.red)
                                             }
                                         }
-                                        .padding(4)
                                     }
-                                    .frame(maxWidth: 700)
 
-                                    GroupBox("Epic Account") {
+                                    SettingsCard(title: "Epic Account", systemImage: "bolt.fill", tint: .purple) {
                                         EpicStoreView(processManager: processManager)
-                                            .padding(4)
                                     }
-                                    .frame(maxWidth: 700)
 
-                                    GroupBox("Paths") {
-                                        VStack(alignment: .leading, spacing: 6) {
+                                    SettingsCard(title: "Storage & Engine", systemImage: "internaldrive.fill", tint: .gray) {
+                                        VStack(alignment: .leading, spacing: 10) {
+                                            SettingsInfoRow(label: "Wine", value: library.wineDir.path)
+                                            SettingsInfoRow(label: "Prefix", value: library.supportDir.path)
+                                            Divider()
                                             HStack {
-                                                Text("Wine:")
-                                                    .foregroundColor(.secondary)
-                                                Text(library.wineDir.path)
-                                                    .textSelection(.enabled)
-                                            }
-                                            HStack {
-                                                Text("Prefix:")
-                                                    .foregroundColor(.secondary)
-                                                Text(library.supportDir.path)
-                                                    .textSelection(.enabled)
-                                            }
-                                        }
-                                        .font(.system(.caption, design: .monospaced))
-                                        .padding(4)
-                                    }
-                                    .frame(maxWidth: 700)
-
-                                    GroupBox("Dependencies") {
-                                        HStack {
-                                            Image(systemName: DepotDownloaderManager.isInstalled
-                                                  ? "checkmark.circle.fill" : "circle")
-                                                .foregroundColor(DepotDownloaderManager.isInstalled ? .green : .secondary)
-                                            VStack(alignment: .leading, spacing: 2) {
-                                                Text("DepotDownloader")
-                                                    .font(.callout)
-                                                if !DepotDownloaderManager.isInstalled {
-                                                    Text("Downloaded automatically the first time you install a Steam game.")
-                                                        .font(.caption)
-                                                        .foregroundColor(.secondary)
+                                                Image(systemName: DepotDownloaderManager.isInstalled
+                                                      ? "checkmark.circle.fill" : "circle.dashed")
+                                                    .foregroundColor(DepotDownloaderManager.isInstalled ? .green : .secondary)
+                                                VStack(alignment: .leading, spacing: 2) {
+                                                    Text("DepotDownloader")
+                                                        .font(.callout)
+                                                    if !DepotDownloaderManager.isInstalled {
+                                                        Text("Downloaded automatically the first time you install a Steam game.")
+                                                            .font(.caption)
+                                                            .foregroundColor(.secondary)
+                                                    }
                                                 }
+                                                Spacer()
                                             }
-                                            Spacer()
                                         }
-                                        .padding(4)
                                     }
-                                    .frame(maxWidth: 700)
 
-                                    Button("Rescan Games") {
-                                        library.scan()
+                                    HStack {
+                                        Button {
+                                            library.scan()
+                                        } label: {
+                                            Label("Rescan Games", systemImage: "arrow.clockwise")
+                                        }
+                                        .buttonStyle(.bordered)
+                                        Spacer()
                                     }
-                                    .buttonStyle(.bordered)
                                 }
                                 .padding(20)
+                                .frame(maxWidth: 700, alignment: .leading)
                             }
+                            .frame(maxWidth: .infinity)
                         } else {
                             GameGridView(
                                 games: filteredGames,
