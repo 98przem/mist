@@ -2007,58 +2007,15 @@ struct GameCardView: View {
     var onShowInFinder: () -> Void = {}
     var onLaunchOptions: () -> Void = {}
 
+    @State private var isHovering = false
+
     private var gptkInstalled: Bool {
         FileManager.default.fileExists(atPath: "/Applications/Game Porting Toolkit.app")
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            // Cover art
-            coverImage
-                .frame(height: 160)
-                .frame(maxWidth: .infinity)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-                .allowsHitTesting(false)
-
-            // Game name
-            Text(game.name)
-                .font(.headline)
-                .lineLimit(2)
-                .foregroundColor(game.isInstalled ? .primary : .secondary)
-                .allowsHitTesting(false)
-
-            // Source + size
-            HStack(spacing: 4) {
-                Text(game.source.rawValue)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                if game.isInstalled && game.sizeBytes > 0 {
-                    Text("· \(game.sizeFormatted)")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-                if !game.isInstalled {
-                    Text("· Not installed")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-            }
-            .allowsHitTesting(false)
-
-            // Anti-cheat badge
-            if game.antiCheat != .none {
-                HStack(spacing: 4) {
-                    Image(systemName: "shield.lefthalf.filled")
-                        .font(.caption2)
-                    Text(game.antiCheat.rawValue)
-                        .font(.caption2)
-                }
-                .foregroundColor(game.hasLinuxEAC ? .orange : .red)
-                .allowsHitTesting(false)
-            }
-
-            Spacer(minLength: 4)
-
+            poster
             // Launch or Install button — must be clickable
             //
             // Steam games always launch their .exe directly under Wine (onLaunchNoEAC) —
@@ -2083,10 +2040,20 @@ struct GameCardView: View {
                 .tint(game.source == .steam ? .blue : .purple)
             }
         }
-        .padding(12)
-        .background(Color(nsColor: .controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 12))
-        .shadow(color: .black.opacity(0.08), radius: 4, y: 2)
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(.regularMaterial)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.07))
+        )
+        .shadow(color: .black.opacity(isHovering ? 0.28 : 0.12),
+               radius: isHovering ? 16 : 6, y: isHovering ? 8 : 3)
+        .scaleEffect(isHovering ? 1.015 : 1)
+        .animation(.spring(response: 0.28, dampingFraction: 0.8), value: isHovering)
+        .onHover { isHovering = $0 }
         .contextMenu {
             if game.isInstalled {
                 Button(action: onShowInFinder) {
@@ -2101,6 +2068,59 @@ struct GameCardView: View {
                 }
             }
         }
+    }
+
+    // Poster-style cover art (2:3, matching Steam's own library capsule ratio)
+    // with the title/metadata overlaid directly on a bottom gradient scrim,
+    // instead of taking up separate rows below the image.
+    private var poster: some View {
+        ZStack(alignment: .bottom) {
+            coverImage
+                .aspectRatio(2/3, contentMode: .fill)
+                .frame(maxWidth: .infinity)
+                .clipped()
+
+            LinearGradient(
+                colors: [.clear, .clear, .black.opacity(0.55), .black.opacity(0.92)],
+                startPoint: .top, endPoint: .bottom
+            )
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(game.name)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(.white)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 4) {
+                    Image(systemName: game.source == .steam ? "cloud.fill" : "bolt.fill")
+                        .font(.system(size: 8))
+                    Text(game.isInstalled
+                         ? (game.sizeBytes > 0 ? game.sizeFormatted : game.source.rawValue)
+                         : "Not installed")
+                        .font(.system(size: 11))
+                }
+                .foregroundColor(.white.opacity(0.7))
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .aspectRatio(2/3, contentMode: .fit)
+        .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .overlay(alignment: .topTrailing) {
+            if game.antiCheat != .none {
+                HStack(spacing: 3) {
+                    Image(systemName: "shield.lefthalf.filled")
+                    Text(game.antiCheat.rawValue)
+                }
+                .font(.system(size: 9, weight: .semibold))
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .background(.black.opacity(0.6), in: Capsule())
+                .foregroundColor(game.hasLinuxEAC ? .orange : .red)
+                .padding(7)
+            }
+        }
+        .allowsHitTesting(false)
     }
 
     @ViewBuilder
@@ -2226,15 +2246,13 @@ struct GameCardView: View {
     }
 
     var fallbackCover: some View {
-        ZStack {
-            (game.source == .steam ? Color.blue : Color.purple).opacity(0.15)
-            VStack(spacing: 4) {
-                Image(systemName: "gamecontroller.fill")
-                    .font(.largeTitle)
-                Text(game.source.rawValue)
-                    .font(.caption)
-            }
-            .foregroundColor(game.source == .steam ? .blue : .purple)
+        let tint = game.source == .steam ? Color.blue : Color.purple
+        return ZStack {
+            LinearGradient(colors: [tint.opacity(0.35), tint.opacity(0.1)],
+                          startPoint: .topLeading, endPoint: .bottomTrailing)
+            Image(systemName: "gamecontroller.fill")
+                .font(.system(size: 34))
+                .foregroundColor(tint.opacity(0.8))
         }
     }
 }
@@ -2418,6 +2436,12 @@ struct SidebarView: View {
     }
 }
 
+enum GameSortOrder: String, CaseIterable, Identifiable {
+    case installedFirst = "Installed First"
+    case titleAZ = "Title (A–Z)"
+    var id: String { rawValue }
+}
+
 struct GameGridView: View {
     let games: [Game]
     var onLaunch: (Game) -> Void = { _ in }
@@ -2428,13 +2452,15 @@ struct GameGridView: View {
     var onShowInFinder: (Game) -> Void = { _ in }
     var onLaunchOptions: (Game) -> Void = { _ in }
 
+    @State private var sortOrder: GameSortOrder = .installedFirst
+
     let columns = [
-        GridItem(.adaptive(minimum: 280, maximum: 400), spacing: 12)
+        GridItem(.adaptive(minimum: 160, maximum: 200), spacing: 14)
     ]
 
     var sortedGames: [Game] {
         games.sorted { a, b in
-            if a.isInstalled != b.isInstalled { return a.isInstalled }
+            if sortOrder == .installedFirst, a.isInstalled != b.isInstalled { return a.isInstalled }
             return a.name.lowercased() < b.name.lowercased()
         }
     }
@@ -2443,28 +2469,50 @@ struct GameGridView: View {
 
     var body: some View {
         if games.isEmpty {
-            VStack(spacing: 12) {
-                Image(systemName: "tray")
-                    .font(.system(size: 48))
-                    .foregroundColor(.secondary)
+            VStack(spacing: 14) {
+                ZStack {
+                    Circle().fill(Color.primary.opacity(0.05)).frame(width: 84, height: 84)
+                    Image(systemName: "tray")
+                        .font(.system(size: 32))
+                        .foregroundColor(.secondary)
+                }
                 Text("No games found")
-                    .font(.title3)
-                    .foregroundColor(.secondary)
+                    .font(.title3.weight(.medium))
                 Text("Install games through Steam or Epic Games")
-                    .font(.caption)
+                    .font(.callout)
                     .foregroundColor(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             ScrollView {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("\(games.count) games · \(installedCount) installed")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .padding(.horizontal, 16)
-                        .padding(.top, 8)
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("\(games.count) games")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(.secondary)
+                        Text("·")
+                            .foregroundColor(.secondary)
+                        Text("\(installedCount) installed")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        Menu {
+                            Picker("Sort", selection: $sortOrder) {
+                                ForEach(GameSortOrder.allCases) { order in
+                                    Text(order.rawValue).tag(order)
+                                }
+                            }
+                        } label: {
+                            Label(sortOrder.rawValue, systemImage: "arrow.up.arrow.down")
+                                .font(.system(size: 11.5))
+                        }
+                        .menuStyle(.borderlessButton)
+                        .fixedSize()
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 10)
 
-                    LazyVGrid(columns: columns, spacing: 12) {
+                    LazyVGrid(columns: columns, spacing: 14) {
                         ForEach(sortedGames) { game in
                             let g = game
                             GameCardView(
