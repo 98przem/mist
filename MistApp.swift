@@ -493,6 +493,18 @@ class GameLibrary: ObservableObject {
         recomputeGames()
     }
 
+    // Handles both games Mist installed itself (tracked in mist_manifest.json,
+    // the common case) and games with a real Steam-format appmanifest.acf (from
+    // the legacy OLD/ CLI path) — whichever is present gets cleaned up.
+    func uninstallSteamGame(_ game: Game) {
+        let fm = FileManager.default
+        try? fm.removeItem(atPath: game.installDir)
+        MistManifest.remove(appid: game.id, steamAppsDir: steamAppsDir)
+        let acf = steamAppsDir.appendingPathComponent("appmanifest_\(game.id).acf")
+        try? fm.removeItem(at: acf)
+        scan()
+    }
+
     private func scanEpicGames() -> [Game] {
         var games: [Game] = []
         let fm = FileManager.default
@@ -1066,6 +1078,13 @@ enum MistManifest {
                 sizeBytes: $0.sizeBytes, isInstalled: FileManager.default.fileExists(atPath: $0.installDir),
                 imageURL: SteamLibraryService.coverURL(forAppID: $0.appid))
         }
+    }
+
+    static func remove(appid: String, steamAppsDir: URL) {
+        var list = load(steamAppsDir: steamAppsDir)
+        list.removeAll { $0.appid == appid }
+        guard let data = try? JSONEncoder().encode(list) else { return }
+        try? data.write(to: fileURL(steamAppsDir: steamAppsDir))
     }
 }
 
@@ -1740,6 +1759,7 @@ class ProcessManager: ObservableObject {
     @Published var epicLoginInProgress = false
     @Published var epicInstallProgress: String = ""
     @Published var epicInstalling = false
+    @Published var epicUninstalling = false
 
     @Published var epicLoginError: String = ""
 
@@ -1917,6 +1937,28 @@ class ProcessManager: ObservableObject {
             }
         }
     }
+
+    func epicUninstall(appName: String) {
+        guard FileManager.default.isExecutableFile(atPath: legendaryPath) else { return }
+        epicUninstalling = true
+        DispatchQueue.global().async { [weak self] in
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: legendaryPath)
+            proc.arguments = ["uninstall", appName, "-y"]
+            let pipe = Pipe()
+            proc.standardOutput = pipe
+            proc.standardError = pipe
+            try? proc.run()
+            // Drain before waiting — legendary's uninstall output is small but this
+            // avoids the same pipe-buffer deadlock class as every other subprocess call.
+            _ = pipe.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            DispatchQueue.main.async {
+                self?.epicUninstalling = false
+                self?.library.scan()
+            }
+        }
+    }
 }
 
 // MARK: - Views
@@ -1961,6 +2003,9 @@ struct GameCardView: View {
     var onLaunchNoEAC: () -> Void = {}
     var onLaunchGPTK: () -> Void = {}
     var onInstall: () -> Void = {}
+    var onUninstall: () -> Void = {}
+    var onShowInFinder: () -> Void = {}
+    var onLaunchOptions: () -> Void = {}
 
     private var gptkInstalled: Bool {
         FileManager.default.fileExists(atPath: "/Applications/Game Porting Toolkit.app")
@@ -2022,7 +2067,67 @@ struct GameCardView: View {
             // through Steam" option for them. Epic games still launch via legendary
             // (onLaunch), which works fine since that's a lightweight native CLI.
             if game.isInstalled {
-                if game.antiCheat != .none {
+                HStack(spacing: 6) {
+                    primaryActionButton
+                    overflowMenu
+                }
+            } else {
+                Button(action: onInstall) {
+                    HStack {
+                        Image(systemName: "arrow.down.circle.fill")
+                        Text("Install")
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .tint(game.source == .steam ? .blue : .purple)
+            }
+        }
+        .padding(12)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .shadow(color: .black.opacity(0.08), radius: 4, y: 2)
+        .contextMenu {
+            if game.isInstalled {
+                Button(action: onShowInFinder) {
+                    Label("Show in Finder", systemImage: "folder")
+                }
+                Button(action: onLaunchOptions) {
+                    Label("Launch Options…", systemImage: "slider.horizontal.3")
+                }
+                Divider()
+                Button(role: .destructive, action: onUninstall) {
+                    Label("Uninstall", systemImage: "trash")
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var overflowMenu: some View {
+        Menu {
+            Button(action: onShowInFinder) {
+                Label("Show in Finder", systemImage: "folder")
+            }
+            Button(action: onLaunchOptions) {
+                Label("Launch Options…", systemImage: "slider.horizontal.3")
+            }
+            Divider()
+            Button(role: .destructive, action: onUninstall) {
+                Label("Uninstall", systemImage: "trash")
+            }
+        } label: {
+            Image(systemName: "ellipsis")
+                .frame(width: 8)
+        }
+        .menuStyle(.borderedButton)
+        .fixedSize()
+    }
+
+    @ViewBuilder
+    private var primaryActionButton: some View {
+        Group {
+            if game.antiCheat != .none {
                     // Anti-cheat game: online/multiplayer isn't supported (Mist
                     // doesn't circumvent anti-cheat). The offline launch runs the
                     // game without its anti-cheat — via Apple's Game Porting Toolkit
@@ -2102,22 +2207,7 @@ struct GameCardView: View {
                     .buttonStyle(.borderedProminent)
                     .tint(.purple)
                 }
-            } else {
-                Button(action: onInstall) {
-                    HStack {
-                        Image(systemName: "arrow.down.circle.fill")
-                        Text("Install")
-                    }
-                    .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .tint(game.source == .steam ? .blue : .purple)
-            }
         }
-        .padding(12)
-        .background(Color(nsColor: .controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 12))
-        .shadow(color: .black.opacity(0.08), radius: 4, y: 2)
     }
 
     @ViewBuilder
@@ -2260,6 +2350,9 @@ struct GameGridView: View {
     var onLaunchNoEAC: (Game) -> Void = { _ in }
     var onLaunchGPTK: (Game) -> Void = { _ in }
     var onInstall: (Game) -> Void = { _ in }
+    var onUninstall: (Game) -> Void = { _ in }
+    var onShowInFinder: (Game) -> Void = { _ in }
+    var onLaunchOptions: (Game) -> Void = { _ in }
 
     let columns = [
         GridItem(.adaptive(minimum: 280, maximum: 400), spacing: 12)
@@ -2305,7 +2398,10 @@ struct GameGridView: View {
                                 onLaunch: { onLaunch(g) },
                                 onLaunchNoEAC: { onLaunchNoEAC(g) },
                                 onLaunchGPTK: { onLaunchGPTK(g) },
-                                onInstall: { onInstall(g) }
+                                onInstall: { onInstall(g) },
+                                onUninstall: { onUninstall(g) },
+                                onShowInFinder: { onShowInFinder(g) },
+                                onLaunchOptions: { onLaunchOptions(g) }
                             )
                         }
                     }
@@ -2842,6 +2938,8 @@ struct ContentView: View {
     @State private var sidebarSelection: String? = "all"
     @State private var showRunningView = false
     @State private var searchText = ""
+    @State private var pendingUninstall: Game?
+    @State private var gameForLaunchOptions: Game?
 
     init() {
         let lib = GameLibrary()
@@ -3007,6 +3105,16 @@ struct ContentView: View {
                                             library.scan()
                                         }
                                     }
+                                },
+                                onUninstall: { game in
+                                    pendingUninstall = game
+                                },
+                                onShowInFinder: { game in
+                                    NSWorkspace.shared.activateFileViewerSelecting(
+                                        [URL(fileURLWithPath: game.installDir)])
+                                },
+                                onLaunchOptions: { game in
+                                    gameForLaunchOptions = game
                                 }
                             )
                         }
@@ -3118,6 +3226,23 @@ struct ContentView: View {
         }
         .onChange(of: steamAuth.isLoggedIn) { _ in
             refreshOwnedSteamGames()
+        }
+        .alert("Uninstall \(pendingUninstall?.name ?? "")?", isPresented: Binding(
+            get: { pendingUninstall != nil },
+            set: { if !$0 { pendingUninstall = nil } }
+        )) {
+            Button("Uninstall", role: .destructive) {
+                guard let game = pendingUninstall else { return }
+                if game.source == .steam {
+                    library.uninstallSteamGame(game)
+                } else {
+                    processManager.epicUninstall(appName: game.id)
+                }
+                pendingUninstall = nil
+            }
+            Button("Cancel", role: .cancel) { pendingUninstall = nil }
+        } message: {
+            Text("This deletes the game's installed files from disk. You can reinstall it later.")
         }
     }
 }
