@@ -3532,6 +3532,31 @@ struct ContentView: View {
                 NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: game.installDir)])
             })
         }
+        .focusedSceneValue(\.rescanAction, { library.scan() })
+        .focusedSceneValue(\.showSettingsAction, { sidebarSelection = "settings" })
+    }
+}
+
+// MARK: - Menu Bar Commands
+//
+// ContentView owns all the actual state (library, sidebarSelection, etc.) — these
+// focused values let the app-level .commands block trigger actions on it without
+// restructuring who owns what, via .focusedSceneValue in ContentView's body.
+
+private struct RescanActionKey: FocusedValueKey {
+    typealias Value = () -> Void
+}
+private struct ShowSettingsActionKey: FocusedValueKey {
+    typealias Value = () -> Void
+}
+extension FocusedValues {
+    var rescanAction: (() -> Void)? {
+        get { self[RescanActionKey.self] }
+        set { self[RescanActionKey.self] = newValue }
+    }
+    var showSettingsAction: (() -> Void)? {
+        get { self[ShowSettingsActionKey.self] }
+        set { self[ShowSettingsActionKey.self] = newValue }
     }
 }
 
@@ -3539,11 +3564,29 @@ struct ContentView: View {
 
 @main
 struct MistApp: App {
+    @FocusedValue(\.rescanAction) private var rescanAction
+    @FocusedValue(\.showSettingsAction) private var showSettingsAction
+
     var body: some Scene {
         WindowGroup {
             ContentView()
         }
         .windowStyle(.titleBar)
         .defaultSize(width: 900, height: 600)
+        .commands {
+            CommandGroup(replacing: .newItem) { }
+            CommandMenu("Library") {
+                Button("Rescan Games") { rescanAction?() }
+                    .keyboardShortcut("r", modifiers: .command)
+                    .disabled(rescanAction == nil)
+                Divider()
+                Button("Settings…") { showSettingsAction?() }
+                    .keyboardShortcut(",", modifiers: .command)
+                    .disabled(showSettingsAction == nil)
+            }
+            CommandGroup(replacing: .help) {
+                Link("Mist on GitHub", destination: URL(string: "https://github.com/98przem/mist")!)
+            }
+        }
     }
 }
