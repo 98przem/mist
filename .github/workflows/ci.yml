@@ -5,34 +5,6 @@ on:
   pull_request:
 
 jobs:
-  shellcheck:
-    name: ShellCheck
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install ShellCheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
-      - name: Lint shell scripts
-        # -x follows sourced files (common.sh). --severity=warning catches the
-        # real bug classes (unquoted vars, missing cd guards, etc.) while
-        # ignoring pure style notes.
-        #
-        # NOTE: this is currently non-blocking (continue-on-error) so it reports
-        # findings without failing the build. Once the remaining warnings are
-        # cleaned up, set continue-on-error to false to make it a hard gate.
-        continue-on-error: true
-        run: |
-          shellcheck -x --severity=warning \
-            OLD/common.sh \
-            OLD/launch-steam.sh \
-            OLD/launch-steam-game.sh \
-            OLD/launch-steam-gptk.sh \
-            OLD/launch-epic-game.sh \
-            OLD/setup.sh \
-            OLD/build-wine.sh \
-            OLD/dismiss-dialogs.sh \
-            OLD/mist
-
   build:
     name: Build (macOS)
     runs-on: macos-latest
@@ -42,8 +14,3 @@ jobs:
         # Same flags as the Makefile 'app'/'bundle' targets. This gates the
         # build so a broken MistApp.swift can't land unnoticed.
         run: swiftc -O -parse-as-library -o /tmp/Mist MistApp.swift
-      - name: Verify launch scripts parse
-        run: |
-          for f in OLD/common.sh OLD/launch-*.sh OLD/setup.sh OLD/build-wine.sh OLD/mist OLD/dismiss-dialogs.sh; do
-            bash -n "$f"
-          done

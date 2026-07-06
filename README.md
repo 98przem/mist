@@ -32,19 +32,6 @@ brew install --cask gcenx/wine/game-porting-toolkit
 
 Epic Games works the same way it always has, via [legendary](https://github.com/derrod/legendary) — see **Epic Games** in the sidebar.
 
-### Command-line tool
-
-The repo also ships a `mist` CLI and a set of shell scripts (`setup.sh`, `launch-steam.sh`, etc.) for scripted/headless use, kept in [`OLD/`](OLD/). These predate the native app and still work the *old* way — they install and run the real Windows Steam client under Wine, with all the caveats that implies (see Troubleshooting). If you just want to play games, use Mist.app instead.
-
-```bash
-cd OLD
-chmod +x setup.sh && ./setup.sh   # downloads a Wine build for the CLI's own use
-./launch-steam.sh                 # launch the real Steam client under Wine
-./mist games                      # list installed Steam games
-./mist launch <appid>             # launch a game
-./mist epic games                 # list your Epic library (via legendary)
-```
-
 ## How Mist.app works
 
 1. **Login** — talks directly to Valve's public authentication API over HTTPS (the same one the Steam Mobile app uses for QR pairing) and renders the QR code natively. No Wine, no browser, no Accessibility permission.
@@ -76,28 +63,15 @@ make bundle                 # build the distributable app → dist/Mist.app
 make release                # also produce dist/Mist.zip
 ```
 
-The `wrapper`/`install-wrapper` targets (and `OLD/webhelper_wrapper.c`) are only needed if you're using the `mist` CLI's shell-script launch path, which still runs the real Steam client under Wine and needs a CEF compatibility wrapper. They require `brew install mingw-w64`. Building Mist.app itself doesn't need them.
-
 ## File Structure
 
 ```
 mist/
 ├── MistApp.swift            # Native SwiftUI app — Steam login, downloads, game library, launcher
-├── Makefile                 # Build targets (app, wrapper, bundle, release)
-├── .github/workflows/ci.yml # ShellCheck + Swift build CI
+├── Makefile                 # Build targets (app, bundle, release)
+├── .github/workflows/ci.yml # Swift build CI
 ├── LICENSE
-├── README.md
-└── OLD/                     # Legacy CLI path — Mist.app doesn't use any of this
-    ├── mist                     # CLI: games, launch, profiles, epic (classic Wine-Steam-client path)
-    ├── common.sh                # Shared launch helpers for the CLI/shell scripts
-    ├── setup.sh                 # Downloads & installs Wine Staging
-    ├── launch-steam.sh          # Launch the real Steam client under Wine
-    ├── launch-steam-game.sh     # Launch a Steam game directly (offline)
-    ├── launch-steam-gptk.sh     # Launch via Game Porting Toolkit (D3DMetal)
-    ├── launch-epic-game.sh      # Launch an Epic game (via legendary)
-    ├── dismiss-dialogs.sh       # Auto-dismisses Steam error popups
-    ├── build-wine.sh            # Build a clean Wine from source (optional)
-    └── webhelper_wrapper.c      # steamwebhelper Wine-compat wrapper
+└── README.md
 ```
 
 ## Troubleshooting
@@ -111,8 +85,6 @@ mist/
 **A D3D12 game crashes immediately:** Install the Game Porting Toolkit (see Download) — the bundled D3D12 path doesn't work on macOS.
 
 **Game crashes on launch:** Not all games work under Wine. Check ProtonDB for compatibility.
-
-**Using the `mist` CLI / shell scripts instead of Mist.app:** those run the real Steam client under Wine and can hit the black-screen/CEF issues Mist.app was specifically redesigned to avoid — see the comments in `OLD/launch-steam.sh` and `OLD/dismiss-dialogs.sh` if you go that route.
 
 ## Credits
 
