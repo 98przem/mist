@@ -10,7 +10,8 @@ BUNDLE_CONTENTS = $(BUNDLE)/Contents
 BUNDLE_MACOS = $(BUNDLE_CONTENTS)/MacOS
 BUNDLE_RESOURCES = $(BUNDLE_CONTENTS)/Resources
 
-.PHONY: all app clean bundle release bundle-clean test-build test
+.PHONY: all app clean bundle release bundle-clean test-build test \
+       reset-steam reset-all reset-depotdownloader-cache
 
 all: app
 
@@ -85,3 +86,51 @@ clean:
 
 bundle-clean:
 	rm -rf dist/
+
+# ── Dev/testing resets ─────────────────────────────────────────────────
+#
+# These wipe real local state (Steam logins, game installs, prefs) — for
+# repeatable from-scratch testing, not something a shipped build ever runs.
+# Always quits Mist first so nothing writes back into what we're deleting.
+
+# Fast reset: wipes Steam install/login, DepotDownloader's own cached session,
+# Mist's native login session, per-game settings, and relevant UserDefaults keys
+# — but keeps the downloaded Wine ENGINE (wine/) so you're not stuck redownloading
+# ~200MB before every test run. Use this for iterating on Steam/login/achievements
+# work. Prefix registry (system.reg/user.reg) is also wiped, forcing Steam's
+# ActiveProcess state to start clean, which reinitializes on next wineboot.
+reset-steam:
+	@pkill -f "Mist.app/Contents/MacOS/Mist" 2>/dev/null || true
+	@"$(PREFIX)/wine/bin/wineserver" -k 2>/dev/null || true
+	@sleep 1
+	rm -rf "$(PREFIX)/drive_c"
+	rm -f "$(PREFIX)"/*.reg "$(PREFIX)/.update-timestamp"
+	rm -rf "$(PREFIX)/tools"
+	rm -f "$(PREFIX)/steam_session.json" "$(PREFIX)/game_settings.json"
+	defaults delete com.mist.app 2>/dev/null || true
+	@echo "Reset done: Steam/login/game state cleared, Wine engine kept."
+	@echo "NOTE: DepotDownloader's own cached session lives outside this prefix"
+	@echo "(.NET IsolatedStorage) — run 'make reset-depotdownloader-cache' too if"
+	@echo "you need that cleared as well."
+
+# DepotDownloader's own session cache is NOT inside our prefix — it's .NET
+# IsolatedStorage, keyed by the DepotDownloader binary's own path/identity, at a
+# fixed machine-wide location. Separate target since it's outside Mist's own
+# folder and (in principle, if this Mac ever ran another .NET app using
+# IsolatedStorage) not exclusively Mist's to delete — kept explicit, not bundled
+# into reset-all by default.
+reset-depotdownloader-cache:
+	rm -rf "$(HOME)/Library/Application Support/IsolatedStorage"
+	@echo "DepotDownloader's cached Steam session cleared."
+
+# Full reset: everything reset-steam does, PLUS the Wine engine itself — puts
+# Mist back to the exact first-launch state (onboarding/"Download & Install"
+# screen). Slow to recover from (~200MB Wine download) — only use this to
+# specifically test first-run setup, not for routine iteration.
+reset-all:
+	@pkill -f "Mist.app/Contents/MacOS/Mist" 2>/dev/null || true
+	@"$(PREFIX)/wine/bin/wineserver" -k 2>/dev/null || true
+	@sleep 1
+	rm -rf "$(PREFIX)"
+	defaults delete com.mist.app 2>/dev/null || true
+	@echo "Full reset done: Mist is back to first-launch state (Wine engine removed too)."
