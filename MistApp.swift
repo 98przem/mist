@@ -952,6 +952,81 @@ enum SteamLibraryService {
     static func coverURL(forAppID appid: String) -> String {
         "https://cdn.cloudflare.steamstatic.com/steam/apps/\(appid)/library_600x900.jpg"
     }
+
+    // Wide "hero" art for the game detail banner — much more dramatic than the
+    // store's 460x215 header.jpg, same deterministic-from-appid pattern as the
+    // library capsule above.
+    static func heroURL(forAppID appid: String) -> String {
+        "https://cdn.cloudflare.steamstatic.com/steam/apps/\(appid)/library_hero.jpg"
+    }
+
+    // Read-only: this game's achievement list and the logged-in user's unlock
+    // status, straight from Steam's own records — NOT something Mist can set.
+    // Actually unlocking achievements during gameplay would require standing in
+    // for steam_api.dll/steamclient.dll the way the game normally talks to a
+    // running Steam client, which is the same mechanism "Steam emulator" tools
+    // use to fake game ownership entirely — deliberately not implemented here.
+    static func fetchAchievements(appid: String, steamID: String, accessToken: String) async throws -> [SteamAchievement] {
+        var comps = URLComponents(string: "https://api.steampowered.com/ISteamUserStats/GetPlayerAchievements/v1/")!
+        comps.queryItems = [
+            URLQueryItem(name: "appid", value: appid),
+            URLQueryItem(name: "steamid", value: steamID),
+            URLQueryItem(name: "access_token", value: accessToken),
+            URLQueryItem(name: "l", value: "english"),
+        ]
+        let (data, response) = try await URLSession.shared.data(from: comps.url!)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw SteamAuthError(message: "This game has no achievements, or they couldn't be loaded.")
+        }
+        struct Resp: Decodable {
+            struct Inner: Decodable {
+                let success: Bool
+                let achievements: [SteamAchievement]?
+                let error: String?
+            }
+            let playerstats: Inner
+        }
+        let decoded = try JSONDecoder().decode(Resp.self, from: data)
+        guard decoded.playerstats.success else {
+            throw SteamAuthError(message: decoded.playerstats.error ?? "No achievement data available for this game.")
+        }
+        return decoded.playerstats.achievements ?? []
+    }
+
+    // Public store metadata (description, tags) — no login needed, same endpoint
+    // the store page itself uses.
+    static func fetchAppDetails(appid: String) async throws -> SteamAppDetails {
+        var comps = URLComponents(string: "https://store.steampowered.com/api/appdetails")!
+        comps.queryItems = [
+            URLQueryItem(name: "appids", value: appid),
+            URLQueryItem(name: "l", value: "english"),
+        ]
+        let (data, response) = try await URLSession.shared.data(from: comps.url!)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw SteamAuthError(message: "Couldn't load the store page for this game.")
+        }
+        struct Wrapper: Decodable { let success: Bool; let data: SteamAppDetails? }
+        let decoded = try JSONDecoder().decode([String: Wrapper].self, from: data)
+        guard let wrapper = decoded[appid], wrapper.success, let details = wrapper.data else {
+            throw SteamAuthError(message: "No store page found for this game.")
+        }
+        return details
+    }
+}
+
+struct SteamAchievement: Identifiable, Decodable {
+    var id: String { apiname }
+    let apiname: String
+    let achieved: Int
+    let unlocktime: Int?
+    let name: String?
+    let description: String?
+}
+
+struct SteamAppDetails: Decodable {
+    struct Genre: Decodable { let description: String }
+    let short_description: String?
+    let genres: [Genre]?
 }
 
 // MARK: - Steam Game Downloads (DepotDownloader — native, no Wine needed to download)
@@ -1085,6 +1160,45 @@ enum MistManifest {
         list.removeAll { $0.appid == appid }
         guard let data = try? JSONEncoder().encode(list) else { return }
         try? data.write(to: fileURL(steamAppsDir: steamAppsDir))
+    }
+}
+
+struct WorkshopItem: Identifiable {
+    let id: String  // pubfile ID (the folder name DepotDownloader creates)
+    let sizeBytes: Int64
+
+    var sizeFormatted: String {
+        if sizeBytes > 1_073_741_824 {
+            return "\(sizeBytes / 1_073_741_824) GB"
+        } else if sizeBytes > 1_048_576 {
+            return "\(sizeBytes / 1_048_576) MB"
+        } else if sizeBytes > 0 {
+            return "\(sizeBytes / 1024) KB"
+        }
+        return "—"
+    }
+}
+
+// Workshop items are tracked purely by scanning steamapps/workshop/content/<appid>/
+// (Steam's own layout — see SteamDownloadManager.installWorkshopItem) rather than a
+// separate manifest, since the folder itself is the source of truth.
+enum MistWorkshop {
+    static func installedItems(appid: String, steamAppsDir: URL) -> [WorkshopItem] {
+        let dir = steamAppsDir.appendingPathComponent("workshop/content/\(appid)")
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: nil) else { return [] }
+        return entries
+            .map { WorkshopItem(id: $0.lastPathComponent, sizeBytes: directorySize($0)) }
+            .sorted { $0.id < $1.id }
+    }
+
+    private static func directorySize(_ url: URL) -> Int64 {
+        guard let en = FileManager.default.enumerator(at: url, includingPropertiesForKeys: [.fileSizeKey]) else { return 0 }
+        var total: Int64 = 0
+        for case let fileURL as URL in en {
+            total += Int64((try? fileURL.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+        }
+        return total
     }
 }
 
@@ -2121,6 +2235,7 @@ struct GameCardView: View {
     var onShowInFinder: () -> Void = {}
     var onLaunchOptions: () -> Void = {}
     var onInstallWorkshopItem: () -> Void = {}
+    var onSelect: () -> Void = {}
 
     @State private var isHovering = false
 
@@ -2169,6 +2284,7 @@ struct GameCardView: View {
         .scaleEffect(isHovering ? 1.015 : 1)
         .animation(.spring(response: 0.28, dampingFraction: 0.8), value: isHovering)
         .onHover { isHovering = $0 }
+        .onTapGesture(perform: onSelect)
         .contextMenu {
             if game.isInstalled {
                 Button(action: onShowInFinder) {
@@ -2195,9 +2311,15 @@ struct GameCardView: View {
     // instead of taking up separate rows below the image.
     private var poster: some View {
         ZStack(alignment: .bottom) {
+            // coverImage already resizes+scaledToFill internally (see
+            // SteamCoverImageView) — it just needs the size the outer
+            // .aspectRatio(2/3, .fit) below resolves for this ZStack, not a
+            // second competing aspectRatio of its own. Stacking two aspectRatio
+            // modifiers (one .fill on the image, one .fit on the container) with
+            // no fixed height in between made SwiftUI's layout solver blow up the
+            // proposed size for some images — that's what caused the occasional
+            // giant blurry tile spanning across neighboring cards.
             coverImage
-                .aspectRatio(2/3, contentMode: .fill)
-                .frame(maxWidth: .infinity)
                 .clipped()
 
             LinearGradient(
@@ -2589,6 +2711,7 @@ struct GameGridView: View {
     var onShowInFinder: (Game) -> Void = { _ in }
     var onLaunchOptions: (Game) -> Void = { _ in }
     var onInstallWorkshopItem: (Game) -> Void = { _ in }
+    var onSelect: (Game) -> Void = { _ in }
 
     @State private var sortOrder: GameSortOrder = .installedFirst
 
@@ -2662,7 +2785,8 @@ struct GameGridView: View {
                                 onUninstall: { onUninstall(g) },
                                 onShowInFinder: { onShowInFinder(g) },
                                 onLaunchOptions: { onLaunchOptions(g) },
-                                onInstallWorkshopItem: { onInstallWorkshopItem(g) }
+                                onInstallWorkshopItem: { onInstallWorkshopItem(g) },
+                                onSelect: { onSelect(g) }
                             )
                         }
                     }
@@ -2670,6 +2794,285 @@ struct GameGridView: View {
                 }
             }
         }
+    }
+}
+
+struct GameDetailView: View {
+    let game: Game
+    @ObservedObject var steamAuth: SteamAuthManager
+    let steamAppsDir: URL
+    var onLaunch: () -> Void = {}
+    var onLaunchNoEAC: () -> Void = {}
+    var onLaunchGPTK: () -> Void = {}
+    var onInstall: () -> Void = {}
+    var onUninstall: () -> Void = {}
+    var onShowInFinder: () -> Void = {}
+    var onLaunchOptions: () -> Void = {}
+    var onInstallWorkshopItem: () -> Void = {}
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var details: SteamAppDetails?
+    @State private var achievements: [SteamAchievement] = []
+    @State private var achievementsError: String?
+    @State private var isLoadingAchievements = false
+    @State private var workshopItems: [WorkshopItem] = []
+
+    private var gptkInstalled: Bool {
+        FileManager.default.fileExists(atPath: "/Applications/Game Porting Toolkit.app")
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+                banner
+                VStack(alignment: .leading, spacing: 18) {
+                    header
+                    if let desc = details?.short_description, !desc.isEmpty {
+                        Text(desc)
+                            .font(.callout)
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if let genres = details?.genres, !genres.isEmpty {
+                        tagRow(genres.map(\.description))
+                    }
+                    actionRow
+                    Divider()
+                    if game.source == .steam {
+                        achievementsSection
+                        Divider()
+                        workshopSection
+                    }
+                }
+                .padding(20)
+            }
+        }
+        .frame(width: 640, height: 620)
+        .task(id: game.id) {
+            await loadAll()
+        }
+    }
+
+    private var banner: some View {
+        AsyncImage(url: URL(string: SteamLibraryService.heroURL(forAppID: game.id))) { phase in
+            switch phase {
+            case .success(let image):
+                image.resizable().scaledToFill()
+            default:
+                LinearGradient(colors: [(game.source == .steam ? Color.blue : .purple).opacity(0.35), .clear],
+                              startPoint: .top, endPoint: .bottom)
+            }
+        }
+        .frame(height: 200)
+        .frame(maxWidth: .infinity)
+        .clipped()
+        .overlay(LinearGradient(colors: [.clear, .black.opacity(0.5)], startPoint: .top, endPoint: .bottom))
+        .overlay(alignment: .topTrailing) {
+            Button {
+                dismiss()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundColor(.white)
+                    .padding(8)
+                    .background(.black.opacity(0.5), in: Circle())
+            }
+            .buttonStyle(.plain)
+            .keyboardShortcut(.cancelAction)
+            .padding(12)
+        }
+    }
+
+    private var header: some View {
+        HStack(alignment: .top) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(game.name)
+                    .font(.system(size: 22, weight: .bold))
+                HStack(spacing: 5) {
+                    Image(systemName: game.source == .steam ? "cloud.fill" : "bolt.fill")
+                        .font(.system(size: 11))
+                    Text(game.source.rawValue)
+                    if game.isInstalled && game.sizeBytes > 0 {
+                        Text("· \(game.sizeFormatted)")
+                    }
+                    if !game.isInstalled {
+                        Text("· Not installed")
+                    }
+                }
+                .font(.system(size: 12.5))
+                .foregroundColor(.secondary)
+            }
+            Spacer()
+        }
+    }
+
+    private func tagRow(_ tags: [String]) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(tags.prefix(8), id: \.self) { tag in
+                    Text(tag)
+                        .font(.system(size: 11, weight: .medium))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.primary.opacity(0.07), in: Capsule())
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var actionRow: some View {
+        if game.isInstalled {
+            HStack(spacing: 8) {
+                if game.antiCheat != .none {
+                    Button(action: onLaunchNoEAC) {
+                        Label("Play Offline — No Anti-Cheat", systemImage: "play.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(game.source == .steam ? .blue : .purple)
+                } else if game.source == .steam && gptkInstalled {
+                    Button(action: onLaunchGPTK) {
+                        Label("Play (D3DMetal)", systemImage: "play.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.blue)
+                } else if game.source == .steam {
+                    Button(action: onLaunchNoEAC) {
+                        Label("Launch", systemImage: "play.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.blue)
+                } else {
+                    Button(action: onLaunch) {
+                        Label("Launch", systemImage: "play.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.purple)
+                }
+                Button("Launch Options…", action: onLaunchOptions)
+                    .buttonStyle(.bordered)
+                Button("Show in Finder", action: onShowInFinder)
+                    .buttonStyle(.bordered)
+                Spacer()
+                Button("Uninstall", role: .destructive, action: onUninstall)
+                    .buttonStyle(.bordered)
+            }
+        } else {
+            Button(action: onInstall) {
+                Label("Install", systemImage: "arrow.down.circle.fill")
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(game.source == .steam ? .blue : .purple)
+        }
+    }
+
+    @ViewBuilder
+    private var achievementsSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("Achievements", systemImage: "trophy.fill")
+                    .font(.system(size: 13, weight: .semibold))
+                if !achievements.isEmpty {
+                    let unlocked = achievements.filter { $0.achieved == 1 }.count
+                    Text("\(unlocked)/\(achievements.count)")
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+            }
+
+            if isLoadingAchievements {
+                ProgressView().controlSize(.small)
+            } else if let err = achievementsError {
+                Text(err)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            } else if achievements.isEmpty {
+                Text("No achievements for this game.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            } else {
+                VStack(spacing: 6) {
+                    ForEach(achievements) { ach in
+                        HStack(spacing: 10) {
+                            Image(systemName: ach.achieved == 1 ? "checkmark.seal.fill" : "lock.fill")
+                                .foregroundColor(ach.achieved == 1 ? .yellow : .secondary)
+                                .font(.system(size: 14))
+                                .frame(width: 18)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(ach.name ?? ach.apiname)
+                                    .font(.system(size: 12.5, weight: .medium))
+                                if let desc = ach.description, !desc.isEmpty {
+                                    Text(desc)
+                                        .font(.system(size: 11))
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                            Spacer()
+                        }
+                        .opacity(ach.achieved == 1 ? 1 : 0.55)
+                    }
+                }
+            }
+
+            Text("Read-only — shows Steam's own record of your progress. Mist doesn't run a Steam client under Wine, so it can't unlock achievements live during gameplay.")
+                .font(.system(size: 10.5))
+                .foregroundColor(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private var workshopSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("Workshop Items", systemImage: "shippingbox.fill")
+                    .font(.system(size: 13, weight: .semibold))
+                Spacer()
+                Button("Install Item…", action: onInstallWorkshopItem)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
+
+            if workshopItems.isEmpty {
+                Text("No workshop items downloaded for this game yet.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            } else {
+                VStack(spacing: 4) {
+                    ForEach(workshopItems) { item in
+                        HStack {
+                            Image(systemName: "doc.zipper")
+                                .foregroundColor(.secondary)
+                            Text(item.id)
+                                .font(.system(.caption, design: .monospaced))
+                            Spacer()
+                            Text(item.sizeFormatted)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func loadAll() async {
+        workshopItems = MistWorkshop.installedItems(appid: game.id, steamAppsDir: steamAppsDir)
+
+        if let d = try? await SteamLibraryService.fetchAppDetails(appid: game.id) {
+            details = d
+        }
+
+        guard game.source == .steam, steamAuth.isLoggedIn else { return }
+        isLoadingAchievements = true
+        do {
+            let token = try await steamAuth.mintAccessToken()
+            achievements = try await SteamLibraryService.fetchAchievements(
+                appid: game.id, steamID: steamAuth.steamID, accessToken: token)
+        } catch {
+            achievementsError = "No achievement data available for this game."
+        }
+        isLoadingAchievements = false
     }
 }
 
@@ -3381,6 +3784,7 @@ struct ContentView: View {
     @State private var pendingUninstall: Game?
     @State private var gameForLaunchOptions: Game?
     @State private var gameForWorkshopInstall: Game?
+    @State private var gameForDetail: Game?
 
     init() {
         let lib = GameLibrary()
@@ -3408,6 +3812,36 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    private func handleLaunch(_ game: Game) {
+        showRunningView = true
+        processManager.launchGame(game)
+    }
+
+    private func handleLaunchNoEAC(_ game: Game) {
+        showRunningView = true
+        processManager.launchGame(game, mode: .noEAC)
+    }
+
+    private func handleLaunchGPTK(_ game: Game) {
+        showRunningView = true
+        processManager.launchGame(game, mode: .gptk)
+    }
+
+    private func handleInstall(_ game: Game) {
+        if game.source == .epic {
+            processManager.epicInstall(appName: game.id)
+        } else if game.source == .steam {
+            downloadManager.install(appid: game.id, name: game.name,
+                                    steamAccountName: steamAuth.accountName) {
+                library.scan()
+            }
+        }
+    }
+
+    private func handleShowInFinder(_ game: Game) {
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: game.installDir)])
     }
 
     var filteredGames: [Game] {
@@ -3517,41 +3951,15 @@ struct ContentView: View {
                         } else {
                             GameGridView(
                                 games: filteredGames,
-                                onLaunch: { game in
-                                    showRunningView = true
-                                    processManager.launchGame(game)
-                                },
-                                onLaunchNoEAC: { game in
-                                    showRunningView = true
-                                    processManager.launchGame(game, mode: .noEAC)
-                                },
-                                onLaunchGPTK: { game in
-                                    showRunningView = true
-                                    processManager.launchGame(game, mode: .gptk)
-                                },
-                                onInstall: { game in
-                                    if game.source == .epic {
-                                        processManager.epicInstall(appName: game.id)
-                                    } else if game.source == .steam {
-                                        downloadManager.install(appid: game.id, name: game.name,
-                                                                steamAccountName: steamAuth.accountName) {
-                                            library.scan()
-                                        }
-                                    }
-                                },
-                                onUninstall: { game in
-                                    pendingUninstall = game
-                                },
-                                onShowInFinder: { game in
-                                    NSWorkspace.shared.activateFileViewerSelecting(
-                                        [URL(fileURLWithPath: game.installDir)])
-                                },
-                                onLaunchOptions: { game in
-                                    gameForLaunchOptions = game
-                                },
-                                onInstallWorkshopItem: { game in
-                                    gameForWorkshopInstall = game
-                                }
+                                onLaunch: handleLaunch,
+                                onLaunchNoEAC: handleLaunchNoEAC,
+                                onLaunchGPTK: handleLaunchGPTK,
+                                onInstall: handleInstall,
+                                onUninstall: { game in pendingUninstall = game },
+                                onShowInFinder: handleShowInFinder,
+                                onLaunchOptions: { game in gameForLaunchOptions = game },
+                                onInstallWorkshopItem: { game in gameForWorkshopInstall = game },
+                                onSelect: { game in gameForDetail = game }
                             )
                         }
                     }
@@ -3692,6 +4100,19 @@ struct ContentView: View {
                     library.scan()
                 }
             }
+        }
+        .sheet(item: $gameForDetail) { game in
+            GameDetailView(
+                game: game, steamAuth: steamAuth, steamAppsDir: library.steamAppsDir,
+                onLaunch: { handleLaunch(game) },
+                onLaunchNoEAC: { handleLaunchNoEAC(game) },
+                onLaunchGPTK: { handleLaunchGPTK(game) },
+                onInstall: { handleInstall(game) },
+                onUninstall: { pendingUninstall = game },
+                onShowInFinder: { handleShowInFinder(game) },
+                onLaunchOptions: { gameForLaunchOptions = game },
+                onInstallWorkshopItem: { gameForWorkshopInstall = game }
+            )
         }
         .focusedSceneValue(\.rescanAction, { library.scan() })
         .focusedSceneValue(\.showSettingsAction, { sidebarSelection = "settings" })
