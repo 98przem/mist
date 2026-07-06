@@ -3555,6 +3555,8 @@ struct LaunchOptionsView: View {
                         .foregroundColor(.secondary)
                 }
                 Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
                 Button("Done") {
                     GameSettingsStore.setCustomArgs(customArgs, for: game.id)
                     dismiss()
@@ -3630,6 +3632,8 @@ struct WorkshopInstallView: View {
                         .foregroundColor(.secondary)
                 }
                 Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
                 Button("Install") {
                     guard let id = extractedID else { return }
                     onInstall(id)
