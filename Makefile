@@ -1,5 +1,5 @@
 # Build targets for Mist
-# Requires: Xcode command line tools (swiftc), mingw-w64 (x86_64-w64-mingw32-gcc)
+# Requires: Xcode command line tools (swiftc)
 
 PREFIX ?= $(HOME)/Library/Application Support/Mist
 CEF_DIR = $(PREFIX)/drive_c/Program Files (x86)/Steam/bin/cef/cef.win64
@@ -10,19 +10,11 @@ BUNDLE_CONTENTS = $(BUNDLE)/Contents
 BUNDLE_MACOS = $(BUNDLE_CONTENTS)/MacOS
 BUNDLE_RESOURCES = $(BUNDLE_CONTENTS)/Resources
 
-.PHONY: all wrapper app clean install-wrapper bundle release bundle-clean \
-       test-build test wine-source wine-clean
+.PHONY: all app clean bundle release bundle-clean test-build test
 
-all: wrapper app
+all: app
 
 # ── Developer targets (git-clone workflow) ────────────────────────────
-
-# Windows PE wrapper for steamwebhelper (requires mingw-w64)
-# Install mingw-w64: brew install mingw-w64
-wrapper: steamwebhelper_wrapper.exe
-
-steamwebhelper_wrapper.exe: webhelper_wrapper.c
-	x86_64-w64-mingw32-gcc -O2 -o $@ $<
 
 # Native macOS SwiftUI app
 app: Mist.app/Contents/MacOS/Mist
@@ -30,23 +22,19 @@ app: Mist.app/Contents/MacOS/Mist
 Mist.app/Contents/MacOS/Mist: MistApp.swift
 	@mkdir -p Mist.app/Contents/MacOS
 	swiftc -O -parse-as-library -o $@ $<
+	@echo '<?xml version="1.0" encoding="UTF-8"?>' > Mist.app/Contents/Info.plist
+	@echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' >> Mist.app/Contents/Info.plist
+	@echo '<plist version="1.0"><dict>' >> Mist.app/Contents/Info.plist
+	@echo '<key>CFBundleExecutable</key><string>Mist</string>' >> Mist.app/Contents/Info.plist
+	@echo '<key>CFBundleIdentifier</key><string>com.mist.app</string>' >> Mist.app/Contents/Info.plist
+	@echo '<key>CFBundleName</key><string>Mist</string>' >> Mist.app/Contents/Info.plist
+	@echo '<key>CFBundleVersion</key><string>2.0</string>' >> Mist.app/Contents/Info.plist
+	@echo '</dict></plist>' >> Mist.app/Contents/Info.plist
 	codesign --force --deep -s - Mist.app
-
-# Copy the webhelper wrapper into the Wine prefix
-install-wrapper: steamwebhelper_wrapper.exe
-	@if [ ! -f "$(CEF_DIR)/steamwebhelper.exe" ]; then \
-		echo "Error: Steam not installed in prefix yet. Run launch-steam.sh first."; \
-		exit 1; \
-	fi
-	@if [ ! -f "$(CEF_DIR)/steamwebhelper_real.exe" ]; then \
-		cp "$(CEF_DIR)/steamwebhelper.exe" "$(CEF_DIR)/steamwebhelper_real.exe"; \
-	fi
-	cp steamwebhelper_wrapper.exe "$(CEF_DIR)/steamwebhelper.exe"
-	@echo "Wrapper installed."
 
 # ── Distribution targets (self-contained .app) ───────────────────────
 
-bundle: wrapper
+bundle:
 	@echo "Assembling Mist.app..."
 	rm -rf dist/
 	mkdir -p "$(BUNDLE_MACOS)" "$(BUNDLE_RESOURCES)"
@@ -60,11 +48,9 @@ bundle: wrapper
 	@echo '<key>CFBundleIdentifier</key><string>com.mist.app</string>' >> "$(BUNDLE_CONTENTS)/Info.plist"
 	@echo '<key>CFBundleName</key><string>Mist</string>' >> "$(BUNDLE_CONTENTS)/Info.plist"
 	@echo '<key>CFBundleVersion</key><string>2.0</string>' >> "$(BUNDLE_CONTENTS)/Info.plist"
-	@echo '<key>NSAppleEventsUsageDescription</key><string>Mist needs accessibility to dismiss game dialogs.</string>' >> "$(BUNDLE_CONTENTS)/Info.plist"
 	@echo '</dict></plist>' >> "$(BUNDLE_CONTENTS)/Info.plist"
-	# Copy runtime resources (webhelper wrapper only — all setup/launch logic is native Swift)
-	cp steamwebhelper_wrapper.exe "$(BUNDLE_RESOURCES)/"
-	# Ad-hoc code sign
+	# Ad-hoc code sign — no runtime resources to bundle; all setup/launch logic is
+	# native Swift and Mist downloads DepotDownloader itself on first use
 	codesign --force --deep -s - "$(BUNDLE)"
 	@echo ""
 	@echo "Bundle ready at dist/Mist.app"
@@ -91,18 +77,9 @@ tests/nt_api_check.exe: tests/nt_api_check.c
 test: test-build
 	./tests/run_tests.sh
 
-# ── Wine from source (anti-cheat patches) ────────────────────────────
-
-wine-source:
-	./build-wine.sh
-
-wine-clean:
-	./build-wine.sh --clean
-
 # ── Cleanup ───────────────────────────────────────────────────────────
 
 clean:
-	rm -f steamwebhelper_wrapper.exe
 	rm -f Mist.app/Contents/MacOS/Mist
 	rm -f tests/mach_syscall_test tests/nt_api_check.exe
 

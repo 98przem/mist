@@ -1,20 +1,5 @@
-# ── Wine: runtime + third-party source/build trees (not part of this project) ──
-/wine
-/wine-src/
-/wine-build/
-/wine-stock/
-/wine-custom/
-/wine-staging-src/
-
-# Convenience symlinks created by setup.sh (point into wine/)
-/bin
-/lib
-/share
-
 # ── Build artifacts (build from source with `make`) ──
 
-
-steamwebhelper_wrapper.exe
 /Mist.app/
 /dist/
 *.dylib
