@@ -23,15 +23,15 @@ jobs:
         continue-on-error: true
         run: |
           shellcheck -x --severity=warning \
-            common.sh \
-            launch-steam.sh \
-            launch-steam-game.sh \
-            launch-steam-gptk.sh \
-            launch-epic-game.sh \
-            setup.sh \
-            build-wine.sh \
-            dismiss-dialogs.sh \
-            mist
+            OLD/common.sh \
+            OLD/launch-steam.sh \
+            OLD/launch-steam-game.sh \
+            OLD/launch-steam-gptk.sh \
+            OLD/launch-epic-game.sh \
+            OLD/setup.sh \
+            OLD/build-wine.sh \
+            OLD/dismiss-dialogs.sh \
+            OLD/mist
 
   build:
     name: Build (macOS)
@@ -44,6 +44,6 @@ jobs:
         run: swiftc -O -parse-as-library -o /tmp/Mist MistApp.swift
       - name: Verify launch scripts parse
         run: |
-          for f in common.sh launch-*.sh setup.sh build-wine.sh mist dismiss-dialogs.sh; do
+          for f in OLD/common.sh OLD/launch-*.sh OLD/setup.sh OLD/build-wine.sh OLD/mist OLD/dismiss-dialogs.sh; do
             bash -n "$f"
           done

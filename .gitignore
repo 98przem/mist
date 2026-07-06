@@ -1,18 +1,28 @@
 # ── Wine: runtime + third-party source/build trees (not part of this project) ──
+# OLD/ is the legacy CLI's shell-script path — setup.sh there creates these
+# relative to wherever it's run from.
 /wine
 /wine-src/
 /wine-build/
 /wine-stock/
 /wine-custom/
 /wine-staging-src/
+OLD/wine
+OLD/wine-src/
+OLD/wine-build/
+OLD/wine-stock/
+OLD/wine-custom/
+OLD/wine-staging-src/
 
-# Convenience symlinks created by setup.sh (point into wine/)
+# Convenience symlinks created by OLD/setup.sh (point into wine/)
 /bin
 /lib
 /share
+OLD/bin
+OLD/lib
+OLD/share
 
 # ── Build artifacts (build from source with `make`) ──
-
 
 steamwebhelper_wrapper.exe
 /Mist.app/
