@@ -2310,41 +2310,44 @@ struct GameCardView: View {
     // with the title/metadata overlaid directly on a bottom gradient scrim,
     // instead of taking up separate rows below the image.
     private var poster: some View {
-        ZStack(alignment: .bottom) {
-            // coverImage already resizes+scaledToFill internally (see
-            // SteamCoverImageView) — it just needs the size the outer
-            // .aspectRatio(2/3, .fit) below resolves for this ZStack, not a
-            // second competing aspectRatio of its own. Stacking two aspectRatio
-            // modifiers (one .fill on the image, one .fit on the container) with
-            // no fixed height in between made SwiftUI's layout solver blow up the
-            // proposed size for some images — that's what caused the occasional
-            // giant blurry tile spanning across neighboring cards.
-            coverImage
-                .clipped()
+        // GeometryReader forces an explicit, unambiguous frame instead of
+        // relying on .aspectRatio's size inference around content that has its
+        // own opinion about size (the title text wrapping to 1 vs 2 lines, or
+        // the loading placeholder's fully-flexible Color fill). Letting that
+        // content's "ideal size" leak into the aspectRatio calculation is what
+        // caused specific cards (long names, or ones caught mid-load) to blow
+        // up to a wrong, oversized frame that bled into neighboring cards.
+        GeometryReader { geo in
+            ZStack(alignment: .bottom) {
+                coverImage
+                    .frame(width: geo.size.width, height: geo.size.height)
+                    .clipped()
 
-            LinearGradient(
-                colors: [.clear, .clear, .black.opacity(0.55), .black.opacity(0.92)],
-                startPoint: .top, endPoint: .bottom
-            )
+                LinearGradient(
+                    colors: [.clear, .clear, .black.opacity(0.55), .black.opacity(0.92)],
+                    startPoint: .top, endPoint: .bottom
+                )
 
-            VStack(alignment: .leading, spacing: 3) {
-                Text(game.name)
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundColor(.white)
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
-                HStack(spacing: 4) {
-                    Image(systemName: game.source == .steam ? "cloud.fill" : "bolt.fill")
-                        .font(.system(size: 8))
-                    Text(game.isInstalled
-                         ? (game.sizeBytes > 0 ? game.sizeFormatted : game.source.rawValue)
-                         : "Not installed")
-                        .font(.system(size: 11))
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(game.name)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundColor(.white)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 4) {
+                        Image(systemName: game.source == .steam ? "cloud.fill" : "bolt.fill")
+                            .font(.system(size: 8))
+                        Text(game.isInstalled
+                             ? (game.sizeBytes > 0 ? game.sizeFormatted : game.source.rawValue)
+                             : "Not installed")
+                            .font(.system(size: 11))
+                    }
+                    .foregroundColor(.white.opacity(0.7))
                 }
-                .foregroundColor(.white.opacity(0.7))
+                .padding(10)
+                .frame(width: geo.size.width, alignment: .leading)
             }
-            .padding(10)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(width: geo.size.width, height: geo.size.height)
         }
         .aspectRatio(2/3, contentMode: .fit)
         .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
