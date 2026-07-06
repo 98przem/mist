@@ -966,31 +966,101 @@ enum SteamLibraryService {
     // for steam_api.dll/steamclient.dll the way the game normally talks to a
     // running Steam client, which is the same mechanism "Steam emulator" tools
     // use to fake game ownership entirely — deliberately not implemented here.
-    static func fetchAchievements(appid: String, steamID: String, accessToken: String) async throws -> [SteamAchievement] {
+    //
+    // Needs a Steam Web API key: this old ISteamUserStats endpoint requires
+    // `key=` and rejects the user access_token our QR login mints ("Required
+    // parameter 'key' is missing", HTTP 400) — unlike the newer
+    // IPublishedFileService the Workshop browser uses, which does accept it. So
+    // achievements are gated on the user adding their own free key in Settings.
+    static func fetchAchievements(appid: String, steamID: String, apiKey: String) async throws -> [SteamAchievement] {
         var comps = URLComponents(string: "https://api.steampowered.com/ISteamUserStats/GetPlayerAchievements/v1/")!
         comps.queryItems = [
             URLQueryItem(name: "appid", value: appid),
             URLQueryItem(name: "steamid", value: steamID),
-            URLQueryItem(name: "access_token", value: accessToken),
+            URLQueryItem(name: "key", value: apiKey),
             URLQueryItem(name: "l", value: "english"),
         ]
         let (data, response) = try await URLSession.shared.data(from: comps.url!)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            throw SteamAuthError(message: "This game has no achievements, or they couldn't be loaded.")
-        }
         struct Resp: Decodable {
             struct Inner: Decodable {
-                let success: Bool
+                let success: Bool?
                 let achievements: [SteamAchievement]?
                 let error: String?
             }
-            let playerstats: Inner
+            let playerstats: Inner?
+        }
+        // GetPlayerAchievements returns its real reason ("Profile is not public",
+        // "Requested app has no stats", etc.) in a JSON body EVEN on non-200 (it
+        // 400s for a private profile) — so parse the body first regardless of code.
+        let decoded = try? JSONDecoder().decode(Resp.self, from: data)
+        if let steamErr = decoded?.playerstats?.error {
+            let hint = steamErr.localizedCaseInsensitiveContains("not public")
+                ? " — set your Steam profile's 'Game details' privacy to Public to see them here."
+                : ""
+            throw SteamAuthError(message: "\(steamErr)\(hint)")
+        }
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+              decoded?.playerstats?.success == true else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            throw SteamAuthError(message: "This game has no achievements, or they couldn't be loaded (HTTP \(code)).")
+        }
+        return decoded?.playerstats?.achievements ?? []
+    }
+
+    // Global unlock rarity — what fraction of ALL owners have each achievement.
+    // Public, keyless. Keyed by apiname, so it joins directly onto the per-user
+    // list from fetchAchievements. Returns [apiname: percent].
+    static func fetchGlobalAchievementPercents(appid: String) async -> [String: Double] {
+        var comps = URLComponents(string: "https://api.steampowered.com/ISteamUserStats/GetGlobalAchievementPercentagesForApp/v2/")!
+        comps.queryItems = [URLQueryItem(name: "gameid", value: appid)]
+        guard let url = comps.url,
+              let (data, response) = try? await URLSession.shared.data(from: url),
+              let http = response as? HTTPURLResponse, http.statusCode == 200 else { return [:] }
+        struct Resp: Decodable {
+            struct Entry: Decodable { let name: String; let percent: Double }
+            struct Inner: Decodable { let achievements: [Entry]? }
+            let achievementpercentages: Inner?
+        }
+        guard let decoded = try? JSONDecoder().decode(Resp.self, from: data) else { return [:] }
+        var map: [String: Double] = [:]
+        for e in decoded.achievementpercentages?.achievements ?? [] { map[e.name] = e.percent }
+        return map
+    }
+
+    // Browse an app's Workshop. Uses the logged-in user's access_token (the same
+    // webapi token GetOwnedGames/GetPlayerAchievements accept). If Steam rejects
+    // it, throws — the caller keeps the manual URL/ID install path as a fallback.
+    // query_type 3 = RankedByTrend (what the Workshop "Popular" tab shows).
+    static func fetchWorkshopItems(appid: String, accessToken: String, page: Int = 1,
+                                   search: String = "") async throws -> [WorkshopBrowseItem] {
+        var comps = URLComponents(string: "https://api.steampowered.com/IPublishedFileService/QueryFiles/v1/")!
+        var items = [
+            URLQueryItem(name: "access_token", value: accessToken),
+            URLQueryItem(name: "appid", value: appid),
+            URLQueryItem(name: "numperpage", value: "30"),
+            URLQueryItem(name: "page", value: String(page)),
+            URLQueryItem(name: "query_type", value: search.isEmpty ? "3" : "12"),
+            URLQueryItem(name: "return_metadata", value: "true"),
+            URLQueryItem(name: "return_previews", value: "true"),
+            URLQueryItem(name: "return_short_description", value: "true"),
+            URLQueryItem(name: "filetype", value: "0"),
+        ]
+        if !search.isEmpty { items.append(URLQueryItem(name: "search_text", value: search)) }
+        comps.queryItems = items
+        let (data, response) = try await URLSession.shared.data(from: comps.url!)
+        guard let http = response as? HTTPURLResponse else {
+            throw SteamAuthError(message: "Couldn't reach the Steam Workshop.")
+        }
+        guard http.statusCode == 200 else {
+            throw SteamAuthError(message: "Steam wouldn't authorize a Workshop search (HTTP \(http.statusCode)). You can still install items by ID below.")
+        }
+        struct Resp: Decodable {
+            struct Inner: Decodable { let publishedfiledetails: [WorkshopBrowseItem]? }
+            let response: Inner?
         }
         let decoded = try JSONDecoder().decode(Resp.self, from: data)
-        guard decoded.playerstats.success else {
-            throw SteamAuthError(message: decoded.playerstats.error ?? "No achievement data available for this game.")
-        }
-        return decoded.playerstats.achievements ?? []
+        // Only items that actually resolved (result == 1) and aren't hidden.
+        return (decoded.response?.publishedfiledetails ?? []).filter { $0.result == 1 }
     }
 
     // Public store metadata (description, tags) — no login needed, same endpoint
@@ -1021,12 +1091,46 @@ struct SteamAchievement: Identifiable, Decodable {
     let unlocktime: Int?
     let name: String?
     let description: String?
+    // Joined in from GetGlobalAchievementPercentagesForApp after fetch (not part
+    // of the GetPlayerAchievements response, so it's a mutable overlay).
+    var globalPercent: Double? = nil
+
+    private enum CodingKeys: String, CodingKey {
+        case apiname, achieved, unlocktime, name, description
+    }
+
+    var rarityLabel: String? {
+        guard let p = globalPercent else { return nil }
+        if p < 5 { return "Ultra Rare" }
+        if p < 15 { return "Rare" }
+        return nil
+    }
 }
 
 struct SteamAppDetails: Decodable {
     struct Genre: Decodable { let description: String }
     let short_description: String?
     let genres: [Genre]?
+}
+
+struct WorkshopBrowseItem: Identifiable, Decodable {
+    var id: String { publishedfileid }
+    let publishedfileid: String
+    let result: Int
+    let title: String?
+    let short_description: String?
+    let preview_url: String?
+    let file_size: String?   // bytes, as a string
+    let time_updated: Int?
+    let subscriptions: Int?
+    let favorited: Int?
+
+    var sizeFormatted: String? {
+        guard let s = file_size, let bytes = Int64(s), bytes > 0 else { return nil }
+        if bytes > 1_073_741_824 { return "\(bytes / 1_073_741_824) GB" }
+        if bytes > 1_048_576 { return "\(bytes / 1_048_576) MB" }
+        return "\(bytes / 1024) KB"
+    }
 }
 
 // MARK: - Steam Game Downloads (DepotDownloader — native, no Wine needed to download)
@@ -1207,6 +1311,31 @@ enum MistWorkshop {
 // since it applies to every game, not just ones Mist itself installed.
 private struct GameLaunchSettings: Codable {
     var customArgs: String = ""
+}
+
+// The user's own Steam Web API key (free, from steamcommunity.com/dev/apikey),
+// needed only for reading achievement data (see fetchAchievements). Stored in a
+// 0600 file like the login session — it's a personal, rate-limited read key, but
+// still the user's credential, so keep it off the plaintext-default UserDefaults.
+enum SteamAPIKeyStore {
+    static var fileURL: URL { MistEnv.supportDir.appendingPathComponent("steam_api_key.txt") }
+
+    static var key: String? {
+        guard let s = try? String(contentsOf: fileURL, encoding: .utf8) else { return nil }
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.isEmpty ? nil : t
+    }
+
+    static func save(_ raw: String) {
+        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        try? FileManager.default.createDirectory(at: MistEnv.supportDir, withIntermediateDirectories: true)
+        if t.isEmpty {
+            try? FileManager.default.removeItem(at: fileURL)
+            return
+        }
+        try? t.write(to: fileURL, atomically: true, encoding: .utf8)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+    }
 }
 
 enum GameSettingsStore {
@@ -2812,19 +2941,45 @@ struct GameDetailView: View {
     var onShowInFinder: () -> Void = {}
     var onLaunchOptions: () -> Void = {}
     var onInstallWorkshopItem: () -> Void = {}
+    var onInstallWorkshopID: (String) -> Void = { _ in }
+    var onOpenSettings: () -> Void = {}
 
     @Environment(\.dismiss) private var dismiss
     @State private var details: SteamAppDetails?
     @State private var achievements: [SteamAchievement] = []
     @State private var achievementsError: String?
     @State private var isLoadingAchievements = false
+    @State private var needsAPIKey = false
     @State private var workshopItems: [WorkshopItem] = []
+    @State private var showingWorkshopBrowse = false
 
     private var gptkInstalled: Bool {
         FileManager.default.fileExists(atPath: "/Applications/Game Porting Toolkit.app")
     }
 
     var body: some View {
+        // The Workshop browser is rendered INLINE (swapping the sheet's content)
+        // rather than as its own sheet. A sheet presented from within this
+        // already-a-sheet detail view is a nested sheet, and on macOS the
+        // interactive controls inside a nested sheet's ScrollView silently stop
+        // receiving clicks — verified: header buttons worked, the in-scroll
+        // Install buttons didn't. Swapping content in-place keeps a single sheet.
+        Group {
+            if showingWorkshopBrowse {
+                WorkshopBrowseView(game: game, steamAuth: steamAuth,
+                                   onInstall: onInstallWorkshopID,
+                                   onBack: { showingWorkshopBrowse = false })
+            } else {
+                detailContent
+            }
+        }
+        .frame(width: 680, height: 620)
+        .task(id: game.id) {
+            await loadAll()
+        }
+    }
+
+    private var detailContent: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
                 banner
@@ -2849,10 +3004,6 @@ struct GameDetailView: View {
                 }
                 .padding(20)
             }
-        }
-        .frame(width: 640, height: 620)
-        .task(id: game.id) {
-            await loadAll()
         }
     }
 
@@ -2984,7 +3135,25 @@ struct GameDetailView: View {
                 Spacer()
             }
 
-            if isLoadingAchievements {
+            if needsAPIKey {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Achievement data comes from Steam's Web API, which needs a free personal API key. Add yours once in Settings to see your unlock status and global rarity for every game.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 8) {
+                        Button(action: onOpenSettings) {
+                            Label("Add Key in Settings", systemImage: "key.fill")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        Link(destination: URL(string: "https://steamcommunity.com/dev/apikey")!) {
+                            Text("Get a key")
+                                .font(.system(size: 11))
+                        }
+                    }
+                }
+            } else if isLoadingAchievements {
                 ProgressView().controlSize(.small)
             } else if let err = achievementsError {
                 Text(err)
@@ -3003,8 +3172,18 @@ struct GameDetailView: View {
                                 .font(.system(size: 14))
                                 .frame(width: 18)
                             VStack(alignment: .leading, spacing: 1) {
-                                Text(ach.name ?? ach.apiname)
-                                    .font(.system(size: 12.5, weight: .medium))
+                                HStack(spacing: 6) {
+                                    Text(ach.name ?? ach.apiname)
+                                        .font(.system(size: 12.5, weight: .medium))
+                                    if let rarity = ach.rarityLabel {
+                                        Text(rarity)
+                                            .font(.system(size: 9, weight: .bold))
+                                            .padding(.horizontal, 5)
+                                            .padding(.vertical, 1)
+                                            .background(Color.purple.opacity(0.22), in: Capsule())
+                                            .foregroundColor(.purple)
+                                    }
+                                }
                                 if let desc = ach.description, !desc.isEmpty {
                                     Text(desc)
                                         .font(.system(size: 11))
@@ -3012,15 +3191,22 @@ struct GameDetailView: View {
                                 }
                             }
                             Spacer()
+                            if let pct = ach.globalPercent {
+                                Text(String(format: "%.1f%%", pct))
+                                    .font(.system(size: 11, weight: .medium).monospacedDigit())
+                                    .foregroundColor(.secondary)
+                            }
                         }
                         .opacity(ach.achieved == 1 ? 1 : 0.55)
                     }
                 }
             }
 
-            Text("Read-only — shows Steam's own record of your progress. Mist doesn't run a Steam client under Wine, so it can't unlock achievements live during gameplay.")
-                .font(.system(size: 10.5))
-                .foregroundColor(.secondary)
+            if !needsAPIKey {
+                Text("Read-only — shows Steam's own record of your progress, and what percent of all owners have each achievement. Mist doesn't run a Steam client under Wine, so it can't unlock achievements live during gameplay.")
+                    .font(.system(size: 10.5))
+                    .foregroundColor(.secondary)
+            }
         }
     }
 
@@ -3031,16 +3217,26 @@ struct GameDetailView: View {
                 Label("Workshop Items", systemImage: "shippingbox.fill")
                     .font(.system(size: 13, weight: .semibold))
                 Spacer()
-                Button("Install Item…", action: onInstallWorkshopItem)
+                Button {
+                    showingWorkshopBrowse = true
+                } label: {
+                    Label("Browse", systemImage: "magnifyingglass")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                Button("By ID…", action: onInstallWorkshopItem)
                     .buttonStyle(.bordered)
                     .controlSize(.small)
             }
 
             if workshopItems.isEmpty {
-                Text("No workshop items downloaded for this game yet.")
+                Text("No workshop items downloaded for this game yet. Browse to find some.")
                     .font(.caption)
                     .foregroundColor(.secondary)
             } else {
+                Text("Downloaded")
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundColor(.secondary)
                 VStack(spacing: 4) {
                     ForEach(workshopItems) { item in
                         HStack {
@@ -3067,15 +3263,234 @@ struct GameDetailView: View {
         }
 
         guard game.source == .steam, steamAuth.isLoggedIn else { return }
+        // Personal achievement status needs the user's own Web API key (the
+        // endpoint rejects our access_token). No key → show the call-to-action
+        // rather than a confusing error, and skip the fetch entirely.
+        guard let apiKey = SteamAPIKeyStore.key else {
+            needsAPIKey = true
+            return
+        }
+        needsAPIKey = false
         isLoadingAchievements = true
         do {
-            let token = try await steamAuth.mintAccessToken()
-            achievements = try await SteamLibraryService.fetchAchievements(
-                appid: game.id, steamID: steamAuth.steamID, accessToken: token)
+            var list = try await SteamLibraryService.fetchAchievements(
+                appid: game.id, steamID: steamAuth.steamID, apiKey: apiKey)
+            // Overlay global rarity (best-effort; keyless, never throws) then sort
+            // unlocked-first, and within each group rarest-last so the standout
+            // "Ultra Rare" ones you HAVE surface at the top.
+            let percents = await SteamLibraryService.fetchGlobalAchievementPercents(appid: game.id)
+            for i in list.indices { list[i].globalPercent = percents[list[i].apiname] }
+            list.sort { a, b in
+                if a.achieved != b.achieved { return a.achieved > b.achieved }
+                return (a.globalPercent ?? 101) < (b.globalPercent ?? 101)
+            }
+            achievements = list
         } catch {
-            achievementsError = "No achievement data available for this game."
+            achievementsError = (error as? SteamAuthError)?.errorDescription
+                ?? "No achievement data available for this game."
         }
         isLoadingAchievements = false
+    }
+}
+
+struct WorkshopBrowseView: View {
+    let game: Game
+    @ObservedObject var steamAuth: SteamAuthManager
+    let onInstall: (String) -> Void
+    var onBack: () -> Void = {}
+
+    @State private var items: [WorkshopBrowseItem] = []
+    @State private var search = ""
+    @State private var page = 1
+    @State private var isLoading = false
+    @State private var loadError: String?
+    @State private var canLoadMore = true
+    // Item IDs the user has clicked Install on this session — so the button can
+    // flip to a confirmation without needing to watch the actual download state
+    // (which lives in a different manager up in ContentView).
+    @State private var requested: Set<String> = []
+
+    private let columns = [GridItem(.adaptive(minimum: 260, maximum: 340), spacing: 12)]
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            Divider()
+            content
+        }
+        .task { await load(reset: true) }
+    }
+
+    private var header: some View {
+        HStack(spacing: 10) {
+            Button(action: onBack) {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 13, weight: .semibold))
+            }
+            .buttonStyle(.plain)
+            .keyboardShortcut(.cancelAction)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Workshop")
+                    .font(.headline)
+                Text(game.name)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            Spacer()
+            HStack(spacing: 5) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                TextField("Search the Workshop", text: $search)
+                    .textFieldStyle(.plain)
+                    .frame(width: 200)
+                    .onSubmit { Task { await load(reset: true) } }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 7))
+        }
+        .padding(14)
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if let err = loadError, items.isEmpty {
+            VStack(spacing: 10) {
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.system(size: 28))
+                    .foregroundColor(.secondary)
+                Text(err)
+                    .font(.callout)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 380)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if items.isEmpty && isLoading {
+            ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if items.isEmpty {
+            Text("No workshop items found.")
+                .foregroundColor(.secondary)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ScrollView {
+                LazyVGrid(columns: columns, spacing: 12) {
+                    ForEach(items) { item in
+                        WorkshopBrowseCard(
+                            item: item,
+                            requested: requested.contains(item.id),
+                            onInstall: {
+                                requested.insert(item.id)
+                                onInstall(item.id)
+                            }
+                        )
+                    }
+                }
+                .padding(14)
+                if canLoadMore && !items.isEmpty {
+                    Button {
+                        Task { await load(reset: false) }
+                    } label: {
+                        if isLoading { ProgressView().controlSize(.small) }
+                        else { Text("Load more") }
+                    }
+                    .buttonStyle(.bordered)
+                    .padding(.bottom, 16)
+                }
+            }
+        }
+    }
+
+    private func load(reset: Bool) async {
+        guard !isLoading else { return }
+        guard steamAuth.isLoggedIn else {
+            loadError = "Sign in to Steam to browse the Workshop."
+            return
+        }
+        isLoading = true
+        if reset { page = 1; canLoadMore = true }
+        do {
+            let token = try await steamAuth.mintAccessToken()
+            let fetched = try await SteamLibraryService.fetchWorkshopItems(
+                appid: game.id, accessToken: token, page: page, search: search)
+            if reset { items = fetched } else { items += fetched }
+            canLoadMore = !fetched.isEmpty
+            if canLoadMore { page += 1 }
+            loadError = nil
+        } catch {
+            loadError = (error as? SteamAuthError)?.errorDescription
+                ?? "Couldn't load the Workshop. You can still install items by ID."
+        }
+        isLoading = false
+    }
+}
+
+struct WorkshopBrowseCard: View {
+    let item: WorkshopBrowseItem
+    let requested: Bool
+    let onInstall: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            AsyncImage(url: URL(string: item.preview_url ?? "")) { phase in
+                switch phase {
+                case .success(let image): image.resizable().scaledToFill()
+                default: Color.primary.opacity(0.06)
+                }
+            }
+            .frame(height: 120)
+            .frame(maxWidth: .infinity)
+            .clipped()
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            // scaledToFill renders past the 120px frame (workshop previews are
+            // wide); .clipped() hides that visually but the overflow still
+            // hit-tests over the Install button below, swallowing its clicks —
+            // the image is decorative, so opt it out of hit testing entirely.
+            .allowsHitTesting(false)
+
+            Text(item.title ?? "Untitled")
+                .font(.system(size: 12.5, weight: .semibold))
+                .lineLimit(1)
+
+            if let desc = item.short_description, !desc.isEmpty {
+                Text(desc)
+                    .font(.system(size: 10.5))
+                    .foregroundColor(.secondary)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            HStack(spacing: 8) {
+                if let subs = item.subscriptions {
+                    Label(compact(subs), systemImage: "person.2.fill")
+                }
+                if let size = item.sizeFormatted {
+                    Label(size, systemImage: "internaldrive")
+                }
+            }
+            .font(.system(size: 10))
+            .foregroundColor(.secondary)
+
+            Button(action: onInstall) {
+                Label(requested ? "Installing…" : "Install",
+                      systemImage: requested ? "checkmark" : "arrow.down.circle.fill")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(requested)
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(.regularMaterial))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.primary.opacity(0.06)))
+    }
+
+    private func compact(_ n: Int) -> String {
+        if n >= 1_000_000 { return String(format: "%.1fM", Double(n) / 1_000_000) }
+        if n >= 1_000 { return String(format: "%.1fk", Double(n) / 1_000) }
+        return "\(n)"
     }
 }
 
@@ -3779,6 +4194,62 @@ struct SettingsInfoRow: View {
     }
 }
 
+// Optional Steam Web API key — only used for reading achievement data (the old
+// GetPlayerAchievements endpoint requires `key=` and rejects our access_token).
+// Uses a SecureField so the key isn't shoulder-surfed; persisted via
+// SteamAPIKeyStore. The user pastes their OWN free key — Mist never asks for it
+// anywhere else and never transmits it except to Steam's own API.
+struct SteamAPIKeyField: View {
+    @State private var draft: String = SteamAPIKeyStore.key ?? ""
+    @State private var saved = false
+
+    private var hasStoredKey: Bool { SteamAPIKeyStore.key != nil }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: hasStoredKey ? "key.fill" : "key")
+                    .font(.system(size: 11))
+                    .foregroundColor(hasStoredKey ? .green : .secondary)
+                Text("Web API Key")
+                    .font(.system(size: 12, weight: .medium))
+                Text("— for achievements")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                Spacer()
+                Link("Get one", destination: URL(string: "https://steamcommunity.com/dev/apikey")!)
+                    .font(.system(size: 11))
+            }
+            HStack {
+                SecureField("Paste your Steam Web API key", text: $draft)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(.caption, design: .monospaced))
+                Button(saved ? "Saved" : "Save") {
+                    SteamAPIKeyStore.save(draft)
+                    saved = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { saved = false }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(draft == (SteamAPIKeyStore.key ?? ""))
+                if hasStoredKey {
+                    Button(role: .destructive) {
+                        SteamAPIKeyStore.save("")
+                        draft = ""
+                    } label: {
+                        Image(systemName: "trash")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+            Text("Stored locally (0600 file), sent only to Steam's own API to read your achievement progress.")
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)
+        }
+    }
+}
+
 struct ContentView: View {
     @StateObject private var library: GameLibrary
     @StateObject private var processManager: ProcessManager
@@ -3911,6 +4382,8 @@ struct ContentView: View {
                                                     .font(.caption)
                                                     .foregroundColor(.red)
                                             }
+                                            Divider()
+                                            SteamAPIKeyField()
                                         }
                                     }
 
@@ -4118,7 +4591,18 @@ struct ContentView: View {
                 onUninstall: { pendingUninstall = game },
                 onShowInFinder: { handleShowInFinder(game) },
                 onLaunchOptions: { gameForLaunchOptions = game },
-                onInstallWorkshopItem: { gameForWorkshopInstall = game }
+                onInstallWorkshopItem: { gameForWorkshopInstall = game },
+                onInstallWorkshopID: { pubfileID in
+                    downloadManager.installWorkshopItem(appid: game.id, pubfileID: pubfileID,
+                                                        gameName: game.name,
+                                                        steamAccountName: steamAuth.accountName) {
+                        library.scan()
+                    }
+                },
+                onOpenSettings: {
+                    gameForDetail = nil
+                    sidebarSelection = "settings"
+                }
             )
         }
         .focusedSceneValue(\.rescanAction, { library.scan() })
