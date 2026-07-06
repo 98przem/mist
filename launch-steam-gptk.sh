@@ -20,8 +20,8 @@ fi
 WINE_BIN="${GPTK_APP}/bin/wine64"
 WINESERVER="${GPTK_APP}/bin/wineserver"
 SHARED_PREFIX="${WINEPREFIX:-$HOME/Library/Application Support/Mist}"
-# Use a dedicated GPTK prefix so GPTK's Wine (7.7) never reconfigures the bundled
-# Wine (11.7) prefix — no version churn. The Steam library is symlinked in, so the
+# Use a dedicated GPTK prefix so GPTK's Wine never reconfigures the bundled
+# CX Wine prefix — no version churn. The Steam library is symlinked in, so the
 # game's C:\ paths are unchanged.
 mist_gptk_prefix "${SHARED_PREFIX}" "${WINE_BIN}"
 WINEPREFIX="${GPTK_PREFIX}"

@@ -1,7 +1,7 @@
 import SwiftUI
 import Cocoa
 import Foundation
-import WebKit
+import CryptoKit
 
 // MARK: - Data Models
 
@@ -50,6 +50,378 @@ struct Game: Identifiable, Hashable {
     }
 }
 
+// MARK: - Mist Environment (native Wine paths + env — no shell scripts)
+
+enum MistEnv {
+    static let supportDir = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/Mist")
+    static let wineDir = supportDir.appendingPathComponent("wine")
+    static let winePrefix = supportDir
+    static var wineBinary: URL { wineDir.appendingPathComponent("bin/wine") }
+    static var wineserverBinary: URL { wineDir.appendingPathComponent("bin/wineserver") }
+    static var steamExePath: URL {
+        winePrefix.appendingPathComponent("drive_c/Program Files (x86)/Steam/steam.exe")
+    }
+    static var cefDir: URL {
+        winePrefix.appendingPathComponent("drive_c/Program Files (x86)/Steam/bin/cef/cef.win64")
+    }
+
+    // Wine binary AND lib/ AND share/ — an interrupted install is incomplete, not "installed"
+    static var wineInstalled: Bool {
+        let fm = FileManager.default
+        return fm.isExecutableFile(atPath: wineBinary.path)
+            && fm.fileExists(atPath: wineDir.appendingPathComponent("lib").path)
+            && fm.fileExists(atPath: wineDir.appendingPathComponent("share").path)
+    }
+
+    // The Sikarugir CX engine ships no support dylibs (it expects the host app to
+    // provide them) — they're merged in as a separate setup step. libinotify is the
+    // marker: without it wineserver can't even start.
+    static var runtimeLibsInstalled: Bool {
+        FileManager.default.fileExists(
+            atPath: wineDir.appendingPathComponent("lib/libinotify.0.dylib").path)
+    }
+    static var steamInstalled: Bool {
+        FileManager.default.fileExists(atPath: steamExePath.path)
+    }
+
+    static func baseEnvironment() -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        env["WINEPREFIX"] = winePrefix.path
+        env["WINEARCH"] = "win64"
+        env["WINEDATADIR"] = wineDir.appendingPathComponent("share/wine").path
+        env["DYLD_LIBRARY_PATH"] = wineDir.appendingPathComponent("lib").path
+        env["PATH"] = "\(wineDir.appendingPathComponent("bin").path):/usr/bin:/bin:/usr/sbin:/sbin"
+        env["WINESERVER"] = wineserverBinary.path
+        env["WINEMSYNC"] = "1"
+        env["WINEESYNC"] = "1"
+        if env["WINEDEBUG"] == nil { env["WINEDEBUG"] = "-all" }
+        return env
+    }
+
+    static func steamEnvironment() -> [String: String] {
+        var env = baseEnvironment()
+        env["DOTNET_EnableWriteXorExecute"] = "0"
+        // Steam CEF rendering fix: Wine's DXGI doesn't report properly, causing CEF to
+        // black-screen. Force software rendering — only affects Steam's UI, not games.
+        env["STEAM_DISABLE_GPU_PROCESS"] = "1"
+        env["GALLIUM_DRIVER"] = "llvmpipe"
+        env["STEAM_CEF_COMMAND_LINE"] = "--no-sandbox --in-process-gpu --disable-gpu --disable-gpu-compositing --use-gl=swiftshader --disable-software-rasterizer"
+        // DXVK (d3d11) + vkd3d-proton (d3d12) for Vulkan→MoltenVK→Metal rendering
+        env["WINEDLLOVERRIDES"] = "d3d11,d3d10core,d3d12,d3d12core=n,b"
+        // Null EOS anti-cheat client so EOS games don't crash (offline/singleplayer only)
+        env["EOS_USE_ANTICHEATCLIENTNULL"] = "1"
+        return env
+    }
+
+    static let steamCEFArgs = [
+        "-cef-disable-gpu", "-cef-disable-gpu-compositing", "-cef-in-process-gpu",
+        "-cef-disable-sandbox", "-no-cef-sandbox", "-noverifyfiles", "-norepairfiles",
+    ]
+
+    // Bundled steamwebhelper wrapper (Resources in the .app; repo root in dev builds)
+    static var webhelperWrapper: URL? {
+        var candidates: [URL] = []
+        if let res = Bundle.main.resourcePath {
+            candidates.append(URL(fileURLWithPath: res).appendingPathComponent("steamwebhelper_wrapper.exe"))
+        }
+        // Dev: Mist.app/Contents/MacOS/Mist → repo root is 3 levels up
+        let binDir = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
+        candidates.append(binDir.deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().appendingPathComponent("steamwebhelper_wrapper.exe"))
+        candidates.append(URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("steamwebhelper_wrapper.exe"))
+        return candidates.first { FileManager.default.fileExists(atPath: $0.path) }
+    }
+
+    @discardableResult
+    static func run(_ tool: URL, _ args: [String], env: [String: String]? = nil,
+                    cwd: URL? = nil) -> Int32 {
+        let p = Process()
+        p.executableURL = tool
+        p.arguments = args
+        if let env = env { p.environment = env }
+        if let cwd = cwd { p.currentDirectoryURL = cwd }
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return -1 }
+        p.waitUntilExit()
+        return p.terminationStatus
+    }
+
+    static func killWineserver() {
+        run(wineserverBinary, ["-k"], env: baseEnvironment())
+    }
+
+    static func waitWineserver() {
+        run(wineserverBinary, ["-w"], env: baseEnvironment())
+    }
+
+    // Install (or re-install after a Steam update) the webhelper wrapper that forces
+    // software rendering for Steam's CEF browser — without it the UI is a black screen.
+    static func installWebhelperWrapperIfNeeded() {
+        guard let wrapper = webhelperWrapper else { return }
+        let fm = FileManager.default
+        let dst = cefDir.appendingPathComponent("steamwebhelper.exe")
+        let real = cefDir.appendingPathComponent("steamwebhelper_real.exe")
+        guard fm.fileExists(atPath: dst.path) else { return }
+        let size = ((try? fm.attributesOfItem(atPath: dst.path))?[.size] as? NSNumber)?.int64Value ?? 0
+        // The real Steam binary is always >1 MB; our wrapper is far smaller.
+        if size > 1_048_576 {
+            try? fm.removeItem(at: real)
+            try? fm.copyItem(at: dst, to: real)
+            try? fm.removeItem(at: dst)
+            try? fm.copyItem(at: wrapper, to: dst)
+        }
+    }
+}
+
+struct SetupError: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
+}
+
+// MARK: - Setup Manager (downloads Wine engine + Steam — all native)
+
+final class SetupManager: NSObject, ObservableObject, URLSessionDownloadDelegate {
+    static let engineName = "WS12WineCX24.0.7_7"
+    static let engineURL = URL(string:
+        "https://github.com/Sikarugir-App/Engines/releases/download/v1.0/WS12WineCX24.0.7_7.tar.xz")!
+    static let engineSHA256 = "203f9e9fd6c2cc77e6525d798a434ced326145db34a356355e05659d3445fd1c"
+    // Donor for support dylibs (freetype, gnutls, libinotify…) the CX engine doesn't
+    // bundle. Only lib/*.dylib is taken from this archive — the Wine binaries in use
+    // remain CrossOver's.
+    static let runtimeLibsURL = URL(string:
+        "https://github.com/Gcenx/macOS_Wine_builds/releases/download/11.7/wine-staging-11.7-osx64.tar.xz")!
+    static let runtimeLibsSHA256 = "fd0b9e54c7c17d972d922b686301c37fe4f3e9986f01f49fdff858118c045d94"
+    static let steamInstallerURL = URL(string:
+        "https://cdn.cloudflare.steamstatic.com/client/installer/SteamSetup.exe")!
+
+    @Published var wineInstalled = MistEnv.wineInstalled && MistEnv.runtimeLibsInstalled
+    @Published var steamInstalled = MistEnv.steamInstalled
+    @Published var isWorking = false
+    @Published var statusText = ""
+    @Published var downloadProgress: Double? = nil  // nil = indeterminate
+    @Published var errorText: String?
+
+    var isComplete: Bool { wineInstalled && steamInstalled }
+
+    func refresh() {
+        wineInstalled = MistEnv.wineInstalled && MistEnv.runtimeLibsInstalled
+        steamInstalled = MistEnv.steamInstalled
+    }
+
+    func runFullSetup() {
+        guard !isWorking else { return }
+        isWorking = true
+        errorText = nil
+        Task.detached { [weak self] in
+            guard let self else { return }
+            do {
+                #if arch(arm64)
+                if MistEnv.run(URL(fileURLWithPath: "/usr/bin/pgrep"), ["-q", "oahd"]) != 0 {
+                    throw SetupError(message: "Rosetta 2 is required to run Wine on Apple Silicon.\nInstall it in Terminal:  softwareupdate --install-rosetta --agree-to-license")
+                }
+                #endif
+                try FileManager.default.createDirectory(
+                    at: MistEnv.supportDir, withIntermediateDirectories: true)
+                if !MistEnv.wineInstalled { try await self.installWineEngine() }
+                if !MistEnv.runtimeLibsInstalled { try await self.installRuntimeLibs() }
+                try await self.initPrefixIfNeeded()
+                if !MistEnv.steamInstalled { try await self.installSteam() }
+                await MainActor.run {
+                    self.refresh()
+                    self.isWorking = false
+                    self.statusText = "Ready!"
+                }
+            } catch {
+                await MainActor.run {
+                    self.refresh()
+                    self.isWorking = false
+                    self.errorText = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    // ── Steps ─────────────────────────────────────────────────────────
+
+    private func installWineEngine() async throws {
+        let tarball = try await download(Self.engineURL,
+                                         status: "Downloading Wine engine (CrossOver 24)…")
+        defer { try? FileManager.default.removeItem(at: tarball) }
+
+        await setStatus("Verifying checksum…", progress: nil)
+        let hash = try sha256(of: tarball)
+        guard hash == Self.engineSHA256 else {
+            throw SetupError(message: "The Wine download failed checksum verification. Try again.")
+        }
+
+        await setStatus("Extracting Wine…", progress: nil)
+        let fm = FileManager.default
+        let extractDir = fm.temporaryDirectory.appendingPathComponent("mist-engine-\(UUID().uuidString)")
+        try fm.createDirectory(at: extractDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: extractDir) }
+        guard MistEnv.run(URL(fileURLWithPath: "/usr/bin/tar"),
+                          ["xf", tarball.path, "-C", extractDir.path]) == 0 else {
+            throw SetupError(message: "Failed to extract the Wine engine archive.")
+        }
+        // Sikarugir engines extract to wswine.bundle/ at the archive root
+        let bundle = extractDir.appendingPathComponent("wswine.bundle")
+        guard fm.isExecutableFile(atPath: bundle.appendingPathComponent("bin/wine").path) else {
+            throw SetupError(message: "Unexpected engine archive layout (wswine.bundle missing).")
+        }
+
+        await setStatus("Installing Wine…", progress: nil)
+        // Stage on the same filesystem, then one atomic rename — an interrupted copy
+        // never leaves a half-installed (and falsely "complete") Wine tree.
+        let staging = MistEnv.supportDir.appendingPathComponent("wine.staging-\(UUID().uuidString)")
+        try fm.createDirectory(at: staging, withIntermediateDirectories: true)
+        for sub in ["bin", "lib", "share"] {
+            try fm.copyItem(at: bundle.appendingPathComponent(sub),
+                            to: staging.appendingPathComponent(sub))
+        }
+        if fm.fileExists(atPath: MistEnv.wineDir.path) { try fm.removeItem(at: MistEnv.wineDir) }
+        try fm.moveItem(at: staging, to: MistEnv.wineDir)
+    }
+
+    private func installRuntimeLibs() async throws {
+        let tarball = try await download(Self.runtimeLibsURL,
+                                         status: "Downloading runtime libraries…")
+        defer { try? FileManager.default.removeItem(at: tarball) }
+
+        await setStatus("Verifying checksum…", progress: nil)
+        let hash = try sha256(of: tarball)
+        guard hash == Self.runtimeLibsSHA256 else {
+            throw SetupError(message: "The runtime libraries download failed checksum verification. Try again.")
+        }
+
+        await setStatus("Installing runtime libraries…", progress: nil)
+        let fm = FileManager.default
+        let extractDir = fm.temporaryDirectory.appendingPathComponent("mist-libs-\(UUID().uuidString)")
+        try fm.createDirectory(at: extractDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: extractDir) }
+        guard MistEnv.run(URL(fileURLWithPath: "/usr/bin/tar"),
+                          ["xf", tarball.path, "-C", extractDir.path]) == 0 else {
+            throw SetupError(message: "Failed to extract the runtime libraries archive.")
+        }
+        guard let app = try fm.contentsOfDirectory(at: extractDir, includingPropertiesForKeys: nil)
+            .first(where: { $0.lastPathComponent.hasSuffix(".app") }) else {
+            throw SetupError(message: "Unexpected runtime libraries archive layout.")
+        }
+        let donorLib = app.appendingPathComponent("Contents/Resources/wine/lib")
+        let targetLib = MistEnv.wineDir.appendingPathComponent("lib")
+        // Copy every top-level dylib (and its version symlinks) into the engine's lib/.
+        // These are generic support libraries — the Wine binaries stay CrossOver's.
+        for item in try fm.contentsOfDirectory(at: donorLib, includingPropertiesForKeys: nil) {
+            guard item.lastPathComponent.hasSuffix(".dylib") else { continue }
+            let dst = targetLib.appendingPathComponent(item.lastPathComponent)
+            if fm.fileExists(atPath: dst.path) { continue }
+            try fm.copyItem(at: item, to: dst)
+        }
+        guard MistEnv.runtimeLibsInstalled else {
+            throw SetupError(message: "Runtime libraries did not install correctly.")
+        }
+    }
+
+    private func initPrefixIfNeeded() async throws {
+        // Check drive_c/windows, not just drive_c — a failed wineboot can leave an
+        // empty drive_c behind, which must not count as an initialized prefix.
+        let windowsDir = MistEnv.winePrefix.appendingPathComponent("drive_c/windows")
+        guard !FileManager.default.fileExists(atPath: windowsDir.path) else { return }
+        await setStatus("Creating Wine prefix (first run takes a minute)…", progress: nil)
+        MistEnv.run(MistEnv.wineBinary, ["wineboot", "--init"], env: MistEnv.baseEnvironment())
+        MistEnv.waitWineserver()
+        guard FileManager.default.fileExists(atPath: windowsDir.path) else {
+            throw SetupError(message: "Failed to initialize the Wine prefix.")
+        }
+    }
+
+    private func installSteam() async throws {
+        let installer = try await download(Self.steamInstallerURL, status: "Downloading Steam…")
+        defer { try? FileManager.default.removeItem(at: installer) }
+
+        await setStatus("Installing Steam (takes a few minutes)…", progress: nil)
+        MistEnv.run(MistEnv.wineBinary, [installer.path, "/S"], env: MistEnv.baseEnvironment())
+        MistEnv.waitWineserver()
+        guard MistEnv.steamInstalled else {
+            throw SetupError(message: "Steam did not install correctly (steam.exe not found). Try again.")
+        }
+        MistEnv.installWebhelperWrapperIfNeeded()
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────
+
+    private func setStatus(_ text: String, progress: Double?) async {
+        await MainActor.run {
+            self.statusText = text
+            self.downloadProgress = progress
+        }
+    }
+
+    private func sha256(of url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while true {
+            let data = handle.readData(ofLength: 8 * 1024 * 1024)
+            if data.isEmpty { break }
+            hasher.update(data: data)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    // ── Download with progress (URLSession delegate) ──────────────────
+
+    private var downloadContinuation: CheckedContinuation<URL, Error>?
+    private lazy var session = URLSession(configuration: .default,
+                                          delegate: self, delegateQueue: nil)
+
+    private func download(_ url: URL, status: String) async throws -> URL {
+        await setStatus(status, progress: 0)
+        return try await withCheckedThrowingContinuation { cont in
+            self.downloadContinuation = cont
+            self.session.downloadTask(with: url).resume()
+        }
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didWriteData bytesWritten: Int64, totalBytesWritten: Int64,
+                    totalBytesExpectedToWrite: Int64) {
+        guard totalBytesExpectedToWrite > 0 else { return }
+        let frac = Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)
+        DispatchQueue.main.async { self.downloadProgress = frac }
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didFinishDownloadingTo location: URL) {
+        if let http = downloadTask.response as? HTTPURLResponse, http.statusCode >= 400 {
+            downloadContinuation?.resume(throwing:
+                SetupError(message: "Download failed (HTTP \(http.statusCode))."))
+            downloadContinuation = nil
+            return
+        }
+        let name = downloadTask.originalRequest?.url?.lastPathComponent ?? "download"
+        let dest = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(UUID().uuidString)-\(name)")
+        do {
+            try FileManager.default.moveItem(at: location, to: dest)
+            downloadContinuation?.resume(returning: dest)
+        } catch {
+            downloadContinuation?.resume(throwing: error)
+        }
+        downloadContinuation = nil
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    didCompleteWithError error: Error?) {
+        if let error = error {
+            downloadContinuation?.resume(throwing: error)
+            downloadContinuation = nil
+        }
+    }
+}
+
 // MARK: - Game Scanner
 
 // Find the full path to legendary, since .app bundles have a minimal PATH
@@ -95,58 +467,13 @@ class GameLibrary: ObservableObject {
     @Published var isScanning = false
     @Published var lastError: String?
 
-    let supportDir: URL
-    let wineDir: URL
-    let steamAppsDir: URL
-    let epicDir: URL
-    let projectDir: URL  // git-clone dev directory
+    let supportDir = MistEnv.supportDir
+    let wineDir = MistEnv.wineDir
+    let steamAppsDir = MistEnv.supportDir
+        .appendingPathComponent("drive_c/Program Files (x86)/Steam/steamapps")
+    let epicDir = MistEnv.supportDir.appendingPathComponent("drive_c/Epic Games")
 
-    init() {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        supportDir = home.appendingPathComponent("Library/Application Support/Mist")
-
-        // Find Wine: check project dir first (dev workflow), then support dir (bundle workflow)
-        let possibleProjectDirs = [
-            // Next to the binary
-            URL(fileURLWithPath: (CommandLine.arguments[0] as NSString).deletingLastPathComponent),
-            // Common dev locations
-            home.appendingPathComponent("opensource-wine-steam"),
-            URL(fileURLWithPath: FileManager.default.currentDirectoryPath),
-        ]
-
-        var foundProjectDir: URL? = nil
-        for dir in possibleProjectDirs {
-            // Check if this dir or its parent has wine/bin/wine
-            for candidate in [dir, dir.deletingLastPathComponent().deletingLastPathComponent()] {
-                if FileManager.default.isExecutableFile(
-                    atPath: candidate.appendingPathComponent("wine/bin/wine").path) {
-                    foundProjectDir = candidate
-                    break
-                }
-            }
-            if foundProjectDir != nil { break }
-        }
-
-        projectDir = foundProjectDir ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-
-        // Wine dir: prefer project dir, fall back to support dir
-        if let found = foundProjectDir,
-           FileManager.default.isExecutableFile(
-            atPath: found.appendingPathComponent("wine/bin/wine").path) {
-            wineDir = found.appendingPathComponent("wine")
-        } else {
-            wineDir = supportDir.appendingPathComponent("wine")
-        }
-
-        steamAppsDir = supportDir
-            .appendingPathComponent("drive_c/Program Files (x86)/Steam/steamapps")
-        epicDir = supportDir.appendingPathComponent("drive_c/Epic Games")
-    }
-
-    var wineExists: Bool {
-        FileManager.default.isExecutableFile(
-            atPath: wineDir.appendingPathComponent("bin/wine").path)
-    }
+    var wineExists: Bool { MistEnv.wineInstalled }
 
     func scan() {
         isScanning = true
@@ -351,45 +678,28 @@ class ProcessManager: ObservableObject {
     @Published var isRunning = false
     @Published var currentGame: Game?
     @Published var outputLog: String = ""
-    @Published var isSettingUp = false
-    @Published var setupProgress: String = ""
-    @Published var lastError: String?
 
     private var process: Process?
+    private var dialogKillerTimer: Timer?
     private let library: GameLibrary
 
     init(library: GameLibrary) {
         self.library = library
     }
 
-    var scriptDir: String {
-        if let resourcePath = Bundle.main.resourcePath,
-           FileManager.default.fileExists(atPath: "\(resourcePath)/launch-steam.sh") {
-            return resourcePath
-        }
-        // Dev mode: use project directory from library
-        let projDir = library.projectDir.path
-        if FileManager.default.fileExists(atPath: "\(projDir)/launch-steam.sh") {
-            return projDir
-        }
-        // Fallback: current directory
-        let cwd = FileManager.default.currentDirectoryPath
-        if FileManager.default.fileExists(atPath: "\(cwd)/launch-steam.sh") {
-            return cwd
-        }
-        // Last resort: look next to the binary
-        let binary = CommandLine.arguments[0]
-        let binDir = (binary as NSString).deletingLastPathComponent
-        let parentDir = (binDir as NSString).deletingLastPathComponent
-        if FileManager.default.fileExists(atPath: "\(parentDir)/launch-steam.sh") {
-            return parentDir
-        }
-        return cwd
-    }
+    private let gptkWinePath =
+        "/Applications/Game Porting Toolkit.app/Contents/Resources/wine/bin/wine64"
 
-    func launchSteam() {
-        let script = "\(scriptDir)/launch-steam.sh"
-        runProcess(path: "/bin/bash", arguments: [script])
+    func launchSteam(extraArgs: [String] = []) {
+        outputLog = "Starting Steam…\n"
+            + "Sign in on Steam's screen — scan the QR code with the Steam Mobile app, or use your password.\n\n"
+        MistEnv.killWineserver()
+        MistEnv.installWebhelperWrapperIfNeeded()
+        runProcess(path: MistEnv.wineBinary.path,
+                   arguments: ["C:/Program Files (x86)/Steam/steam.exe"]
+                       + MistEnv.steamCEFArgs + extraArgs,
+                   env: MistEnv.steamEnvironment())
+        startDialogKiller()
     }
 
     enum LaunchMode: String {
@@ -406,134 +716,179 @@ class ProcessManager: ObservableObject {
         case .steam:
             switch mode {
             case .gptk:
-                // Launch directly via Apple GPTK Wine (D3D12→Metal, offline)
-                let script = "\(scriptDir)/launch-steam-gptk.sh"
-                runProcess(path: "/bin/bash", arguments: [script, game.id])
+                launchGameGPTK(game)
             case .noEAC:
-                // Offline/singleplayer: run the game's exe directly (no anti-cheat)
-                let script = "\(scriptDir)/launch-steam-game.sh"
-                runProcess(path: "/bin/bash", arguments: [script, game.id, "--no-eac"])
+                launchGameDirect(game)
             case .normal:
-                let script = "\(scriptDir)/launch-steam.sh"
-                runProcess(path: "/bin/bash", arguments: [script, "-applaunch", game.id])
+                launchSteam(extraArgs: ["-applaunch", game.id])
             }
         case .epic:
-            let script = "\(scriptDir)/launch-epic-game.sh"
-            let gameDir = game.installDir
-
-            outputLog += "Game dir: \(gameDir)\n"
-            outputLog += "Mode: \(mode.rawValue)\n\n"
-
             switch mode {
             case .noEAC:
-                runProcess(path: "/bin/bash", arguments: [script, gameDir, "--no-eac"])
+                launchGameDirect(game)
             case .normal, .gptk:
                 // Use legendary for the launch (handles Epic auth / cloud saves),
                 // pointing it at GPTK/D3DMetal when installed (reliable for D3D12).
-                let gptkWine = "/Applications/Game Porting Toolkit.app/Contents/Resources/wine/bin/wine64"
-                let useGPTK = FileManager.default.fileExists(atPath: gptkWine)
-                let wineBin = useGPTK ? gptkWine : library.wineDir.appendingPathComponent("bin/wine").path
+                let useGPTK = FileManager.default.fileExists(atPath: gptkWinePath)
+                let wineBin = useGPTK ? gptkWinePath : MistEnv.wineBinary.path
+                var env: [String: String]
+                if useGPTK {
+                    env = ProcessInfo.processInfo.environment
+                    env["WINEPREFIX"] = MistEnv.winePrefix.path
+                    env["WINEARCH"] = "win64"
+                    if env["WINEDEBUG"] == nil { env["WINEDEBUG"] = "-all" }
+                    env["WINEMSYNC"] = "1"
+                    env["WINEESYNC"] = "1"
+                    // Force builtin DirectX DLLs so D3DMetal handles rendering
+                    env["WINEDLLOVERRIDES"] = "d3d9,d3d10,d3d10core,d3d11,d3d12,d3d12core,dxgi=b"
+                    env["PATH"] = "\((gptkWinePath as NSString).deletingLastPathComponent):/usr/bin:/bin"
+                } else {
+                    env = MistEnv.baseEnvironment()
+                }
                 runProcess(path: legendaryPath, arguments: [
                     "launch", game.id,
                     "--wine", wineBin,
-                    "--wine-prefix", library.supportDir.path
-                ], gptk: useGPTK)
+                    "--wine-prefix", MistEnv.winePrefix.path,
+                ], env: env)
             }
         }
     }
 
-    func runSetup() {
-        isSettingUp = true
-        setupProgress = "Downloading Wine..."
+    // Offline/singleplayer: run the game's main exe directly under the bundled Wine
+    // with the null EOS anti-cheat client (no anti-cheat — offline only).
+    private func launchGameDirect(_ game: Game) {
+        guard FileManager.default.fileExists(atPath: game.installDir),
+              let exe = findMainExe(in: game.installDir) else {
+            outputLog += "ERROR: couldn't find the game's executable in \(game.installDir)\n"
+            return
+        }
+        outputLog += "Exe: \(exe)\n\n"
+        var env = MistEnv.baseEnvironment()
+        env["WINEDLLOVERRIDES"] = "d3d11,d3d10core,d3d12,d3d12core=n,b"
+        env["EOS_USE_ANTICHEATCLIENTNULL"] = "1"
+        env["DOTNET_EnableWriteXorExecute"] = "0"
+        MistEnv.killWineserver()
+        runProcess(path: MistEnv.wineBinary.path, arguments: [exe], env: env,
+                   cwd: URL(fileURLWithPath: exe).deletingLastPathComponent())
+        startDialogKiller()
+    }
 
-        let script = "\(scriptDir)/setup.sh"
-        let targetDir = library.supportDir.appendingPathComponent("wine").path
+    // Launch via Apple's Game Porting Toolkit (D3DMetal) in a dedicated prefix, so
+    // GPTK's Wine never reconfigures the bundled CX prefix. The Steam/Epic libraries
+    // are symlinked in, keeping the same C:\ paths without re-downloading games.
+    private func launchGameGPTK(_ game: Game) {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: gptkWinePath) else {
+            outputLog += "ERROR: Game Porting Toolkit is not installed.\n"
+                + "Install it with: brew install --cask gcenx/wine/game-porting-toolkit\n"
+            return
+        }
+        let gptkBin = (gptkWinePath as NSString).deletingLastPathComponent
+        let gptkPrefix = URL(fileURLWithPath: MistEnv.winePrefix.path + "-gptk")
 
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-        proc.arguments = [script, "--target-dir", targetDir, "--quiet"]
+        var env = ProcessInfo.processInfo.environment
+        env["WINEPREFIX"] = gptkPrefix.path
+        env["WINEARCH"] = "win64"
+        if env["WINEDEBUG"] == nil { env["WINEDEBUG"] = "-all" }
+        env["WINEMSYNC"] = "1"
+        env["WINEESYNC"] = "1"
+        env["WINEDLLOVERRIDES"] = "d3d9,d3d10,d3d10core,d3d11,d3d12,d3d12core,dxgi=b"
+        env["EOS_USE_ANTICHEATCLIENTNULL"] = "1"
+        env["PATH"] = "\(gptkBin):/usr/bin:/bin"
 
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = FileHandle.nullDevice
-
-        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            guard !data.isEmpty, let line = String(data: data, encoding: .utf8) else { return }
-
-            for l in line.split(separator: "\n") {
-                let text = String(l)
-                if text.hasPrefix("PROGRESS:") {
-                    let status = String(text.dropFirst(9))
-                    DispatchQueue.main.async {
-                        switch status {
-                        case "downloading": self?.setupProgress = "Downloading Wine Staging..."
-                        case "verifying": self?.setupProgress = "Verifying checksum..."
-                        case "extracting": self?.setupProgress = "Extracting..."
-                        case "done": self?.setupProgress = "Done!"
-                        default: self?.setupProgress = status
-                        }
-                    }
-                }
+        if !fm.fileExists(atPath: gptkPrefix.appendingPathComponent("system.reg").path) {
+            outputLog += "Setting up dedicated GPTK prefix (one-time)…\n"
+            try? fm.createDirectory(at: gptkPrefix, withIntermediateDirectories: true)
+            MistEnv.run(URL(fileURLWithPath: gptkWinePath), ["wineboot", "--init"], env: env)
+            MistEnv.run(URL(fileURLWithPath: "\(gptkBin)/wineserver"), ["-w"], env: env)
+        }
+        let sharedC = MistEnv.winePrefix.appendingPathComponent("drive_c")
+        let gptkC = gptkPrefix.appendingPathComponent("drive_c")
+        let steamSrc = sharedC.appendingPathComponent("Program Files (x86)/Steam")
+        if fm.fileExists(atPath: steamSrc.path) {
+            let pfDir = gptkC.appendingPathComponent("Program Files (x86)")
+            try? fm.createDirectory(at: pfDir, withIntermediateDirectories: true)
+            let link = pfDir.appendingPathComponent("Steam")
+            if !fm.fileExists(atPath: link.path) {
+                try? fm.createSymbolicLink(at: link, withDestinationURL: steamSrc)
+            }
+        }
+        let epicSrc = sharedC.appendingPathComponent("Epic Games")
+        if fm.fileExists(atPath: epicSrc.path) {
+            let link = gptkC.appendingPathComponent("Epic Games")
+            if !fm.fileExists(atPath: link.path) {
+                try? fm.createSymbolicLink(at: link, withDestinationURL: epicSrc)
             }
         }
 
-        proc.terminationHandler = { [weak self] p in
-            DispatchQueue.main.async {
-                self?.isSettingUp = false
-                if p.terminationStatus == 0 {
-                    self?.lastError = nil
-                    self?.library.scan()
-                } else {
-                    let msg = "Setup failed (exit \(p.terminationStatus)). Check your connection and try again."
-                    self?.setupProgress = msg
-                    self?.lastError = msg
-                }
-            }
+        guard let exe = findMainExe(in: game.installDir) else {
+            outputLog += "ERROR: couldn't find the game's executable in \(game.installDir)\n"
+            return
         }
+        outputLog += "Exe: \(exe)\nRenderer: D3DMetal (GPTK)\n\n"
+        runProcess(path: gptkWinePath, arguments: [exe], env: env,
+                   cwd: URL(fileURLWithPath: exe).deletingLastPathComponent())
+        startDialogKiller()
+    }
 
-        do {
-            try proc.run()
-        } catch {
-            // run() threw — the termination handler will never fire, so clear the
-            // spinner here and surface the error (otherwise setup hangs forever).
-            DispatchQueue.main.async { [weak self] in
-                self?.isSettingUp = false
-                let msg = "Couldn't start setup: \(error.localizedDescription)"
-                self?.setupProgress = msg
-                self?.lastError = msg
+    // Pick the most likely main game .exe under a directory (port of mist_main_exe):
+    // skip helper/installer/anti-cheat exes; prefer an exe named like its folder,
+    // else the largest remaining exe.
+    private func findMainExe(in root: String, maxDepth: Int = 4) -> String? {
+        let fm = FileManager.default
+        let rootURL = URL(fileURLWithPath: root)
+        let rootName = rootURL.lastPathComponent.lowercased()
+        let skip = ["start_protected_game", "easyanticheat", "crashhandler", "crashreport",
+                    "setup", "unins", "redist", "touchup", "notification", "be_service",
+                    "beservice", "epicgameslauncher", "dxsetup", "vcredist", "helper"]
+        var best: (path: String, size: Int64)? = nil
+        var nameMatch: String? = nil
+        guard let en = fm.enumerator(at: rootURL, includingPropertiesForKeys: [.fileSizeKey],
+                                     options: [.skipsHiddenFiles]) else { return nil }
+        for case let url as URL in en {
+            let depth = url.pathComponents.count - rootURL.pathComponents.count
+            if depth > maxDepth {
+                en.skipDescendants()
+                continue
+            }
+            guard url.pathExtension.lowercased() == "exe" else { continue }
+            let base = url.lastPathComponent.lowercased()
+            if skip.contains(where: { base.contains($0) }) { continue }
+            let stem = String(base.dropLast(4))
+            let parent = url.deletingLastPathComponent().lastPathComponent.lowercased()
+            if stem == parent || stem == rootName { nameMatch = url.path }
+            let size = Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+            if best == nil || size > best!.size { best = (url.path, size) }
+        }
+        return nameMatch ?? best?.path
+    }
+
+    // Wine surfaces crashes in background processes (e.g. steamservice.exe) as
+    // winedbg dialog boxes that block the UI. Kill winedbg quietly instead —
+    // this replaces the old dismiss-dialogs.sh + Accessibility permission.
+    private func startDialogKiller() {
+        dialogKillerTimer?.invalidate()
+        dialogKillerTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            guard let self, self.isRunning else {
+                self?.dialogKillerTimer?.invalidate()
+                self?.dialogKillerTimer = nil
+                return
+            }
+            DispatchQueue.global(qos: .background).async {
+                MistEnv.run(URL(fileURLWithPath: "/usr/bin/pkill"), ["-f", "winedbg"])
             }
         }
     }
 
-    private func runProcess(path: String, arguments: [String], gptk: Bool = false) {
+    private func runProcess(path: String, arguments: [String],
+                            env: [String: String], cwd: URL? = nil) {
         isRunning = true
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: path)
         proc.arguments = arguments
-
-        var env = ProcessInfo.processInfo.environment
-        env["WINEPREFIX"] = library.supportDir.path
-        env["WINEARCH"] = "win64"
-        if env["WINEDEBUG"] == nil { env["WINEDEBUG"] = "-all" }
-        env["WINEMSYNC"] = "1"
-        env["WINEESYNC"] = "1"
-        if gptk {
-            // GPTK/D3DMetal: force builtin DirectX DLLs and don't leak the bundled
-            // Wine dylib/datadir paths (those carry DXVK/MoltenVK, which would
-            // override D3DMetal and fail under GPTK).
-            let gptkBin = "/Applications/Game Porting Toolkit.app/Contents/Resources/wine/bin"
-            env["WINEDLLOVERRIDES"] = "d3d9,d3d10,d3d10core,d3d11,d3d12,d3d12core,dxgi=b"
-            env.removeValue(forKey: "DYLD_LIBRARY_PATH")
-            env.removeValue(forKey: "WINEDATADIR")
-            env["PATH"] = "\(gptkBin):/usr/bin:/bin"
-        } else {
-            env["WINEDATADIR"] = library.wineDir.appendingPathComponent("share/wine").path
-            env["DYLD_LIBRARY_PATH"] = library.wineDir.appendingPathComponent("lib").path
-            env["PATH"] = "\(library.wineDir.appendingPathComponent("bin").path):/usr/bin:/bin:/usr/sbin:/sbin"
-        }
         proc.environment = env
+        if let cwd = cwd { proc.currentDirectoryURL = cwd }
 
         let outPipe = Pipe()
         let errPipe = Pipe()
@@ -560,6 +915,8 @@ class ProcessManager: ObservableObject {
                 self?.outputLog += "\n[Process exited with code \(p.terminationStatus)]\n"
                 self?.isRunning = false
                 self?.currentGame = nil
+                self?.dialogKillerTimer?.invalidate()
+                self?.dialogKillerTimer = nil
             }
         }
 
@@ -574,6 +931,7 @@ class ProcessManager: ObservableObject {
 
     func stop() {
         process?.terminate()
+        DispatchQueue.global().async { MistEnv.killWineserver() }
     }
 
     // MARK: - Epic Games via Legendary
@@ -933,40 +1291,55 @@ struct GameCardView: View {
 }
 
 struct SetupView: View {
-    @ObservedObject var processManager: ProcessManager
+    @ObservedObject var setup: SetupManager
 
     var body: some View {
         VStack(spacing: 20) {
-            Image(systemName: "cup.and.saucer.fill")
+            Image(systemName: "cloud.fog.fill")
                 .font(.system(size: 64))
                 .foregroundColor(.purple)
 
             Text("Welcome to Mist")
                 .font(.largeTitle.bold())
 
-            Text("Wine needs to be downloaded before you can play games.\nThis is a one-time setup (~190 MB).")
+            Text("Mist needs to download the Wine engine, its runtime libraries and the Windows Steam client.\nThis is a one-time setup (~400 MB).")
                 .multilineTextAlignment(.center)
                 .foregroundColor(.secondary)
 
-            if processManager.isSettingUp {
+            VStack(alignment: .leading, spacing: 8) {
+                Label("Wine engine (CrossOver 24)",
+                      systemImage: setup.wineInstalled ? "checkmark.circle.fill" : "circle")
+                    .foregroundColor(setup.wineInstalled ? .green : .secondary)
+                Label("Steam client",
+                      systemImage: setup.steamInstalled ? "checkmark.circle.fill" : "circle")
+                    .foregroundColor(setup.steamInstalled ? .green : .secondary)
+            }
+            .font(.callout)
+
+            if setup.isWorking {
                 VStack(spacing: 8) {
-                    ProgressView()
-                        .progressViewStyle(.linear)
-                    Text(processManager.setupProgress)
+                    if let progress = setup.downloadProgress {
+                        ProgressView(value: progress)
+                            .progressViewStyle(.linear)
+                    } else {
+                        ProgressView()
+                            .progressViewStyle(.linear)
+                    }
+                    Text(setup.statusText)
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
-                .frame(width: 300)
+                .frame(width: 320)
             } else {
-                if let err = processManager.lastError {
+                if let err = setup.errorText {
                     Label(err, systemImage: "exclamationmark.triangle.fill")
                         .font(.caption)
                         .foregroundColor(.red)
                         .multilineTextAlignment(.center)
-                        .frame(maxWidth: 320)
+                        .frame(maxWidth: 360)
                 }
-                Button(processManager.lastError == nil ? "Download Wine" : "Try Again") {
-                    processManager.runSetup()
+                Button(setup.errorText == nil ? "Download & Install" : "Try Again") {
+                    setup.runFullSetup()
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.purple)
@@ -1581,8 +1954,9 @@ struct RunningGameView: View {
 }
 
 struct ContentView: View {
-    @StateObject private var library = GameLibrary()
+    @StateObject private var library: GameLibrary
     @StateObject private var processManager: ProcessManager
+    @StateObject private var setup = SetupManager()
     @State private var sidebarSelection: String? = "all"
     @State private var showRunningView = false
     @State private var searchText = ""
@@ -1615,10 +1989,8 @@ struct ContentView: View {
 
     var body: some View {
         Group {
-            if !library.wineExists && !processManager.isSettingUp {
-                SetupView(processManager: processManager)
-            } else if processManager.isSettingUp {
-                SetupView(processManager: processManager)
+            if setup.isWorking || !setup.isComplete {
+                SetupView(setup: setup)
             } else {
                 NavigationSplitView {
                     SidebarView(
@@ -1636,17 +2008,26 @@ struct ContentView: View {
                             })
                         } else if sidebarSelection == "launch-steam" {
                             VStack(spacing: 20) {
-                                Image(systemName: "server.rack")
+                                Image(systemName: "person.badge.key.fill")
                                     .font(.system(size: 48))
                                     .foregroundColor(.blue)
-                                Text("Steam Client")
+                                Text("Steam")
                                     .font(.title2.bold())
-                                Button("Launch Steam") {
+                                Text("Opens the Windows Steam client.\nSign in on Steam's screen — scan the QR code with the Steam Mobile app, or use your password.")
+                                    .font(.callout)
+                                    .foregroundColor(.secondary)
+                                    .multilineTextAlignment(.center)
+                                Button {
                                     showRunningView = true
                                     processManager.launchSteam()
+                                } label: {
+                                    Label("Open Steam", systemImage: "play.fill")
                                 }
                                 .buttonStyle(.borderedProminent)
                                 .controlSize(.large)
+                                Text("First launch: Steam updates itself before showing the sign-in screen — give it a few minutes.")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
                             }
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                         } else if sidebarSelection == "epic-store" {
@@ -1673,12 +2054,6 @@ struct ContentView: View {
                                             Text("Prefix:")
                                                 .foregroundColor(.secondary)
                                             Text(library.supportDir.path)
-                                                .textSelection(.enabled)
-                                        }
-                                        HStack {
-                                            Text("Project:")
-                                                .foregroundColor(.secondary)
-                                            Text(library.projectDir.path)
                                                 .textSelection(.enabled)
                                         }
                                     }
@@ -1741,8 +2116,12 @@ struct ContentView: View {
         }
         .frame(minWidth: 700, minHeight: 500)
         .onAppear {
+            setup.refresh()
             library.scan()
             processManager.checkEpicLogin()
+        }
+        .onChange(of: setup.isComplete) { complete in
+            if complete { library.scan() }
         }
     }
 }

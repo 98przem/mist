@@ -1,5 +1,5 @@
 #!/bin/bash
-# Mist Setup — Downloads and configures Wine Staging for running Windows Steam on macOS
+# Mist Setup — Downloads and configures Wine (CrossOver edition) for running Windows Steam on macOS
 # Supports Apple Silicon (M1/M2/M3/M4) via Rosetta 2
 #
 # Usage: ./setup.sh [--target-dir DIR] [--quiet]
@@ -9,9 +9,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-WINE_VERSION="11.7"
-WINE_URL="https://github.com/Gcenx/macOS_Wine_builds/releases/download/wine-staging-${WINE_VERSION}/wine-staging-${WINE_VERSION}-osx64.tar.xz"
-WINE_SHA256="fd0b9e54c7c17d972d922b686301c37fe4f3e9986f01f49fdff858118c045d94"
+ENGINE_NAME="WS12WineCX24.0.7_7"
+WINE_URL="https://github.com/Sikarugir-App/Engines/releases/download/v1.0/${ENGINE_NAME}.tar.xz"
+WINE_SHA256="203f9e9fd6c2cc77e6525d798a434ced326145db34a356355e05659d3445fd1c"
 
 # Parse arguments
 TARGET_DIR=""
@@ -56,13 +56,13 @@ if [[ -x "${WINE_DIR}/bin/wine" && -d "${WINE_DIR}/lib" && -d "${WINE_DIR}/share
     progress "done"
 else
     progress "downloading"
-    log "Downloading Wine Staging ${WINE_VERSION}..."
+    log "Downloading Wine engine ${ENGINE_NAME}..."
 
-    if [[ -f "$HOME/Downloads/wine-staging-${WINE_VERSION}-osx64.tar.xz" ]]; then
-        TARBALL="$HOME/Downloads/wine-staging-${WINE_VERSION}-osx64.tar.xz"
+    if [[ -f "$HOME/Downloads/${ENGINE_NAME}.tar.xz" ]]; then
+        TARBALL="$HOME/Downloads/${ENGINE_NAME}.tar.xz"
         log "  (Using existing download from ~/Downloads)"
     else
-        TARBALL="$(mktemp /tmp/wine-staging-XXXXXX.tar.xz)"
+        TARBALL="$(mktemp /tmp/wine-engine-XXXXXX.tar.xz)"
         curl -L -o "${TARBALL}" "${WINE_URL}"
     fi
 
@@ -82,14 +82,12 @@ else
     EXTRACT_DIR=$(mktemp -d)
     tar xf "${TARBALL}" -C "${EXTRACT_DIR}"
 
-    # Find the Wine app bundle inside the extracted archive
-    WINE_APP=$(find "${EXTRACT_DIR}" -name "Wine Staging.app" -o -name "Wine Devel.app" | head -1)
-    if [[ -z "${WINE_APP}" ]]; then
-        echo "ERROR: Could not find Wine app in archive" >&2
+    # Sikarugir engines extract to wswine.bundle/ at the archive root
+    WINE_BUNDLE="${EXTRACT_DIR}/wswine.bundle"
+    if [[ ! -d "${WINE_BUNDLE}" ]]; then
+        echo "ERROR: Could not find wswine.bundle in engine archive" >&2
         exit 1
     fi
-
-    WINE_RESOURCES="${WINE_APP}/Contents/Resources/wine"
 
     # Stage into a temp dir on the same filesystem, then move into place in one
     # atomic rename. An interrupted copy never leaves a half-installed (and
@@ -97,9 +95,9 @@ else
     PARENT_DIR="$(dirname "${WINE_DIR}")"
     mkdir -p "${PARENT_DIR}"
     STAGING_DIR="$(mktemp -d "${WINE_DIR}.staging.XXXXXX")"
-    cp -R "${WINE_RESOURCES}/bin"   "${STAGING_DIR}/bin"
-    cp -R "${WINE_RESOURCES}/lib"   "${STAGING_DIR}/lib"
-    cp -R "${WINE_RESOURCES}/share" "${STAGING_DIR}/share"
+    cp -R "${WINE_BUNDLE}/bin"   "${STAGING_DIR}/bin"
+    cp -R "${WINE_BUNDLE}/lib"   "${STAGING_DIR}/lib"
+    cp -R "${WINE_BUNDLE}/share" "${STAGING_DIR}/share"
     rm -rf "${WINE_DIR}"
     mv "${STAGING_DIR}" "${WINE_DIR}"
 
@@ -112,7 +110,7 @@ else
         ln -sf wine/share "${SCRIPT_DIR}/share"
     fi
 
-    log "  Wine Staging ${WINE_VERSION} installed."
+    log "  Wine engine ${ENGINE_NAME} installed."
     progress "done"
 fi
 
