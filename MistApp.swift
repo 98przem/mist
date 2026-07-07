@@ -1157,6 +1157,98 @@ enum RelayManager {
     }
 }
 
+// MARK: - GBE (Steamworks emulator) — in-game achievements + overlay
+
+// Deploys gbe_fork's steam_api64.dll/steamclient64.dll/overlay into a game so it
+// runs under Wine thinking Steam is present — recording achievement unlocks (and
+// showing the overlay) with no Steam client. Unlocks land in a local gse_save/
+// folder next to the exe; after the game exits, syncAchievements() pushes any new
+// ones to the real Steam profile via RelayManager. This is the emulator half of
+// the in-game achievements feature; the relay is the "make it real" half.
+enum GBEManager {
+    static var dllDir: URL { MistEnv.supportDir.appendingPathComponent("tools/gbe") }
+    static var isInstalled: Bool {
+        FileManager.default.fileExists(atPath: dllDir.appendingPathComponent("steam_api64.dll").path)
+    }
+
+    // Portable save dir gbe_fork writes unlocks into (set via local_save_path),
+    // relative to the game's steam_api64.dll. Kept local so Mist can read it back.
+    static let saveDirName = "gse_save"
+
+    // Swap gbe_fork's DLLs into the game dir + write steam_settings. Idempotent:
+    // the game's original steam_api64.dll is backed up once to .mist-orig so the
+    // swap can be reverted, and re-deploying just refreshes the emu files.
+    static func deploy(gameDir: String, appid: String) throws {
+        guard isInstalled else { throw SteamAuthError(message: "The achievements emulator isn't installed yet.") }
+        let fm = FileManager.default
+        let dir = URL(fileURLWithPath: gameDir)
+
+        // steam_api64.dll sits wherever the game keeps it — find it (some games
+        // nest it under a data subfolder). Deploy beside each one we find.
+        let apiDLLs = locateSteamAPIDLLs(in: dir)
+        let targets = apiDLLs.isEmpty ? [dir.appendingPathComponent("steam_api64.dll")] : apiDLLs
+        for target in targets {
+            let folder = target.deletingLastPathComponent()
+            // Back up the original once.
+            let backup = target.appendingPathExtension("mist-orig")
+            if fm.fileExists(atPath: target.path), !fm.fileExists(atPath: backup.path) {
+                try? fm.moveItem(at: target, to: backup)
+            }
+            try? fm.removeItem(at: target)
+            try fm.copyItem(at: dllDir.appendingPathComponent("steam_api64.dll"), to: target)
+            for extra in ["steamclient64.dll", "GameOverlayRenderer64.dll"] {
+                let dst = folder.appendingPathComponent(extra)
+                try? fm.removeItem(at: dst)
+                try? fm.copyItem(at: dllDir.appendingPathComponent(extra), to: dst)
+            }
+            try writeSteamSettings(in: folder, appid: appid)
+        }
+    }
+
+    private static func writeSteamSettings(in folder: URL, appid: String) throws {
+        let fm = FileManager.default
+        let settings = folder.appendingPathComponent("steam_settings")
+        try fm.createDirectory(at: settings, withIntermediateDirectories: true)
+        try appid.write(to: settings.appendingPathComponent("steam_appid.txt"), atomically: true, encoding: .utf8)
+        // Portable local saves so unlocks land in <folder>/gse_save/ for the sync.
+        let userIni = "[user::saves]\nlocal_save_path=./\(saveDirName)\n"
+        try userIni.write(to: settings.appendingPathComponent("configs.user.ini"), atomically: true, encoding: .utf8)
+    }
+
+    // Find the game's steam_api64.dll(s), skipping ones we already replaced.
+    private static func locateSteamAPIDLLs(in root: URL) -> [URL] {
+        var found: [URL] = []
+        guard let en = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil) else { return found }
+        for case let url as URL in en where url.lastPathComponent == "steam_api64.dll" {
+            found.append(url)
+        }
+        return found
+    }
+
+    // API names of achievements gbe_fork recorded as unlocked during play. It
+    // writes them under <dll folder>/gse_save/<appid>/achievements.json; we scan
+    // for any such file (the dll can be nested) and read the earned entries.
+    // Parser is deliberately lenient about gbe_fork's exact on-disk shape.
+    static func locallyUnlocked(gameDir: String, appid: String) -> [String] {
+        let fm = FileManager.default
+        var result: Set<String> = []
+        guard let en = fm.enumerator(at: URL(fileURLWithPath: gameDir), includingPropertiesForKeys: nil) else { return [] }
+        for case let url as URL in en where url.lastPathComponent == "achievements.json"
+            && url.deletingLastPathComponent().pathComponents.contains(saveDirName) {
+            guard let data = try? Data(contentsOf: url),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+            for (name, val) in obj {
+                if let d = val as? [String: Any] {
+                    let earned = (d["earned"] as? Bool) ?? ((d["earned"] as? Int) == 1)
+                        || ((d["Achieved"] as? Int) == 1) || ((d["achieved"] as? Int) == 1)
+                    if earned { result.insert(name) }
+                }
+            }
+        }
+        return Array(result)
+    }
+}
+
 // MARK: - Steam Game Downloads (DepotDownloader — native, no Wine needed to download)
 //
 // DepotDownloader (SteamRE, MIT) talks Steam's real depot protocol directly, so games
@@ -1803,12 +1895,42 @@ class ProcessManager: ObservableObject {
         env["EOS_USE_ANTICHEATCLIENTNULL"] = "1"
         env["DOTNET_EnableWriteXorExecute"] = "0"
 
+        // In-game achievements: for Steam games, swap in gbe_fork so the game runs
+        // thinking Steam is present and records unlocks locally. After it exits we
+        // push those unlocks to the real profile via the relay (see onGameExit).
+        let achievementsGame: Game? = (game.source == .steam && GBEManager.isInstalled) ? game : nil
+        if let g = achievementsGame {
+            do {
+                try GBEManager.deploy(gameDir: g.installDir, appid: g.id)
+                env["SteamAppId"] = g.id
+                env["SteamGameId"] = g.id
+                outputLog += "Achievements: running through the Steam emulator (appid \(g.id)).\n\n"
+            } catch {
+                outputLog += "Achievements: emulator setup skipped (\(error.localizedDescription)).\n\n"
+            }
+        }
+
         MistEnv.killWineserver()
 
         let args = [exe] + GameSettingsStore.tokenize(GameSettingsStore.customArgs(for: game.id))
         runProcess(path: MistEnv.wineBinary.path, arguments: args, env: env,
-                   cwd: URL(fileURLWithPath: exe).deletingLastPathComponent())
+                   cwd: URL(fileURLWithPath: exe).deletingLastPathComponent(),
+                   onExit: achievementsGame.map { g in { [weak self] in self?.syncAchievements(for: g) } })
         startDialogKiller()
+    }
+
+    // After a Steam game (run through gbe_fork) exits, push any achievements it
+    // recorded locally to the real profile via the relay. Best-effort + async.
+    private func syncAchievements(for game: Game) {
+        Task { @MainActor in
+            let unlocked = GBEManager.locallyUnlocked(gameDir: game.installDir, appid: game.id)
+            guard !unlocked.isEmpty else { return }
+            self.outputLog += "\nSyncing \(unlocked.count) achievement(s) to your Steam profile…\n"
+            for apiname in unlocked {
+                let ok = (try? await RelayManager.unlock(appid: game.id, apiname: apiname)) ?? false
+                self.outputLog += ok ? "  ✓ \(apiname)\n" : "  ✗ \(apiname) (couldn't sync)\n"
+            }
+        }
     }
 
     // Launch via Apple's Game Porting Toolkit (D3DMetal) in a dedicated prefix, so
@@ -1929,7 +2051,8 @@ class ProcessManager: ObservableObject {
     // everything it spawned) actually quits.
     private func runProcess(path: String, arguments: [String],
                             env: [String: String], cwd: URL? = nil,
-                            waitForWineserverAfter: Bool = false) {
+                            waitForWineserverAfter: Bool = false,
+                            onExit: (() -> Void)? = nil) {
         isRunning = true
 
         let proc = Process()
@@ -1967,6 +2090,7 @@ class ProcessManager: ObservableObject {
                     self?.currentGame = nil
                     self?.dialogKillerTimer?.invalidate()
                     self?.dialogKillerTimer = nil
+                    onExit?()
                 }
             }
             if waitForWineserverAfter {
