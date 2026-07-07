@@ -968,51 +968,14 @@ enum SteamLibraryService {
         "https://cdn.cloudflare.steamstatic.com/steam/apps/\(appid)/library_hero.jpg"
     }
 
-    // Read-only: this game's achievement list and the logged-in user's unlock
-    // status, straight from Steam's own records — NOT something Mist can set.
-    // Actually unlocking achievements during gameplay would require standing in
-    // for steam_api.dll/steamclient.dll the way the game normally talks to a
-    // running Steam client, which is the same mechanism "Steam emulator" tools
-    // use to fake game ownership entirely — deliberately not implemented here.
-    //
-    // Needs a Steam Web API key: this old ISteamUserStats endpoint requires
-    // `key=` and rejects the user access_token our QR login mints ("Required
-    // parameter 'key' is missing", HTTP 400) — unlike the newer
-    // IPublishedFileService the Workshop browser uses, which does accept it. So
-    // achievements are gated on the user adding their own free key in Settings.
-    static func fetchAchievements(appid: String, steamID: String, apiKey: String) async throws -> [SteamAchievement] {
-        var comps = URLComponents(string: "https://api.steampowered.com/ISteamUserStats/GetPlayerAchievements/v1/")!
-        comps.queryItems = [
-            URLQueryItem(name: "appid", value: appid),
-            URLQueryItem(name: "steamid", value: steamID),
-            URLQueryItem(name: "key", value: apiKey),
-            URLQueryItem(name: "l", value: "english"),
-        ]
-        let (data, response) = try await URLSession.shared.data(from: comps.url!)
-        struct Resp: Decodable {
-            struct Inner: Decodable {
-                let success: Bool?
-                let achievements: [SteamAchievement]?
-                let error: String?
-            }
-            let playerstats: Inner?
-        }
-        // GetPlayerAchievements returns its real reason ("Profile is not public",
-        // "Requested app has no stats", etc.) in a JSON body EVEN on non-200 (it
-        // 400s for a private profile) — so parse the body first regardless of code.
-        let decoded = try? JSONDecoder().decode(Resp.self, from: data)
-        if let steamErr = decoded?.playerstats?.error {
-            let hint = steamErr.localizedCaseInsensitiveContains("not public")
-                ? " — set your Steam profile's 'Game details' privacy to Public to see them here."
-                : ""
-            throw SteamAuthError(message: "\(steamErr)\(hint)")
-        }
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200,
-              decoded?.playerstats?.success == true else {
-            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-            throw SteamAuthError(message: "This game has no achievements, or they couldn't be loaded (HTTP \(code)).")
-        }
-        return decoded?.playerstats?.achievements ?? []
+    // This game's achievement list + the user's unlock status, read over Steam's
+    // client protocol by the bundled AchievementRelay helper — powered by Mist's
+    // single QR login (no Steam Web API key, no Steam client running). See
+    // RelayManager. The old ISteamUserStats/GetPlayerAchievements path needed a
+    // separate Web API key because it rejects the user access_token; the client
+    // protocol has no such restriction.
+    static func fetchAchievements(appid: String, steamID: String) async throws -> [SteamAchievement] {
+        try await RelayManager.achievements(appid: appid)
     }
 
     // Global unlock rarity — what fraction of ALL owners have each achievement.
@@ -1138,6 +1101,59 @@ struct WorkshopBrowseItem: Identifiable, Decodable {
         if bytes > 1_073_741_824 { return "\(bytes / 1_073_741_824) GB" }
         if bytes > 1_048_576 { return "\(bytes / 1_048_576) MB" }
         return "\(bytes / 1024) KB"
+    }
+}
+
+// MARK: - Achievement Relay (client protocol via Mist's single login)
+
+// Bridges to the bundled AchievementRelay helper (a self-contained SteamKit2 tool,
+// like DepotDownloader) which speaks Steam's client protocol using Mist's single
+// QR-login session — reading achievement state and (when a game unlocks one)
+// writing it to the real profile, with no Steam Web API key and no Steam client.
+enum RelayManager {
+    static var binaryPath: URL { MistEnv.supportDir.appendingPathComponent("tools/AchievementRelay") }
+    static var sessionPath: URL { MistEnv.supportDir.appendingPathComponent("steam_session.json") }
+    static var isInstalled: Bool { FileManager.default.isExecutableFile(atPath: binaryPath.path) }
+
+    // Runs the relay off the main thread and returns its stdout (JSON). The read
+    // happens on a background queue so the pipe never deadlocks and the UI never
+    // blocks on the ~seconds-long Steam round-trip.
+    private static func run(_ args: [String]) async throws -> Data {
+        guard isInstalled else { throw SteamAuthError(message: "The achievements helper isn't installed yet.") }
+        guard FileManager.default.fileExists(atPath: sessionPath.path) else {
+            throw SteamAuthError(message: "Sign in to Steam first to load achievements.")
+        }
+        return try await withCheckedThrowingContinuation { cont in
+            DispatchQueue.global().async {
+                let p = Process()
+                p.executableURL = binaryPath
+                p.arguments = [sessionPath.path] + args
+                let out = Pipe()
+                p.standardOutput = out
+                p.standardError = FileHandle.nullDevice
+                do { try p.run() } catch { cont.resume(throwing: error); return }
+                let data = out.fileHandleForReading.readDataToEndOfFile()
+                p.waitUntilExit()
+                if p.terminationStatus == 0 {
+                    cont.resume(returning: data)
+                } else {
+                    cont.resume(throwing: SteamAuthError(message: "This game has no achievements, or they couldn't be loaded."))
+                }
+            }
+        }
+    }
+
+    static func achievements(appid: String) async throws -> [SteamAchievement] {
+        let data = try await run([appid])
+        return try JSONDecoder().decode([SteamAchievement].self, from: data)
+    }
+
+    // Unlock one achievement on the real Steam profile. Returns true on success.
+    @discardableResult
+    static func unlock(appid: String, apiname: String) async throws -> Bool {
+        let data = try await run([appid, "--unlock", apiname])
+        struct R: Decodable { let ok: Bool? }
+        return (try? JSONDecoder().decode(R.self, from: data))?.ok ?? false
     }
 }
 
@@ -1319,31 +1335,6 @@ enum MistWorkshop {
 // since it applies to every game, not just ones Mist itself installed.
 private struct GameLaunchSettings: Codable {
     var customArgs: String = ""
-}
-
-// The user's own Steam Web API key (free, from steamcommunity.com/dev/apikey),
-// needed only for reading achievement data (see fetchAchievements). Stored in a
-// 0600 file like the login session — it's a personal, rate-limited read key, but
-// still the user's credential, so keep it off the plaintext-default UserDefaults.
-enum SteamAPIKeyStore {
-    static var fileURL: URL { MistEnv.supportDir.appendingPathComponent("steam_api_key.txt") }
-
-    static var key: String? {
-        guard let s = try? String(contentsOf: fileURL, encoding: .utf8) else { return nil }
-        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        return t.isEmpty ? nil : t
-    }
-
-    static func save(_ raw: String) {
-        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        try? FileManager.default.createDirectory(at: MistEnv.supportDir, withIntermediateDirectories: true)
-        if t.isEmpty {
-            try? FileManager.default.removeItem(at: fileURL)
-            return
-        }
-        try? t.write(to: fileURL, atomically: true, encoding: .utf8)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
-    }
 }
 
 enum GameSettingsStore {
@@ -1843,246 +1834,6 @@ final class SteamDownloadManager: ObservableObject {
     }
 }
 
-// MARK: - Steam Runtime (headless real Steam client, for real achievements/overlay)
-//
-// The ONLY non-emulator way to get real, profile-synced in-game achievements is
-// for the game's bundled steam_api.dll to talk to a genuine, logged-in Steam
-// client. Mist runs Valve's actual Windows client under the same bundled Wine,
-// headless via the official `-no-browser` flag (which disables the CEF UI that
-// black-screened the old visible-client approach) + `-silent` (no window). A
-// game launched while it's running + logged in connects to it and unlocks REAL
-// achievements. This is exactly what a Steam-backed launcher like GameHub does;
-// it is NOT a steam_api.dll emulator/crack.
-//
-// Login: the client can only auto-login headlessly AFTER a session is cached, and
-// `-no-browser` has no UI to perform a first login — so setup requires exactly
-// one login inside the real client (its CEF UI, shown once). After that, ssfn
-// machine-auth files are cached and headless auto-login works indefinitely.
-@MainActor
-final class SteamRuntime: ObservableObject {
-    @Published var isRunning = false
-    @Published var isInstalling = false
-    @Published var statusText = ""
-    @Published var lastError: String?
-
-    private var process: Process?
-    nonisolated private static let enabledKey = "SteamAchievementsEnabled"
-
-    // nonisolated: read from the (non-MainActor) game-launch path in ProcessManager.
-    nonisolated static var enabled: Bool {
-        get { UserDefaults.standard.bool(forKey: enabledKey) }
-        set { UserDefaults.standard.set(newValue, forKey: enabledKey) }
-    }
-
-    nonisolated static var steamDir: URL {
-        MistEnv.winePrefix.appendingPathComponent("drive_c/Program Files (x86)/Steam")
-    }
-    nonisolated static var steamExe: URL { steamDir.appendingPathComponent("steam.exe") }
-
-    var isInstalled: Bool { FileManager.default.isExecutableFile(atPath: Self.steamExe.path) }
-
-    // ssfn* machine-auth files appear only after a genuine, confirmed login on
-    // this machine — the reliable "we can headless-auto-login" signal.
-    var isLoggedIn: Bool {
-        guard let files = try? FileManager.default.contentsOfDirectory(atPath: Self.steamDir.path)
-        else { return false }
-        return files.contains { $0.hasPrefix("ssfn") }
-    }
-
-    // Downloads the real Steam installer from Valve's own CDN (same URL/mechanism
-    // the old CLI setup used) and silently installs it into Mist's own Wine
-    // prefix — /S is Valve's documented silent-install flag. No checksum pinning
-    // here (unlike DepotDownloader): Valve updates this installer continuously,
-    // there's no stable published hash to pin against, so this instead sanity-
-    // checks it's a non-trivial PE download and verifies steam.exe exists after
-    // install rather than trusting the download blindly.
-    func ensureInstalled(progress: @escaping (String) -> Void) async throws {
-        guard !isInstalled else { return }
-
-        progress("Downloading Steam…")
-        let url = URL(string: "https://cdn.cloudflare.steamstatic.com/client/installer/SteamSetup.exe")!
-        let (tmpFile, response) = try await URLSession.shared.download(from: url)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            throw SteamAuthError(message: "Failed to download the Steam installer (HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)).")
-        }
-        let fm = FileManager.default
-        let exePath = fm.temporaryDirectory.appendingPathComponent("SteamSetup-\(UUID().uuidString).exe")
-        try fm.moveItem(at: tmpFile, to: exePath)
-        defer { try? fm.removeItem(at: exePath) }
-
-        let size = (try? fm.attributesOfItem(atPath: exePath.path)[.size] as? Int) ?? 0
-        guard size > 100_000 else {
-            throw SteamAuthError(message: "Steam installer download looked incomplete. Try again.")
-        }
-
-        try fm.createDirectory(at: MistEnv.winePrefix, withIntermediateDirectories: true)
-
-        // A wiped/fresh prefix (e.g. after `make reset-steam`, which clears
-        // drive_c + the registry but keeps the Wine engine) needs an explicit
-        // wineboot before anything else runs in it, or the installer can fail
-        // silently against a half-initialized C: drive. Mirrors the same check
-        // SetupManager.initPrefixIfNeeded() does for the very first app launch.
-        let windowsDir = MistEnv.winePrefix.appendingPathComponent("drive_c/windows")
-        if !fm.fileExists(atPath: windowsDir.path) {
-            progress("Preparing Wine prefix…")
-            await runAsync(MistEnv.wineBinary, ["wineboot", "--init"], env: steamEnv())
-            await runAsync(MistEnv.wineserverBinary, ["-w"], env: steamEnv())
-        }
-
-        progress("Installing Steam (this takes a minute)…")
-        await runAsync(MistEnv.wineBinary, [exePath.path, "/S"], env: steamEnv())
-
-        guard isInstalled else {
-            throw SteamAuthError(message: "Steam didn't install correctly. Try again.")
-        }
-        progress("Steam installed.")
-    }
-
-    // Process.waitUntilExit() is a plain blocking call with no suspension point —
-    // calling it directly from this @MainActor class would freeze the whole UI
-    // for however long the subprocess runs (this is exactly what happened before
-    // this fix: the install looked "stuck" because the main thread genuinely
-    // was). terminationHandler fires off-thread, so bridging it through a
-    // continuation gives a real await point that lets the actor keep servicing
-    // UI/other work while the process runs.
-    private func runAsync(_ url: URL, _ args: [String], env: [String: String]) async {
-        let p = Process()
-        p.executableURL = url
-        p.arguments = args
-        p.environment = env
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        guard (try? p.run()) != nil else { return }
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            p.terminationHandler = { _ in continuation.resume() }
-        }
-    }
-
-    private func steamEnv() -> [String: String] {
-        var env = MistEnv.baseEnvironment()
-        // Steam's CEF (only used during the one-time login) black-screens/crashes
-        // on Wine with GPU rendering — force software rendering just for it.
-        // Harmless headless (no CEF running then). This exact combination is the
-        // one the project already proved out (see the deleted OLD/launch-steam.sh)
-        // — --disable-gpu paired with --disable-software-rasterizer but WITHOUT
-        // --use-gl=swiftshader leaves CEF with no viable rendering backend at all
-        // (that mismatch is what caused the 0x3008/0x3044 steamwebhelper crashes).
-        env["STEAM_DISABLE_GPU_PROCESS"] = "1"
-        env["GALLIUM_DRIVER"] = "llvmpipe"
-        env["STEAM_CEF_COMMAND_LINE"] =
-            "--no-sandbox --in-process-gpu --disable-gpu --disable-gpu-compositing --use-gl=swiftshader --disable-software-rasterizer"
-        env["DOTNET_EnableWriteXorExecute"] = "0"
-        return env
-    }
-
-    // One-time login: launch the real client WITH its UI so the user can sign in
-    // (QR or password). After a successful login this never needs to run again.
-    //
-    // Wrapped in Wine's virtual-desktop (`explorer /desktop=`) — a rootless Wine
-    // window for Steam's CEF login often never presents under macdrv (the process
-    // is frontmost but nothing draws). A virtual desktop forces every Wine window
-    // into one bounded top-level frame that macdrv reliably shows, which is what
-    // makes the login screen actually appear.
-    func launchForLogin() {
-        guard process == nil || !(process!.isRunning) else { return }
-        guard !isInstalling else { return }
-        lastError = nil
-        Task {
-            if !isInstalled {
-                isInstalling = true
-                do {
-                    try await ensureInstalled { [weak self] status in
-                        Task { @MainActor in self?.statusText = status }
-                    }
-                } catch {
-                    lastError = error.localizedDescription
-                    isInstalling = false
-                    return
-                }
-                isInstalling = false
-            }
-            statusText = "Opening Steam sign-in… (this one time only)"
-            launch(args: ["-cef-disable-gpu", "-cef-disable-gpu-compositing",
-                          "-cef-in-process-gpu", "-cef-disable-sandbox", "-no-cef-sandbox"],
-                   virtualDesktop: true)
-        }
-    }
-
-    // Headless: keep a logged-in client alive in the background so games launched
-    // afterward get real Steam connectivity. No-op if already running.
-    func startHeadless() {
-        guard isInstalled, isLoggedIn else { return }
-        guard process == nil || !(process!.isRunning) else { return }
-        statusText = "Starting Steam in the background…"
-        launch(args: ["-no-browser", "-silent"])
-    }
-
-    private func launch(args: [String], virtualDesktop: Bool = false) {
-        let p = Process()
-        p.executableURL = MistEnv.wineBinary
-        if virtualDesktop {
-            p.arguments = ["explorer", "/desktop=SteamLogin,1280x800", Self.steamExe.path] + args
-        } else {
-            p.arguments = [Self.steamExe.path] + args
-        }
-        p.environment = steamEnv()
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        do {
-            try p.run()
-            process = p
-            isRunning = true
-            p.terminationHandler = { [weak self] _ in
-                Task { @MainActor in self?.isRunning = false }
-            }
-        } catch {
-            lastError = "Couldn't start Steam: \(error.localizedDescription)"
-        }
-    }
-
-    // Steam is actually "ready" for a game to connect only once its client core
-    // has logged in and published Software\Valve\Steam\ActiveProcess with a
-    // nonzero ActiveUser — that's the exact handshake the game's real
-    // steam_api.dll reads to locate the running client (confirmed by reversing
-    // GameHub's game containers, which carry these same keys). Alive != ready, so
-    // poll the registry for it rather than guessing with a fixed delay.
-    nonisolated var activeUserReady: Bool {
-        let reg = MistEnv.winePrefix.appendingPathComponent("user.reg")
-        guard let text = try? String(contentsOf: reg, encoding: .utf8),
-              let sect = text.range(of: "[Software\\\\Valve\\\\Steam\\\\ActiveProcess]")
-        else { return false }
-        let window = text[sect.upperBound...].prefix(600)
-        guard let m = window.range(of: "\"ActiveUser\"=dword:") else { return false }
-        let hex = window[m.upperBound...].prefix(8)
-        return (UInt32(hex, radix: 16) ?? 0) != 0
-    }
-
-    // Give a freshly-started headless client time to log in and register
-    // ActiveProcess before a game is launched against it. Returns as soon as it's
-    // ready; on timeout it returns anyway (better to attempt the launch than hang
-    // — worst case the game just runs without achievements).
-    func waitUntilReady() async {
-        statusText = "Waiting for Steam to sign in…"
-        for _ in 0..<80 {  // up to ~40s: cold-start + auto-login can be slow
-            if !isRunning || activeUserReady {
-                statusText = activeUserReady ? "Steam ready." : ""
-                return
-            }
-            try? await Task.sleep(nanoseconds: 500_000_000)
-        }
-    }
-
-    // Best-effort stop. Terminating the tracked process signals Steam to exit; its
-    // helper children wind down with it. Deliberately NOT a wineserver -k, which
-    // would also kill any game running in the same prefix.
-    func stop() {
-        process?.terminate()
-        process = nil
-        isRunning = false
-        statusText = ""
-    }
-}
-
 // MARK: - Wine/Game Process Manager
 
 class ProcessManager: ObservableObject {
@@ -2169,23 +1920,7 @@ class ProcessManager: ObservableObject {
         env["EOS_USE_ANTICHEATCLIENTNULL"] = "1"
         env["DOTNET_EnableWriteXorExecute"] = "0"
 
-        // Real-achievements mode: a headless Steam client is (or is being) kept
-        // running in the same prefix. Tell the game which appid it is so its
-        // steam_api.dll connects to that client — via the SteamAppId env var AND
-        // a steam_appid.txt next to the exe (belt and suspenders; different games
-        // read one or the other). Crucially, DON'T kill the wineserver here —
-        // that would tear down the very Steam client we need alive.
-        let steamMode = SteamRuntime.enabled && game.source == .steam
-        if steamMode {
-            env["SteamAppId"] = game.id
-            env["SteamGameId"] = game.id
-            let appidFile = URL(fileURLWithPath: exe).deletingLastPathComponent()
-                .appendingPathComponent("steam_appid.txt")
-            try? game.id.write(to: appidFile, atomically: true, encoding: .utf8)
-            outputLog += "Steam achievements: connecting as appid \(game.id)…\n\n"
-        } else {
-            MistEnv.killWineserver()
-        }
+        MistEnv.killWineserver()
 
         let args = [exe] + GameSettingsStore.tokenize(GameSettingsStore.customArgs(for: game.id))
         runProcess(path: MistEnv.wineBinary.path, arguments: args, env: env,
@@ -3215,7 +2950,6 @@ struct GameDetailView: View {
     @State private var achievements: [SteamAchievement] = []
     @State private var achievementsError: String?
     @State private var isLoadingAchievements = false
-    @State private var needsAPIKey = false
     @State private var workshopItems: [WorkshopItem] = []
     @State private var showingWorkshopBrowse = false
 
@@ -3401,25 +3135,7 @@ struct GameDetailView: View {
                 Spacer()
             }
 
-            if needsAPIKey {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Achievement data comes from Steam's Web API, which needs a free personal API key. Add yours once in Settings to see your unlock status and global rarity for every game.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    HStack(spacing: 8) {
-                        Button(action: onOpenSettings) {
-                            Label("Add Key in Settings", systemImage: "key.fill")
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
-                        Link(destination: URL(string: "https://steamcommunity.com/dev/apikey")!) {
-                            Text("Get a key")
-                                .font(.system(size: 11))
-                        }
-                    }
-                }
-            } else if isLoadingAchievements {
+            if isLoadingAchievements {
                 ProgressView().controlSize(.small)
             } else if let err = achievementsError {
                 Text(err)
@@ -3468,11 +3184,9 @@ struct GameDetailView: View {
                 }
             }
 
-            if !needsAPIKey {
-                Text("Read-only — shows Steam's own record of your progress, and what percent of all owners have each achievement. Mist doesn't run a Steam client under Wine, so it can't unlock achievements live during gameplay.")
-                    .font(.system(size: 10.5))
-                    .foregroundColor(.secondary)
-            }
+            Text("Your unlock status and each achievement's global rarity, read live from Steam over your single sign-in.")
+                .font(.system(size: 10.5))
+                .foregroundColor(.secondary)
         }
     }
 
@@ -3529,18 +3243,10 @@ struct GameDetailView: View {
         }
 
         guard game.source == .steam, steamAuth.isLoggedIn else { return }
-        // Personal achievement status needs the user's own Web API key (the
-        // endpoint rejects our access_token). No key → show the call-to-action
-        // rather than a confusing error, and skip the fetch entirely.
-        guard let apiKey = SteamAPIKeyStore.key else {
-            needsAPIKey = true
-            return
-        }
-        needsAPIKey = false
         isLoadingAchievements = true
         do {
             var list = try await SteamLibraryService.fetchAchievements(
-                appid: game.id, steamID: steamAuth.steamID, apiKey: apiKey)
+                appid: game.id, steamID: steamAuth.steamID)
             // Overlay global rarity (best-effort; keyless, never throws) then sort
             // unlocked-first, and within each group rarest-last so the standout
             // "Ultra Rare" ones you HAVE surface at the top.
@@ -4460,149 +4166,11 @@ struct SettingsInfoRow: View {
     }
 }
 
-// Optional Steam Web API key — only used for reading achievement data (the old
-// GetPlayerAchievements endpoint requires `key=` and rejects our access_token).
-// Uses a SecureField so the key isn't shoulder-surfed; persisted via
-// SteamAPIKeyStore. The user pastes their OWN free key — Mist never asks for it
-// anywhere else and never transmits it except to Steam's own API.
-struct SteamAPIKeyField: View {
-    @State private var draft: String = SteamAPIKeyStore.key ?? ""
-    @State private var saved = false
-
-    private var hasStoredKey: Bool { SteamAPIKeyStore.key != nil }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
-                Image(systemName: hasStoredKey ? "key.fill" : "key")
-                    .font(.system(size: 11))
-                    .foregroundColor(hasStoredKey ? .green : .secondary)
-                Text("Web API Key")
-                    .font(.system(size: 12, weight: .medium))
-                Text("— for achievements")
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
-                Spacer()
-                Link("Get one", destination: URL(string: "https://steamcommunity.com/dev/apikey")!)
-                    .font(.system(size: 11))
-            }
-            HStack {
-                SecureField("Paste your Steam Web API key", text: $draft)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(.caption, design: .monospaced))
-                Button(saved ? "Saved" : "Save") {
-                    SteamAPIKeyStore.save(draft)
-                    saved = true
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { saved = false }
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(draft == (SteamAPIKeyStore.key ?? ""))
-                if hasStoredKey {
-                    Button(role: .destructive) {
-                        SteamAPIKeyStore.save("")
-                        draft = ""
-                    } label: {
-                        Image(systemName: "trash")
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                }
-            }
-            Text("Stored locally (0600 file), sent only to Steam's own API to read your achievement progress.")
-                .font(.system(size: 10))
-                .foregroundColor(.secondary)
-        }
-    }
-}
-
-// Setup + status for real, profile-synced achievements via a headless Steam
-// client (see SteamRuntime). Three states: Steam-not-installed, installed-but-
-// -not-logged-in (needs the one-time login), and ready (toggle on/off).
-struct SteamAchievementsSetup: View {
-    @ObservedObject var runtime: SteamRuntime
-    @State private var enabled = SteamRuntime.enabled
-
-    private var buttonLabel: String {
-        if runtime.isInstalling { return "Setting up Steam…" }
-        if runtime.isRunning { return "Steam is opening…" }
-        return runtime.isInstalled ? "Sign In to Steam (once)" : "Install & Sign In to Steam"
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Unlocks REAL achievements on your Steam profile by running Valve's own client invisibly in the background while you play. Not an emulator — genuine Steam.")
-                .font(.caption)
-                .foregroundColor(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            if !runtime.isLoggedIn {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(runtime.isInstalled
-                         ? "One-time setup: sign in once inside the Steam window that opens — scan the QR with the Steam mobile app (or use your password + check \"Remember me\"). Once you're signed in, just close that Steam window. After this it signs in silently in the background and you'll never see it again."
-                         : "First click downloads and silently installs the real Steam client into Mist's own prefix (~2 MB, one-time), then opens it once so you can sign in.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    HStack(spacing: 8) {
-                        Button {
-                            runtime.launchForLogin()
-                        } label: {
-                            Label(buttonLabel, systemImage: "person.badge.key.fill")
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .tint(.orange)
-                        .disabled(runtime.isRunning || runtime.isInstalling)
-                        if runtime.isRunning || runtime.isInstalling {
-                            ProgressView().controlSize(.small)
-                        }
-                    }
-                    if runtime.isInstalling || runtime.isRunning, !runtime.statusText.isEmpty {
-                        Text(runtime.statusText)
-                            .font(.system(size: 10.5))
-                            .foregroundColor(.secondary)
-                    }
-                    Text("⚠ Experimental: the Steam sign-in window renders through Wine and may be slow or misbehave. Once you're signed in, close the Steam window.")
-                        .font(.system(size: 10.5))
-                        .foregroundColor(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            } else {
-                VStack(alignment: .leading, spacing: 8) {
-                    Toggle(isOn: $enabled) {
-                        Label("Enable in-game achievements", systemImage: "checkmark.seal.fill")
-                            .font(.system(size: 13))
-                    }
-                    .toggleStyle(.switch)
-                    .onChange(of: enabled) { newValue in
-                        SteamRuntime.enabled = newValue
-                        if !newValue { runtime.stop() }
-                    }
-                    Label("Signed in — Steam will run silently in the background when you launch a game.",
-                          systemImage: "checkmark.circle.fill")
-                        .font(.caption)
-                        .foregroundColor(.green)
-                    if runtime.isRunning {
-                        Label("Steam is running in the background.", systemImage: "circle.fill")
-                            .font(.system(size: 10.5))
-                            .foregroundColor(.secondary)
-                    }
-                }
-            }
-
-            if let err = runtime.lastError {
-                Text(err).font(.caption).foregroundColor(.red)
-            }
-        }
-    }
-}
-
 struct ContentView: View {
     @StateObject private var library: GameLibrary
     @StateObject private var processManager: ProcessManager
     @StateObject private var setup = SetupManager()
     @StateObject private var steamAuth = SteamAuthManager()
-    @StateObject private var steamRuntime = SteamRuntime()
     @StateObject private var downloadManager: SteamDownloadManager
     @State private var sidebarSelection: String? = "all"
     @State private var showRunningView = false
@@ -4640,33 +4208,19 @@ struct ContentView: View {
         }
     }
 
-    // When real-achievements mode is on, make sure the headless Steam client is
-    // up (and given a moment to connect) BEFORE the game launches, so the game's
-    // steam_api.dll finds it. No-op if disabled/not logged in.
-    private func withSteamIfEnabled(_ game: Game, _ launch: @escaping () -> Void) {
-        guard SteamRuntime.enabled, game.source == .steam, steamRuntime.isLoggedIn else {
-            launch(); return
-        }
-        Task {
-            steamRuntime.startHeadless()
-            await steamRuntime.waitUntilReady()
-            launch()
-        }
-    }
-
     private func handleLaunch(_ game: Game) {
         showRunningView = true
-        withSteamIfEnabled(game) { processManager.launchGame(game) }
+        processManager.launchGame(game)
     }
 
     private func handleLaunchNoEAC(_ game: Game) {
         showRunningView = true
-        withSteamIfEnabled(game) { processManager.launchGame(game, mode: .noEAC) }
+        processManager.launchGame(game, mode: .noEAC)
     }
 
     private func handleLaunchGPTK(_ game: Game) {
         showRunningView = true
-        withSteamIfEnabled(game) { processManager.launchGame(game, mode: .gptk) }
+        processManager.launchGame(game, mode: .gptk)
     }
 
     private func handleInstall(_ game: Game) {
@@ -4744,13 +4298,15 @@ struct ContentView: View {
                                                     .font(.caption)
                                                     .foregroundColor(.red)
                                             }
-                                            Divider()
-                                            SteamAPIKeyField()
+                                            if steamAuth.isLoggedIn {
+                                                Divider()
+                                                Label("Your library, downloads, and achievements all use this one sign-in — no separate keys or logins needed.",
+                                                      systemImage: "checkmark.seal")
+                                                    .font(.caption)
+                                                    .foregroundColor(.secondary)
+                                                    .fixedSize(horizontal: false, vertical: true)
+                                            }
                                         }
-                                    }
-
-                                    SettingsCard(title: "Steam Achievements (Experimental)", systemImage: "trophy.fill", tint: .orange) {
-                                        SteamAchievementsSetup(runtime: steamRuntime)
                                     }
 
                                     SettingsCard(title: "Epic Account", systemImage: "bolt.fill", tint: .purple) {
