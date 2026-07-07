@@ -1539,10 +1539,10 @@ final class SteamDownloadManager: ObservableObject {
     }
 
     private func runDepotDownloader(appid: String, name: String, steamAccountName: String,
-                                    forceQR: Bool = false, pubfileID: String? = nil,
+                                    pubfileID: String? = nil,
                                     onComplete: @escaping () -> Void) {
         let tool = DepotDownloaderManager.installPath.path
-        downloadStatusText = "Starting download…"
+        downloadStatusText = "Signing in with your Steam login…"
 
         let installDir: URL
         if let pubfileID {
@@ -1553,52 +1553,29 @@ final class SteamDownloadManager: ObservableObject {
         }
         try? FileManager.default.createDirectory(at: installDir, withIntermediateDirectories: true)
 
-        // Try to reuse DepotDownloader's own cached session (see
-        // reusableAccountsKey) instead of asking for another QR scan. -username
-        // with -remember-password and no -password makes DepotDownloader use its
-        // cached token when one exists (Program.cs only prompts interactively when
-        // RememberPassword is false or no cached token is found for that
-        // username) — but if the cached token has expired or was never actually
-        // saved, that same code path blocks on an unanswerable interactive prompt
-        // with no stdin to satisfy it. The watchdog below detects that stall and
-        // falls back to -qr rather than hanging the UI forever.
-        let reuse = !forceQR && Self.canReuseSession(for: steamAccountName)
-        let pubfileArgs = pubfileID.map { ["-pubfile", $0] } ?? []
-        var args: [String]
-        if reuse {
-            args = ["-app", appid, "-os", "windows", "-dir", installDir.path,
+        // Single-login: our patched DepotDownloader seeds Mist's own persistent
+        // session token (passed via MIST_REFRESH_TOKEN) into its login store, so
+        // "-username <account> -remember-password" logs in non-interactively with
+        // Mist's one QR sign-in — no separate DepotDownloader QR scan, ever.
+        var args = ["-app", appid, "-os", "windows", "-dir", installDir.path,
                     "-username", steamAccountName, "-remember-password"]
-            downloadStatusText = "Signing in with saved session…"
-        } else {
-            args = ["-app", appid, "-os", "windows", "-dir", installDir.path, "-remember-password", "-qr"]
-        }
-        args += pubfileArgs
+        if let pubfileID { args += ["-pubfile", pubfileID] }
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: tool)
         proc.arguments = args
+        var env = ProcessInfo.processInfo.environment
+        if let token = Self.sessionRefreshToken() { env["MIST_REFRESH_TOKEN"] = token }
+        proc.environment = env
 
         let outPipe = Pipe()
         proc.standardOutput = outPipe
         proc.standardError = outPipe
 
-        let qrRegex = try? NSRegularExpression(pattern: "https://s\\.team/q/\\S+")
-        // DepotDownloader prints "NN.NN% path/to/file" for each chunk — the only line
+        // DepotDownloader prints "NN.NN% path/to/file" per chunk — the only line
         // type treated as real, user-facing progress.
         let progressRegex = try? NSRegularExpression(pattern: "^(\\d+\\.\\d+)%")
-
         recentOutputLines = []
-        isCapturingQRArt = false
-        qrArtBuffer = []
-        sawMeaningfulOutputThisRun = false
-        reuseWatchdog?.invalidate()
-        reuseWatchdog = nil
-
-        // Declared here (not inline in terminationHandler below) so the output
-        // parser can also trigger it the moment it recognizes the exact hang
-        // signature, instead of only from the timeout-based watchdog.
-        var fallingBackToQR = false
-        var lastOutputAt = Date()
 
         outPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
@@ -1606,80 +1583,20 @@ final class SteamDownloadManager: ObservableObject {
             DispatchQueue.main.async {
                 guard let self else { return }
                 for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
-                    // Only strip \r (line-ending noise) here — trimming whitespace is
-                    // done separately below ONLY for detection/status purposes. The QR
-                    // art buffer keeps the untrimmed line: different rows of the
-                    // pattern have different amounts of leading blank space (that's
-                    // part of the encoded data), so trimming it shifts each row's dark
-                    // squares by a different amount and completely scrambles the grid
-                    // — confirmed as the actual cause of the QR not scanning at all.
-                    let raw = String(rawLine).replacingOccurrences(of: "\r", with: "")
-                    let l = raw.trimmingCharacters(in: .whitespaces)
-
-                    if !l.isEmpty {
-                        self.recentOutputLines.append(l)
-                        if self.recentOutputLines.count > self.maxRecentLines {
-                            self.recentOutputLines.removeFirst()
-                        }
-                        lastOutputAt = Date()
+                    let l = String(rawLine).replacingOccurrences(of: "\r", with: "")
+                        .trimmingCharacters(in: .whitespaces)
+                    guard !l.isEmpty else { continue }
+                    self.recentOutputLines.append(l)
+                    if self.recentOutputLines.count > self.maxRecentLines {
+                        self.recentOutputLines.removeFirst()
                     }
-
-                    // "Enter account password for ..." is DepotDownloader's exact,
-                    // unambiguous tell that the cached-session reuse lookup failed
-                    // (LoginTokens had no entry for this username) and it's about to
-                    // block on Console.ReadLine() forever, since we give it no
-                    // stdin. Catch this instantly rather than waiting for the
-                    // watchdog timeout — this is the real hang, not a slow network.
-                    if reuse && !fallingBackToQR && l.localizedCaseInsensitiveContains("enter account password for") {
-                        fallingBackToQR = true
-                        Self.forgetReusableSession(for: steamAccountName)
-                        self.downloadStatusText = "Saved session no longer valid — scan again…"
-                        proc.terminate()
-                    }
-
-                    // DepotDownloader (this version) never prints a plain QR URL —
-                    // only a terminal ASCII-art rendering using Unicode block
-                    // characters, announced by a "sign in with this QR code" line. We
-                    // capture the whole block (including its blank-line quiet-zone
-                    // padding, part of the QR standard) and rasterize it into a real
-                    // bitmap with guaranteed-square modules, since there's no URL to
-                    // re-render as a clean generated image and text rendering can't
-                    // reliably reproduce exact column alignment.
-                    let isAsciiArt = l.unicodeScalars.contains { (0x2580...0x259F).contains($0.value) }
-
-                    if let regex = qrRegex,
-                       let match = regex.firstMatch(in: l, range: NSRange(l.startIndex..., in: l)),
-                       let range = Range(match.range, in: l) {
-                        self.isCapturingQRArt = false
-                        self.downloadQRImage = nil
-                        self.downloadQRURL = String(l[range])
-                        self.downloadStatusText = "Scan with the Steam Mobile app to authorize downloads"
-                    } else if let regex = progressRegex,
-                              let match = regex.firstMatch(in: l, range: NSRange(l.startIndex..., in: l)),
-                              let range = Range(match.range(at: 1), in: l),
-                              let pct = Double(l[range]) {
-                        self.isCapturingQRArt = false
-                        self.downloadQRURL = nil
-                        self.downloadQRImage = nil
+                    if let regex = progressRegex,
+                       let m = regex.firstMatch(in: l, range: NSRange(l.startIndex..., in: l)),
+                       let r = Range(m.range(at: 1), in: l), let pct = Double(l[r]) {
                         self.downloadProgress = pct / 100
                         self.downloadStatusText = "Downloading \(name)…"
-                        // Real download progress is proof the cached-session
-                        // reuse path actually worked — cancel the fallback watchdog.
-                        self.sawMeaningfulOutputThisRun = true
-                        self.reuseWatchdog?.invalidate()
-                        self.reuseWatchdog = nil
-                    } else if l.localizedCaseInsensitiveContains("sign in with this qr code") {
-                        self.isCapturingQRArt = true
-                        self.qrArtBuffer = []
-                        self.downloadStatusText = "Scan with the Steam Mobile app to authorize downloads"
-                    } else if self.isCapturingQRArt && (isAsciiArt || l.isEmpty) {
-                        self.qrArtBuffer.append(raw)
-                        self.downloadQRImage = Self.renderTerminalQR(lines: self.qrArtBuffer)
-                    } else if !l.isEmpty {
-                        self.isCapturingQRArt = false
-                        if !isAsciiArt {
-                            self.downloadStatusText = l
-                        }
+                    } else {
+                        self.downloadStatusText = l
                     }
                 }
             }
@@ -1689,25 +1606,13 @@ final class SteamDownloadManager: ObservableObject {
             outPipe.fileHandleForReading.readabilityHandler = nil
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.reuseWatchdog?.invalidate()
-                self.reuseWatchdog = nil
-
-                if fallingBackToQR {
-                    self.runDepotDownloader(appid: appid, name: name, steamAccountName: steamAccountName,
-                                            forceQR: true, pubfileID: pubfileID, onComplete: onComplete)
-                    return
-                }
-
                 if p.terminationStatus == 0 {
                     self.isDownloading = false
                     self.downloadingAppID = nil
                     self.downloadingName = nil
-                    self.downloadQRURL = nil
-                    self.downloadQRImage = nil
                     self.downloadProgress = nil
                     self.connectionRetryCount = 0
                     self.downloadStatusText = "Done!"
-                    Self.markSessionReusable(for: steamAccountName)
                     if pubfileID == nil {
                         let size = Self.directorySize(installDir)
                         MistManifest.add(MistInstalledGame(appid: appid, name: name, installDir: installDir.path, sizeBytes: size),
@@ -1720,19 +1625,9 @@ final class SteamDownloadManager: ObservableObject {
                 let looksLikeConnectionHiccup = Self.connectionFailureMarkers.contains { marker in
                     self.recentOutputLines.contains { $0.contains(marker) }
                 }
-                if reuse && !self.sawMeaningfulOutputThisRun {
-                    // The saved session likely failed (expired/revoked token) rather
-                    // than a transient connection hiccup — forget it and fall back
-                    // to a fresh QR scan instead of endlessly retrying a bad session.
-                    Self.forgetReusableSession(for: steamAccountName)
-                    self.downloadStatusText = "Saved session no longer valid — scan again…"
-                    self.runDepotDownloader(appid: appid, name: name, steamAccountName: steamAccountName,
-                                            forceQR: true, pubfileID: pubfileID, onComplete: onComplete)
-                } else if looksLikeConnectionHiccup && self.connectionRetryCount < self.maxConnectionRetries {
+                if looksLikeConnectionHiccup && self.connectionRetryCount < self.maxConnectionRetries {
                     self.connectionRetryCount += 1
                     self.downloadStatusText = "Steam connection hiccup — retrying (\(self.connectionRetryCount)/\(self.maxConnectionRetries))…"
-                    self.downloadQRURL = nil
-                    self.downloadQRImage = nil
                     self.downloadProgress = nil
                     DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
                         self.runDepotDownloader(appid: appid, name: name, steamAccountName: steamAccountName,
@@ -1742,8 +1637,6 @@ final class SteamDownloadManager: ObservableObject {
                     self.isDownloading = false
                     self.downloadingAppID = nil
                     self.downloadingName = nil
-                    self.downloadQRURL = nil
-                    self.downloadQRImage = nil
                     self.downloadProgress = nil
                     self.connectionRetryCount = 0
                     let tail = self.recentOutputLines.suffix(6).joined(separator: "\n")
@@ -1755,32 +1648,22 @@ final class SteamDownloadManager: ObservableObject {
         do {
             try proc.run()
             process = proc
-
-            if reuse {
-                // Backstop only — the password-prompt phrase check above catches
-                // the actual known hang instantly. This just guards against a
-                // truly silent stall (e.g. connection to Steam3 never completes)
-                // that doesn't print anything at all. Steam's license/app-info
-                // check before the first "%" line can legitimately take a while on
-                // a slow connection, so this only fires after real silence, not
-                // just "no progress yet" — polling every 5s and resetting whenever
-                // ANY output arrives (see lastOutputAt), not just progress lines.
-                reuseWatchdog = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] timer in
-                    guard let self, self.process === proc, proc.isRunning else { timer.invalidate(); return }
-                    guard !self.sawMeaningfulOutputThisRun, !fallingBackToQR else { return }
-                    guard Date().timeIntervalSince(lastOutputAt) > 45 else { return }
-                    fallingBackToQR = true
-                    Self.forgetReusableSession(for: steamAccountName)
-                    self.downloadStatusText = "Saved session didn't respond — scan again…"
-                    proc.terminate()
-                }
-            }
         } catch {
             isDownloading = false
             downloadingAppID = nil
             downloadingName = nil
             downloadError = "Couldn't start DepotDownloader: \(error.localizedDescription)"
         }
+    }
+
+    // Mist's own persistent refresh token, read from the session file — passed to
+    // our patched DepotDownloader so downloads reuse the single QR login.
+    private static func sessionRefreshToken() -> String? {
+        let url = MistEnv.supportDir.appendingPathComponent("steam_session.json")
+        guard let data = try? Data(contentsOf: url),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tok = obj["refreshToken"] as? String, !tok.isEmpty else { return nil }
+        return tok
     }
 
     func cancel() {
