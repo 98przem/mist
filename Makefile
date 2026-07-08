@@ -10,7 +10,7 @@ BUNDLE_CONTENTS = $(BUNDLE)/Contents
 BUNDLE_MACOS = $(BUNDLE_CONTENTS)/MacOS
 BUNDLE_RESOURCES = $(BUNDLE_CONTENTS)/Resources
 
-.PHONY: all app tools clean bundle release bundle-clean test-build test \
+.PHONY: all app tools clean bundle dmg release bundle-clean test-build test \
        reset-steam reset-all reset-depotdownloader-cache
 
 # Helper tools live in the app bundle's Resources; the relay binary doubles as
@@ -55,7 +55,7 @@ Mist.icns: tools/make_icon.swift
 
 # ── Distribution targets (self-contained .app) ───────────────────────
 
-bundle:
+bundle: Mist.icns
 	@echo "Assembling Mist.app..."
 	rm -rf dist/
 	mkdir -p "$(BUNDLE_MACOS)" "$(BUNDLE_RESOURCES)"
@@ -81,9 +81,20 @@ bundle:
 	@echo "Bundle ready at dist/Mist.app"
 	@echo "Test with: open dist/Mist.app"
 
-release: bundle
-	cd dist && zip -r Mist.zip Mist.app
-	@echo "Release archive: dist/Mist.zip"
+release: dmg
+	cd dist && zip -qr Mist.zip Mist.app
+	@echo "Release archives: dist/Mist.dmg and dist/Mist.zip"
+
+# Drag-to-install disk image with an Applications shortcut.
+dmg: bundle
+	@echo "Building dist/Mist.dmg..."
+	rm -f dist/Mist.dmg
+	rm -rf dist/dmg && mkdir -p dist/dmg
+	cp -R "$(BUNDLE)" dist/dmg/Mist.app
+	ln -s /Applications dist/dmg/Applications
+	hdiutil create -volname "Mist" -srcfolder dist/dmg -ov -format UDZO dist/Mist.dmg >/dev/null
+	rm -rf dist/dmg
+	@echo "DMG ready at dist/Mist.dmg"
 
 # ── Anti-cheat test targets ───────────────────────────────────────────
 

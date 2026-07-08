@@ -53,7 +53,11 @@ GBE_SHA="$(sed -n 's/^sha256=//p' "$HERE/gbe_fork.pin")"
 GBE_TMP="$(mktemp -d)"
 curl -fsSL -o "$GBE_TMP/emu.7z" "$GBE_URL"
 echo "$GBE_SHA  $GBE_TMP/emu.7z" | shasum -a 256 -c - >/dev/null
-tar xf "$GBE_TMP/emu.7z" -C "$GBE_TMP"   # libarchive reads .7z
+# macOS `tar` (libarchive) usually reads .7z; fall back to p7zip if not.
+if ! tar xf "$GBE_TMP/emu.7z" -C "$GBE_TMP" 2>/dev/null || [ ! -d "$GBE_TMP/release" ]; then
+  if ! command -v 7z >/dev/null 2>&1 && command -v brew >/dev/null 2>&1; then brew install -q p7zip; fi
+  7z x -y -o"$GBE_TMP" "$GBE_TMP/emu.7z" >/dev/null
+fi
 GBE_R="$GBE_TMP/release"
 cp "$GBE_R/experimental/x64/steam_api64.dll"                 "$OUT/gbe/steam_api64.dll"
 cp "$GBE_R/experimental/x64/steamclient64.dll"              "$OUT/gbe/steamclient64.dll"
