@@ -1148,12 +1148,21 @@ enum RelayManager {
         return try JSONDecoder().decode([SteamAchievement].self, from: data)
     }
 
-    // Unlock one achievement on the real Steam profile. Returns true on success.
+    // Push one achievement to the real Steam profile. Returns true when it's
+    // confirmed present afterward — either freshly stored (ok) OR already earned
+    // (alreadyUnlocked), since "already on your profile" is a success, not a
+    // failure, for our sync-what-you-earned flow.
     @discardableResult
     static func unlock(appid: String, apiname: String) async throws -> Bool {
         let data = try await run([appid, "--unlock", apiname])
-        struct R: Decodable { let ok: Bool? }
-        return (try? JSONDecoder().decode(R.self, from: data))?.ok ?? false
+        struct R: Decodable { let ok: Bool?; let alreadyUnlocked: Bool? }
+        let r = try? JSONDecoder().decode(R.self, from: data)
+        return (r?.ok ?? false) || (r?.alreadyUnlocked ?? false)
+    }
+
+    // The achievement schema in gbe_fork's steam_settings/achievements.json format.
+    static func gbeSchema(appid: String) async throws -> Data {
+        try await run([appid, "--schema"])
     }
 }
 
@@ -1213,6 +1222,29 @@ enum GBEManager {
         // Portable local saves so unlocks land in <folder>/gse_save/ for the sync.
         let userIni = "[user::saves]\nlocal_save_path=./\(saveDirName)\n"
         try userIni.write(to: settings.appendingPathComponent("configs.user.ini"), atomically: true, encoding: .utf8)
+    }
+
+    // Fetch the game's achievement schema and write it into every steam_settings
+    // folder as achievements.json. CRITICAL: gbe_fork silently ignores any
+    // SetAchievement() call for an achievement not in this schema, so without it
+    // nothing is ever recorded. Fetched over the client protocol (Mist's login) —
+    // best-effort: a game with no achievements, or a transient Steam hiccup, just
+    // means no schema (the game still runs fine).
+    static func installSchema(gameDir: String, appid: String) async {
+        guard let data = try? await RelayManager.gbeSchema(appid: appid), data.count > 2 else { return }
+        for folder in steamSettingsFolders(in: gameDir) {
+            try? data.write(to: folder.appendingPathComponent("achievements.json"))
+        }
+    }
+
+    // Synchronous scan (kept out of async context — DirectoryEnumerator iteration
+    // isn't async-safe) for every steam_settings folder deploy created.
+    private static func steamSettingsFolders(in gameDir: String) -> [URL] {
+        let fm = FileManager.default
+        guard let en = fm.enumerator(at: URL(fileURLWithPath: gameDir), includingPropertiesForKeys: nil) else { return [] }
+        var out: [URL] = []
+        for case let url as URL in en where url.lastPathComponent == "steam_settings" { out.append(url) }
+        return out
     }
 
     // Find the game's steam_api64.dll(s), skipping ones we already replaced.
@@ -1897,26 +1929,41 @@ class ProcessManager: ObservableObject {
 
         // In-game achievements: for Steam games, swap in gbe_fork so the game runs
         // thinking Steam is present and records unlocks locally. After it exits we
-        // push those unlocks to the real profile via the relay (see onGameExit).
+        // push those unlocks to the real profile via the relay (see syncAchievements).
         let achievementsGame: Game? = (game.source == .steam && GBEManager.isInstalled) ? game : nil
-        if let g = achievementsGame {
-            do {
-                try GBEManager.deploy(gameDir: g.installDir, appid: g.id)
-                env["SteamAppId"] = g.id
-                env["SteamGameId"] = g.id
-                outputLog += "Achievements: running through the Steam emulator (appid \(g.id)).\n\n"
-            } catch {
-                outputLog += "Achievements: emulator setup skipped (\(error.localizedDescription)).\n\n"
-            }
+
+        let launchArgs = [exe] + GameSettingsStore.tokenize(GameSettingsStore.customArgs(for: game.id))
+        let launchCwd = URL(fileURLWithPath: exe).deletingLastPathComponent()
+        let onExit: (() -> Void)? = achievementsGame.map { g in { [weak self] in self?.syncAchievements(for: g) } }
+
+        let start: ([String: String]) -> Void = { [weak self] finalEnv in
+            guard let self else { return }
+            MistEnv.killWineserver()
+            self.runProcess(path: MistEnv.wineBinary.path, arguments: launchArgs, env: finalEnv,
+                            cwd: launchCwd, onExit: onExit)
+            self.startDialogKiller()
         }
 
-        MistEnv.killWineserver()
+        guard let g = achievementsGame else { start(env); return }
 
-        let args = [exe] + GameSettingsStore.tokenize(GameSettingsStore.customArgs(for: game.id))
-        runProcess(path: MistEnv.wineBinary.path, arguments: args, env: env,
-                   cwd: URL(fileURLWithPath: exe).deletingLastPathComponent(),
-                   onExit: achievementsGame.map { g in { [weak self] in self?.syncAchievements(for: g) } })
-        startDialogKiller()
+        // Deploy the emulator AND fetch/write the achievement schema BEFORE the game
+        // process starts — gbe_fork reads steam_settings/achievements.json once at
+        // init, so the schema must already be on disk or the game's achievement
+        // calls that session are silently dropped.
+        Task { @MainActor in
+            var gameEnv = env
+            do {
+                try GBEManager.deploy(gameDir: g.installDir, appid: g.id)
+                gameEnv["SteamAppId"] = g.id
+                gameEnv["SteamGameId"] = g.id
+                self.outputLog += "Achievements: preparing the Steam emulator (appid \(g.id))…\n"
+                await GBEManager.installSchema(gameDir: g.installDir, appid: g.id)
+                self.outputLog += "Achievements: running through the Steam emulator.\n\n"
+            } catch {
+                self.outputLog += "Achievements: emulator setup skipped (\(error.localizedDescription)).\n\n"
+            }
+            start(gameEnv)
+        }
     }
 
     // After a Steam game (run through gbe_fork) exits, push any achievements it
