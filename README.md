@@ -12,7 +12,7 @@ Mist never runs Steam's own Windows client under Wine — that's a deliberate de
 
 **One login for everything.** A single QR scan powers your whole library, downloads, and achievements — there's no second sign-in. And you still get **real Steam achievements**: browse them in-app (unlock status + global rarity), and when you unlock one *in-game*, it syncs to your actual Steam profile — all without a running Steam client (see [Achievements](#achievements)).
 
-**Tested on:** macOS 14+ with Apple Silicon (M1/M2/M3/M4) via Rosetta 2.
+**Tested on:** macOS 15.7.8 - M2 Macbook Air
 
 ## Download
 
