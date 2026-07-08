@@ -1,12 +1,24 @@
-# Mist
+<p align="center">
+  <img src="docs/mist-icon.png" width="120" alt="Mist">
+</p>
 
-Run Windows **Steam** and **Epic Games** titles on macOS (Apple Silicon & Intel) using Wine + Apple's Game Porting Toolkit.
+<h1 align="center">Mist</h1>
+
+<p align="center">
+  <b>Play Windows Steam &amp; Epic games on macOS.</b><br>
+  One QR login, real Steam achievements, nothing to install by hand —<br>
+  powered by Wine + Apple's Game Porting Toolkit.
+</p>
+
+<p align="center">
+  <a href="../../releases/latest"><img src="https://img.shields.io/github/v/release/98przem/mist?label=download&amp;color=8b5cf6" alt="Latest release"></a>
+</p>
 
 ## What is this?
 
 A native macOS launcher for Windows games. Mist.app signs in to Steam natively (no Wine involved — just a QR code, like the Steam Mobile app), downloads games with [DepotDownloader](https://github.com/SteamRE/DepotDownloader), and runs the downloaded `.exe` directly through [Wine](https://www.winehq.org/) (CrossOver engine), rendering DirectX with Apple's **Game Porting Toolkit (D3DMetal)** when available and DXVK/MoltenVK as a fallback.
 
-Every dependency — the Wine engine and DepotDownloader — is downloaded and managed by Mist.app itself. There's nothing to install with Homebrew or any other package manager, and no separate Gatekeeper approval to grant: Mist downloads these tools the same way a browser would, but since it's not going through Homebrew's cask installer (which quarantines binaries on your behalf), they aren't quarantined and just run.
+It's self-contained: the helper tools ship inside the app, and the one thing that's too big to bundle — the Wine engine (~200 MB) — is downloaded by Mist itself on first launch. There's nothing to install with Homebrew or any other package manager.
 
 Mist never runs Steam's own Windows client under Wine — that's a deliberate design choice. Steam's client renders its UI with an embedded Chromium browser (CEF) that doesn't behave reliably under Wine (black screens, broken websocket connections between the client and its own UI process), and getting it working needs Accessibility permissions to auto-dismiss its error popups. Sidestepping the client entirely avoids all of that: no Accessibility permission, no black screens, no CEF.
 
