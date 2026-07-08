@@ -34,9 +34,10 @@ tools:
 $(TOOLS_SENTINEL):
 	tools/build-tools.sh "$(TOOLS_APP)"
 
-Mist.app/Contents/MacOS/Mist: MistApp.swift $(TOOLS_SENTINEL)
-	@mkdir -p Mist.app/Contents/MacOS
+Mist.app/Contents/MacOS/Mist: MistApp.swift $(TOOLS_SENTINEL) Mist.icns
+	@mkdir -p Mist.app/Contents/MacOS Mist.app/Contents/Resources
 	swiftc -O -parse-as-library -o $@ $<
+	@cp Mist.icns Mist.app/Contents/Resources/Mist.icns
 	@echo '<?xml version="1.0" encoding="UTF-8"?>' > Mist.app/Contents/Info.plist
 	@echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' >> Mist.app/Contents/Info.plist
 	@echo '<plist version="1.0"><dict>' >> Mist.app/Contents/Info.plist
@@ -44,8 +45,13 @@ Mist.app/Contents/MacOS/Mist: MistApp.swift $(TOOLS_SENTINEL)
 	@echo '<key>CFBundleIdentifier</key><string>com.mist.app</string>' >> Mist.app/Contents/Info.plist
 	@echo '<key>CFBundleName</key><string>Mist</string>' >> Mist.app/Contents/Info.plist
 	@echo '<key>CFBundleVersion</key><string>2.0</string>' >> Mist.app/Contents/Info.plist
+	@echo '<key>CFBundleIconFile</key><string>Mist.icns</string>' >> Mist.app/Contents/Info.plist
 	@echo '</dict></plist>' >> Mist.app/Contents/Info.plist
 	codesign --force --deep -s - Mist.app
+
+# Generate the app icon from tools/make_icon.swift (regenerate: rm Mist.icns).
+Mist.icns: tools/make_icon.swift
+	swift tools/make_icon.swift
 
 # ── Distribution targets (self-contained .app) ───────────────────────
 
