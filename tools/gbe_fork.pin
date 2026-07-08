@@ -1,0 +1,4 @@
+# gbe_fork (Goldberg fork) — Steamworks emulator DLLs for in-game achievements.
+# Prebuilt Windows release, downloaded + extracted at build time (not committed).
+url=https://github.com/Detanup01/gbe_fork/releases/download/release-2026_05_30/emu-win-release.7z
+sha256=38d0ce822f78f5b22dd28d948f4b1c98bc65f5fc3a850b7775286743a60e3516

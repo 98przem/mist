@@ -4,6 +4,10 @@
 /dist/
 *.dylib
 
+# .NET build intermediates for the helper tools (built by tools/build-tools.sh)
+tools/**/bin/
+tools/**/obj/
+
 # ── Kept local, intentionally NOT published ───────────────────────────
 # Anti-cheat circumvention code + anything documenting it.
 /patches/

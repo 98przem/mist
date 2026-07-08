@@ -10,13 +10,15 @@ Every dependency — the Wine engine and DepotDownloader — is downloaded and m
 
 Mist never runs Steam's own Windows client under Wine — that's a deliberate design choice. Steam's client renders its UI with an embedded Chromium browser (CEF) that doesn't behave reliably under Wine (black screens, broken websocket connections between the client and its own UI process), and getting it working needs Accessibility permissions to auto-dismiss its error popups. Sidestepping the client entirely avoids all of that: no Accessibility permission, no black screens, no CEF.
 
+**One login for everything.** A single QR scan powers your whole library, downloads, and achievements — there's no second sign-in. And you still get **real Steam achievements**: browse them in-app (unlock status + global rarity), and when you unlock one *in-game*, it syncs to your actual Steam profile — all without a running Steam client (see [Achievements](#achievements)).
+
 **Tested on:** macOS 14+ with Apple Silicon (M1/M2/M3/M4) via Rosetta 2.
 
 ## Download
 
-Grab the latest **Mist.zip** from the [Releases](../../releases) page. Unzip it, drag **Mist.app** to your Applications folder (or anywhere), and double-click.
+Grab the latest **Mist.dmg** from the [Releases](../../releases) page, open it, and drag **Mist.app** into your Applications folder.
 
-> **Note:** Since the app is not notarized, macOS will block it on first open. Right-click the app and select "Open" to bypass Gatekeeper. This is the only manual Gatekeeper step — Mist's own downloads (Wine, DepotDownloader) don't need it.
+> **Note:** Since the app is not notarized, macOS will block it on first open. Right-click the app and select "Open" to bypass Gatekeeper. This is the only manual step — the helper tools ship inside the app, and the Wine engine it downloads itself isn't quarantined.
 
 For DirectX 12 games, also install Apple's Game Porting Toolkit:
 ```bash
@@ -26,11 +28,20 @@ brew install --cask gcenx/wine/game-porting-toolkit
 ## Quick Start
 
 1. Open **Mist.app**. On first launch it downloads the Wine engine (~200 MB) — click **Download & Install** and wait for it to finish.
-2. Click **Steam** in the sidebar and scan the QR code with the Steam Mobile app (or sign in with your password on Steam's own login page if you'd rather use a browser).
-3. Your Steam library shows up — click **Install** on any owned game. The first install also downloads DepotDownloader itself (~30 MB, one-time, automatic).
-4. Once installed, click **Launch** to run it directly under Wine.
+2. Go to **Settings → Steam** and scan the QR code with the Steam Mobile app. That's the only login — it covers your library, downloads, and achievements.
+3. Your Steam library shows up — click **Install** on any owned game (no extra sign-in).
+4. Once installed, click **Launch** to run it directly under Wine. Click a game's card to see its details, description, and achievements.
 
 Epic Games works the same way it always has, via [legendary](https://github.com/derrod/legendary) — see **Epic Games** in the sidebar.
+
+## Achievements
+
+Mist reads and writes your **real** Steam achievements over Steam's client protocol using your one login — no Steam client, no Web API key:
+
+- **View** — a game's detail view lists its achievements with your unlock status and each one's global rarity.
+- **Unlock in-game** — when you launch a Steam game, Mist runs it through an open-source Steamworks shim ([gbe_fork](https://github.com/Detanup01/gbe_fork)) so the game unlocks achievements normally as you play. On exit, anything you genuinely earned is synced to your real Steam profile. Mist never fabricates achievements — it only syncs what the game actually unlocked, and skips anything already on your profile.
+
+> Achievement unlocking is experimental. The in-game **overlay** (Shift+Tab) isn't working under Wine yet — that's a known gap.
 
 ## How Mist.app works
 
@@ -55,30 +66,40 @@ Check [ProtonDB](https://www.protondb.com/) for game-specific reports — if a g
 
 ## Building from Source
 
-Pre-built binaries are not included in the repo.
+No binaries are committed to the repo — everything is built from source. You need the **Xcode command-line tools** (for `swiftc`) and the **[.NET 10 SDK](https://dotnet.microsoft.com/download)** (to build the two helper tools).
 
 ```bash
-make app                   # build Mist.app in the repo root (dev workflow)
-make bundle                 # build the distributable app → dist/Mist.app
-make release                # also produce dist/Mist.zip
+make app       # build Mist.app in the repo root (Swift + bundled tools; dev workflow)
+make bundle    # build the distributable app → dist/Mist.app
+make dmg       # build a drag-to-install disk image → dist/Mist.dmg
+make release   # produce dist/Mist.dmg + dist/Mist.zip
+make tools     # (re)build just the helper tools into the app's Resources
 ```
+
+The first `make app` also builds the helper tools (a few minutes); later builds reuse them. Releases are produced automatically by GitHub Actions when a `v*` tag is pushed (see `.github/workflows/release.yml`).
 
 ## File Structure
 
 ```
 mist/
-├── MistApp.swift            # Native SwiftUI app — Steam login, downloads, game library, launcher
-├── Makefile                 # Build targets (app, bundle, release)
-├── .github/workflows/ci.yml # Swift build CI
+├── MistApp.swift              # Native SwiftUI app — login, downloads, library, launcher, achievements
+├── Makefile                   # Build targets (app, tools, bundle, dmg, release)
+├── Mist.icns                  # App icon (regenerate with tools/make_icon.swift)
+├── tools/
+│   ├── AchievementRelay/      # SteamKit2 helper: read/write achievements over the client protocol
+│   ├── depotdownloader.patch  # small patch so DepotDownloader reuses Mist's login (no 2nd scan)
+│   ├── depotdownloader.pin    # pinned upstream DepotDownloader commit
+│   ├── gbe_fork.pin           # pinned gbe_fork release (Steamworks shim, prebuilt) + checksum
+│   ├── build-tools.sh         # builds/fetches all three helper tools
+│   └── make_icon.swift        # generates Mist.icns
+├── .github/workflows/         # ci.yml (Swift build) + release.yml (tagged DMG release)
 ├── LICENSE
 └── README.md
 ```
 
 ## Troubleshooting
 
-**First install takes a bit longer than expected:** Mist downloads DepotDownloader (~30 MB) automatically before your very first game install — that only happens once.
-
-**Install asks me to scan a QR code again:** DepotDownloader keeps its own Steam session (separate from Mist's login, since it talks to Steam's depot-download protocol directly) and caches it after the first successful scan — Mist reuses that cached session automatically on later installs, so this should only happen once per machine. If it happens again, the cached session probably expired or was revoked (e.g. after a password change) — just scan again and it'll cache the new one.
+**A downloaded game or achievement won't authenticate:** Everything runs off your one Steam login. If it expired or was revoked (e.g. after a password change), sign out and back in from **Settings → Steam** — one fresh scan restores downloads and achievements.
 
 **"wine server failed to run":** The Wine engine didn't download/extract correctly — try **Try Again** on the setup screen, or delete `~/Library/Application Support/Mist/wine` and relaunch Mist.app.
 
@@ -91,6 +112,8 @@ mist/
 - [Wine](https://www.winehq.org/) — the Windows compatibility layer (LGPL)
 - [Sikarugir](https://github.com/Sikarugir-App/Sikarugir) — packages the CrossOver Wine engine Mist downloads
 - [DepotDownloader](https://github.com/SteamRE/DepotDownloader) (SteamRE) — downloads Steam game depots directly, no Steam client needed
+- [SteamKit2](https://github.com/SteamRE/SteamKit) (SteamRE) — Steam client-protocol library powering Mist's achievement relay
+- [gbe_fork](https://github.com/Detanup01/gbe_fork) — open-source Steamworks emulator; Mist uses it as an in-game achievement shim for games you own
 - Apple **Game Porting Toolkit** (D3DMetal) — DirectX → Metal translation
 - [legendary](https://github.com/derrod/legendary) — open-source Epic Games launcher
 - [MoltenVK](https://github.com/KhronosGroup/MoltenVK) / [DXVK](https://github.com/doitsujin/dxvk) — Vulkan → Metal and D3D → Vulkan
