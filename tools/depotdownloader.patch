@@ -1,0 +1,36 @@
+diff --git a/DepotDownloader/Program.cs b/DepotDownloader/Program.cs
+index 26b7f16..c9349a2 100644
+--- a/DepotDownloader/Program.cs
++++ b/DepotDownloader/Program.cs
+@@ -70,6 +70,19 @@ namespace DepotDownloader
+             ContentDownloader.Config.UseQrCode = HasParameter(args, "-qr");
+             ContentDownloader.Config.SkipAppConfirmation = HasParameter(args, "-no-mobile");
+ 
++            // Mist integration: the launcher passes its own persistent refresh token
++            // (from its single QR login) via MIST_REFRESH_TOKEN. Seeding it into the
++            // login-token store makes the normal "-username <name> -remember-password"
++            // path reuse Mist's session — so downloads never prompt a separate QR
++            // scan. Requires the token to be persistent (Mist requests
++            // persistence=1 at auth), otherwise it dies after one CM logon.
++            var mistToken = Environment.GetEnvironmentVariable("MIST_REFRESH_TOKEN");
++            if (!string.IsNullOrEmpty(mistToken) && username != null)
++            {
++                AccountSettingsStore.Instance.LoginTokens[username] = mistToken;
++                ContentDownloader.Config.RememberPassword = true;
++            }
++
+             if (username == null)
+             {
+                 if (ContentDownloader.Config.RememberPassword && !ContentDownloader.Config.UseQrCode)
+diff --git a/global.json b/global.json
+index 2bc13e8..f657889 100644
+--- a/global.json
++++ b/global.json
+@@ -1,6 +1,6 @@
+ {
+   "sdk": {
+     "version": "9.0.100",
+-    "rollForward": "latestMinor"
++    "rollForward": "latestMajor"
+   }
+ }

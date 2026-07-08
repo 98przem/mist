@@ -10,17 +10,31 @@ BUNDLE_CONTENTS = $(BUNDLE)/Contents
 BUNDLE_MACOS = $(BUNDLE_CONTENTS)/MacOS
 BUNDLE_RESOURCES = $(BUNDLE_CONTENTS)/Resources
 
-.PHONY: all app clean bundle release bundle-clean test-build test \
+.PHONY: all app tools clean bundle release bundle-clean test-build test \
        reset-steam reset-all reset-depotdownloader-cache
+
+# Helper tools live in the app bundle's Resources; the relay binary doubles as
+# the "are the tools built?" sentinel so `make app` builds them once, then skips.
+TOOLS_APP = Mist.app/Contents/Resources/tools
+TOOLS_SENTINEL = $(TOOLS_APP)/AchievementRelay
 
 all: app
 
 # ── Developer targets (git-clone workflow) ────────────────────────────
 
-# Native macOS SwiftUI app
+# Native macOS SwiftUI app (+ bundled helper tools).
 app: Mist.app/Contents/MacOS/Mist
 
-Mist.app/Contents/MacOS/Mist: MistApp.swift
+# Build/fetch the helper tools (AchievementRelay, patched DepotDownloader,
+# gbe_fork DLLs). Requires the .NET SDK — see tools/build-tools.sh. Run directly
+# to refresh them after changing anything under tools/.
+tools:
+	tools/build-tools.sh "$(TOOLS_APP)"
+
+$(TOOLS_SENTINEL):
+	tools/build-tools.sh "$(TOOLS_APP)"
+
+Mist.app/Contents/MacOS/Mist: MistApp.swift $(TOOLS_SENTINEL)
 	@mkdir -p Mist.app/Contents/MacOS
 	swiftc -O -parse-as-library -o $@ $<
 	@echo '<?xml version="1.0" encoding="UTF-8"?>' > Mist.app/Contents/Info.plist
@@ -49,9 +63,13 @@ bundle:
 	@echo '<key>CFBundleIdentifier</key><string>com.mist.app</string>' >> "$(BUNDLE_CONTENTS)/Info.plist"
 	@echo '<key>CFBundleName</key><string>Mist</string>' >> "$(BUNDLE_CONTENTS)/Info.plist"
 	@echo '<key>CFBundleVersion</key><string>2.0</string>' >> "$(BUNDLE_CONTENTS)/Info.plist"
+	@echo '<key>CFBundleIconFile</key><string>Mist.icns</string>' >> "$(BUNDLE_CONTENTS)/Info.plist"
 	@echo '</dict></plist>' >> "$(BUNDLE_CONTENTS)/Info.plist"
-	# Ad-hoc code sign — no runtime resources to bundle; all setup/launch logic is
-	# native Swift and Mist downloads DepotDownloader itself on first use
+	# App icon
+	@cp Mist.icns "$(BUNDLE_RESOURCES)/Mist.icns" 2>/dev/null || echo "(no Mist.icns yet)"
+	# Bundle the helper tools (relay, patched DepotDownloader, gbe_fork DLLs).
+	tools/build-tools.sh "$(BUNDLE_RESOURCES)/tools"
+	# Ad-hoc code sign the whole bundle (tools included).
 	codesign --force --deep -s - "$(BUNDLE)"
 	@echo ""
 	@echo "Bundle ready at dist/Mist.app"
@@ -82,6 +100,7 @@ test: test-build
 
 clean:
 	rm -f Mist.app/Contents/MacOS/Mist
+	rm -rf "$(TOOLS_APP)"
 	rm -f tests/mach_syscall_test tests/nt_api_check.exe
 
 bundle-clean:

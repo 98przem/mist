@@ -56,6 +56,19 @@ struct Game: Identifiable, Hashable {
 enum MistEnv {
     static let supportDir = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/Mist")
+
+    // Helper tools (AchievementRelay, patched DepotDownloader, gbe_fork DLLs) ship
+    // inside the app bundle at Contents/Resources/tools (see `make tools`). Fall
+    // back to the support dir for dev runs of the bare binary, or installs that
+    // fetched a tool there. Wine itself is NOT bundled (too big) — still downloaded.
+    static var toolsDir: URL {
+        if let res = Bundle.main.resourceURL {
+            let bundled = res.appendingPathComponent("tools")
+            if FileManager.default.fileExists(atPath: bundled.path) { return bundled }
+        }
+        return supportDir.appendingPathComponent("tools")
+    }
+
     static let wineDir = supportDir.appendingPathComponent("wine")
     static let winePrefix = supportDir
     static var wineBinary: URL { wineDir.appendingPathComponent("bin/wine") }
@@ -1111,7 +1124,7 @@ struct WorkshopBrowseItem: Identifiable, Decodable {
 // QR-login session — reading achievement state and (when a game unlocks one)
 // writing it to the real profile, with no Steam Web API key and no Steam client.
 enum RelayManager {
-    static var binaryPath: URL { MistEnv.supportDir.appendingPathComponent("tools/AchievementRelay") }
+    static var binaryPath: URL { MistEnv.toolsDir.appendingPathComponent("AchievementRelay") }
     static var sessionPath: URL { MistEnv.supportDir.appendingPathComponent("steam_session.json") }
     static var isInstalled: Bool { FileManager.default.isExecutableFile(atPath: binaryPath.path) }
 
@@ -1175,7 +1188,7 @@ enum RelayManager {
 // ones to the real Steam profile via RelayManager. This is the emulator half of
 // the in-game achievements feature; the relay is the "make it real" half.
 enum GBEManager {
-    static var dllDir: URL { MistEnv.supportDir.appendingPathComponent("tools/gbe") }
+    static var dllDir: URL { MistEnv.toolsDir.appendingPathComponent("gbe") }
     static var isInstalled: Bool {
         FileManager.default.fileExists(atPath: dllDir.appendingPathComponent("steam_api64.dll").path)
     }
@@ -1309,7 +1322,7 @@ enum DepotDownloaderManager {
     #endif
 
     static var installPath: URL {
-        MistEnv.supportDir.appendingPathComponent("tools/DepotDownloader")
+        MistEnv.toolsDir.appendingPathComponent("DepotDownloader")
     }
 
     static var isInstalled: Bool {
