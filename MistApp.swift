@@ -4634,7 +4634,7 @@ struct MistApp: App {
             ContentView()
         }
         .windowStyle(.titleBar)
-        .defaultSize(width: 900, height: 600)
+        .defaultSize(width: 1160, height: 760)
         .commands {
             CommandGroup(replacing: .newItem) { }
             CommandMenu("Library") {
