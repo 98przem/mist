@@ -767,7 +767,15 @@ final class SteamAuthManager: ObservableObject {
         // regardless of scope quirks below; platform_type=3 (MobileApp) broke the QR
         // flow itself (Steam Mobile reported "sign in request expired" right after
         // confirming), since this device isn't actually a phone.
-        request.httpBody = "device_friendly_name=\(encodedName)&platform_type=1".data(using: .utf8)
+        //
+        // persistence=1 (ESessionPersistence_Persistent) is REQUIRED for the refresh
+        // token to be reusable across multiple client-protocol logons. Without it
+        // Steam issues an ephemeral token that dies after a single CM logon (and even
+        // its renewal is then AccessDenied) — which is fine for Mist's own one-shot
+        // Web-API use, but breaks anything that logs into Steam's CM repeatedly with
+        // it (game downloads, the achievement relay). DepotDownloader sets the same
+        // flag (IsPersistentSession=true), which is why its session survives reuse.
+        request.httpBody = "device_friendly_name=\(encodedName)&platform_type=1&persistence=1".data(using: .utf8)
 
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
@@ -960,37 +968,70 @@ enum SteamLibraryService {
         "https://cdn.cloudflare.steamstatic.com/steam/apps/\(appid)/library_hero.jpg"
     }
 
-    // Read-only: this game's achievement list and the logged-in user's unlock
-    // status, straight from Steam's own records — NOT something Mist can set.
-    // Actually unlocking achievements during gameplay would require standing in
-    // for steam_api.dll/steamclient.dll the way the game normally talks to a
-    // running Steam client, which is the same mechanism "Steam emulator" tools
-    // use to fake game ownership entirely — deliberately not implemented here.
-    static func fetchAchievements(appid: String, steamID: String, accessToken: String) async throws -> [SteamAchievement] {
-        var comps = URLComponents(string: "https://api.steampowered.com/ISteamUserStats/GetPlayerAchievements/v1/")!
-        comps.queryItems = [
-            URLQueryItem(name: "appid", value: appid),
-            URLQueryItem(name: "steamid", value: steamID),
+    // This game's achievement list + the user's unlock status, read over Steam's
+    // client protocol by the bundled AchievementRelay helper — powered by Mist's
+    // single QR login (no Steam Web API key, no Steam client running). See
+    // RelayManager. The old ISteamUserStats/GetPlayerAchievements path needed a
+    // separate Web API key because it rejects the user access_token; the client
+    // protocol has no such restriction.
+    static func fetchAchievements(appid: String, steamID: String) async throws -> [SteamAchievement] {
+        try await RelayManager.achievements(appid: appid)
+    }
+
+    // Global unlock rarity — what fraction of ALL owners have each achievement.
+    // Public, keyless. Keyed by apiname, so it joins directly onto the per-user
+    // list from fetchAchievements. Returns [apiname: percent].
+    static func fetchGlobalAchievementPercents(appid: String) async -> [String: Double] {
+        var comps = URLComponents(string: "https://api.steampowered.com/ISteamUserStats/GetGlobalAchievementPercentagesForApp/v2/")!
+        comps.queryItems = [URLQueryItem(name: "gameid", value: appid)]
+        guard let url = comps.url,
+              let (data, response) = try? await URLSession.shared.data(from: url),
+              let http = response as? HTTPURLResponse, http.statusCode == 200 else { return [:] }
+        struct Resp: Decodable {
+            struct Entry: Decodable { let name: String; let percent: Double }
+            struct Inner: Decodable { let achievements: [Entry]? }
+            let achievementpercentages: Inner?
+        }
+        guard let decoded = try? JSONDecoder().decode(Resp.self, from: data) else { return [:] }
+        var map: [String: Double] = [:]
+        for e in decoded.achievementpercentages?.achievements ?? [] { map[e.name] = e.percent }
+        return map
+    }
+
+    // Browse an app's Workshop. Uses the logged-in user's access_token (the same
+    // webapi token GetOwnedGames/GetPlayerAchievements accept). If Steam rejects
+    // it, throws — the caller keeps the manual URL/ID install path as a fallback.
+    // query_type 3 = RankedByTrend (what the Workshop "Popular" tab shows).
+    static func fetchWorkshopItems(appid: String, accessToken: String, page: Int = 1,
+                                   search: String = "") async throws -> [WorkshopBrowseItem] {
+        var comps = URLComponents(string: "https://api.steampowered.com/IPublishedFileService/QueryFiles/v1/")!
+        var items = [
             URLQueryItem(name: "access_token", value: accessToken),
-            URLQueryItem(name: "l", value: "english"),
+            URLQueryItem(name: "appid", value: appid),
+            URLQueryItem(name: "numperpage", value: "30"),
+            URLQueryItem(name: "page", value: String(page)),
+            URLQueryItem(name: "query_type", value: search.isEmpty ? "3" : "12"),
+            URLQueryItem(name: "return_metadata", value: "true"),
+            URLQueryItem(name: "return_previews", value: "true"),
+            URLQueryItem(name: "return_short_description", value: "true"),
+            URLQueryItem(name: "filetype", value: "0"),
         ]
+        if !search.isEmpty { items.append(URLQueryItem(name: "search_text", value: search)) }
+        comps.queryItems = items
         let (data, response) = try await URLSession.shared.data(from: comps.url!)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            throw SteamAuthError(message: "This game has no achievements, or they couldn't be loaded.")
+        guard let http = response as? HTTPURLResponse else {
+            throw SteamAuthError(message: "Couldn't reach the Steam Workshop.")
+        }
+        guard http.statusCode == 200 else {
+            throw SteamAuthError(message: "Steam wouldn't authorize a Workshop search (HTTP \(http.statusCode)). You can still install items by ID below.")
         }
         struct Resp: Decodable {
-            struct Inner: Decodable {
-                let success: Bool
-                let achievements: [SteamAchievement]?
-                let error: String?
-            }
-            let playerstats: Inner
+            struct Inner: Decodable { let publishedfiledetails: [WorkshopBrowseItem]? }
+            let response: Inner?
         }
         let decoded = try JSONDecoder().decode(Resp.self, from: data)
-        guard decoded.playerstats.success else {
-            throw SteamAuthError(message: decoded.playerstats.error ?? "No achievement data available for this game.")
-        }
-        return decoded.playerstats.achievements ?? []
+        // Only items that actually resolved (result == 1) and aren't hidden.
+        return (decoded.response?.publishedfiledetails ?? []).filter { $0.result == 1 }
     }
 
     // Public store metadata (description, tags) — no login needed, same endpoint
@@ -1021,12 +1062,223 @@ struct SteamAchievement: Identifiable, Decodable {
     let unlocktime: Int?
     let name: String?
     let description: String?
+    // Joined in from GetGlobalAchievementPercentagesForApp after fetch (not part
+    // of the GetPlayerAchievements response, so it's a mutable overlay).
+    var globalPercent: Double? = nil
+
+    private enum CodingKeys: String, CodingKey {
+        case apiname, achieved, unlocktime, name, description
+    }
+
+    var rarityLabel: String? {
+        guard let p = globalPercent else { return nil }
+        if p < 5 { return "Ultra Rare" }
+        if p < 15 { return "Rare" }
+        return nil
+    }
 }
 
 struct SteamAppDetails: Decodable {
     struct Genre: Decodable { let description: String }
     let short_description: String?
     let genres: [Genre]?
+}
+
+struct WorkshopBrowseItem: Identifiable, Decodable {
+    var id: String { publishedfileid }
+    let publishedfileid: String
+    let result: Int
+    let title: String?
+    let short_description: String?
+    let preview_url: String?
+    let file_size: String?   // bytes, as a string
+    let time_updated: Int?
+    let subscriptions: Int?
+    let favorited: Int?
+
+    var sizeFormatted: String? {
+        guard let s = file_size, let bytes = Int64(s), bytes > 0 else { return nil }
+        if bytes > 1_073_741_824 { return "\(bytes / 1_073_741_824) GB" }
+        if bytes > 1_048_576 { return "\(bytes / 1_048_576) MB" }
+        return "\(bytes / 1024) KB"
+    }
+}
+
+// MARK: - Achievement Relay (client protocol via Mist's single login)
+
+// Bridges to the bundled AchievementRelay helper (a self-contained SteamKit2 tool,
+// like DepotDownloader) which speaks Steam's client protocol using Mist's single
+// QR-login session — reading achievement state and (when a game unlocks one)
+// writing it to the real profile, with no Steam Web API key and no Steam client.
+enum RelayManager {
+    static var binaryPath: URL { MistEnv.supportDir.appendingPathComponent("tools/AchievementRelay") }
+    static var sessionPath: URL { MistEnv.supportDir.appendingPathComponent("steam_session.json") }
+    static var isInstalled: Bool { FileManager.default.isExecutableFile(atPath: binaryPath.path) }
+
+    // Runs the relay off the main thread and returns its stdout (JSON). The read
+    // happens on a background queue so the pipe never deadlocks and the UI never
+    // blocks on the ~seconds-long Steam round-trip.
+    private static func run(_ args: [String]) async throws -> Data {
+        guard isInstalled else { throw SteamAuthError(message: "The achievements helper isn't installed yet.") }
+        guard FileManager.default.fileExists(atPath: sessionPath.path) else {
+            throw SteamAuthError(message: "Sign in to Steam first to load achievements.")
+        }
+        return try await withCheckedThrowingContinuation { cont in
+            DispatchQueue.global().async {
+                let p = Process()
+                p.executableURL = binaryPath
+                p.arguments = [sessionPath.path] + args
+                let out = Pipe()
+                p.standardOutput = out
+                p.standardError = FileHandle.nullDevice
+                do { try p.run() } catch { cont.resume(throwing: error); return }
+                let data = out.fileHandleForReading.readDataToEndOfFile()
+                p.waitUntilExit()
+                if p.terminationStatus == 0 {
+                    cont.resume(returning: data)
+                } else {
+                    cont.resume(throwing: SteamAuthError(message: "This game has no achievements, or they couldn't be loaded."))
+                }
+            }
+        }
+    }
+
+    static func achievements(appid: String) async throws -> [SteamAchievement] {
+        let data = try await run([appid])
+        return try JSONDecoder().decode([SteamAchievement].self, from: data)
+    }
+
+    // Push one achievement to the real Steam profile. Returns true when it's
+    // confirmed present afterward — either freshly stored (ok) OR already earned
+    // (alreadyUnlocked), since "already on your profile" is a success, not a
+    // failure, for our sync-what-you-earned flow.
+    @discardableResult
+    static func unlock(appid: String, apiname: String) async throws -> Bool {
+        let data = try await run([appid, "--unlock", apiname])
+        struct R: Decodable { let ok: Bool?; let alreadyUnlocked: Bool? }
+        let r = try? JSONDecoder().decode(R.self, from: data)
+        return (r?.ok ?? false) || (r?.alreadyUnlocked ?? false)
+    }
+
+    // The achievement schema in gbe_fork's steam_settings/achievements.json format.
+    static func gbeSchema(appid: String) async throws -> Data {
+        try await run([appid, "--schema"])
+    }
+}
+
+// MARK: - GBE (Steamworks emulator) — in-game achievements + overlay
+
+// Deploys gbe_fork's steam_api64.dll/steamclient64.dll/overlay into a game so it
+// runs under Wine thinking Steam is present — recording achievement unlocks (and
+// showing the overlay) with no Steam client. Unlocks land in a local gse_save/
+// folder next to the exe; after the game exits, syncAchievements() pushes any new
+// ones to the real Steam profile via RelayManager. This is the emulator half of
+// the in-game achievements feature; the relay is the "make it real" half.
+enum GBEManager {
+    static var dllDir: URL { MistEnv.supportDir.appendingPathComponent("tools/gbe") }
+    static var isInstalled: Bool {
+        FileManager.default.fileExists(atPath: dllDir.appendingPathComponent("steam_api64.dll").path)
+    }
+
+    // Portable save dir gbe_fork writes unlocks into (set via local_save_path),
+    // relative to the game's steam_api64.dll. Kept local so Mist can read it back.
+    static let saveDirName = "gse_save"
+
+    // Swap gbe_fork's DLLs into the game dir + write steam_settings. Idempotent:
+    // the game's original steam_api64.dll is backed up once to .mist-orig so the
+    // swap can be reverted, and re-deploying just refreshes the emu files.
+    static func deploy(gameDir: String, appid: String) throws {
+        guard isInstalled else { throw SteamAuthError(message: "The achievements emulator isn't installed yet.") }
+        let fm = FileManager.default
+        let dir = URL(fileURLWithPath: gameDir)
+
+        // steam_api64.dll sits wherever the game keeps it — find it (some games
+        // nest it under a data subfolder). Deploy beside each one we find.
+        let apiDLLs = locateSteamAPIDLLs(in: dir)
+        let targets = apiDLLs.isEmpty ? [dir.appendingPathComponent("steam_api64.dll")] : apiDLLs
+        for target in targets {
+            let folder = target.deletingLastPathComponent()
+            // Back up the original once.
+            let backup = target.appendingPathExtension("mist-orig")
+            if fm.fileExists(atPath: target.path), !fm.fileExists(atPath: backup.path) {
+                try? fm.moveItem(at: target, to: backup)
+            }
+            try? fm.removeItem(at: target)
+            try fm.copyItem(at: dllDir.appendingPathComponent("steam_api64.dll"), to: target)
+            for extra in ["steamclient64.dll", "GameOverlayRenderer64.dll"] {
+                let dst = folder.appendingPathComponent(extra)
+                try? fm.removeItem(at: dst)
+                try? fm.copyItem(at: dllDir.appendingPathComponent(extra), to: dst)
+            }
+            try writeSteamSettings(in: folder, appid: appid)
+        }
+    }
+
+    private static func writeSteamSettings(in folder: URL, appid: String) throws {
+        let fm = FileManager.default
+        let settings = folder.appendingPathComponent("steam_settings")
+        try fm.createDirectory(at: settings, withIntermediateDirectories: true)
+        try appid.write(to: settings.appendingPathComponent("steam_appid.txt"), atomically: true, encoding: .utf8)
+        // Portable local saves so unlocks land in <folder>/gse_save/ for the sync.
+        let userIni = "[user::saves]\nlocal_save_path=./\(saveDirName)\n"
+        try userIni.write(to: settings.appendingPathComponent("configs.user.ini"), atomically: true, encoding: .utf8)
+    }
+
+    // Fetch the game's achievement schema and write it into every steam_settings
+    // folder as achievements.json. CRITICAL: gbe_fork silently ignores any
+    // SetAchievement() call for an achievement not in this schema, so without it
+    // nothing is ever recorded. Fetched over the client protocol (Mist's login) —
+    // best-effort: a game with no achievements, or a transient Steam hiccup, just
+    // means no schema (the game still runs fine).
+    static func installSchema(gameDir: String, appid: String) async {
+        guard let data = try? await RelayManager.gbeSchema(appid: appid), data.count > 2 else { return }
+        for folder in steamSettingsFolders(in: gameDir) {
+            try? data.write(to: folder.appendingPathComponent("achievements.json"))
+        }
+    }
+
+    // Synchronous scan (kept out of async context — DirectoryEnumerator iteration
+    // isn't async-safe) for every steam_settings folder deploy created.
+    private static func steamSettingsFolders(in gameDir: String) -> [URL] {
+        let fm = FileManager.default
+        guard let en = fm.enumerator(at: URL(fileURLWithPath: gameDir), includingPropertiesForKeys: nil) else { return [] }
+        var out: [URL] = []
+        for case let url as URL in en where url.lastPathComponent == "steam_settings" { out.append(url) }
+        return out
+    }
+
+    // Find the game's steam_api64.dll(s), skipping ones we already replaced.
+    private static func locateSteamAPIDLLs(in root: URL) -> [URL] {
+        var found: [URL] = []
+        guard let en = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil) else { return found }
+        for case let url as URL in en where url.lastPathComponent == "steam_api64.dll" {
+            found.append(url)
+        }
+        return found
+    }
+
+    // API names of achievements gbe_fork recorded as unlocked during play. It
+    // writes them under <dll folder>/gse_save/<appid>/achievements.json; we scan
+    // for any such file (the dll can be nested) and read the earned entries.
+    // Parser is deliberately lenient about gbe_fork's exact on-disk shape.
+    static func locallyUnlocked(gameDir: String, appid: String) -> [String] {
+        let fm = FileManager.default
+        var result: Set<String> = []
+        guard let en = fm.enumerator(at: URL(fileURLWithPath: gameDir), includingPropertiesForKeys: nil) else { return [] }
+        for case let url as URL in en where url.lastPathComponent == "achievements.json"
+            && url.deletingLastPathComponent().pathComponents.contains(saveDirName) {
+            guard let data = try? Data(contentsOf: url),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+            for (name, val) in obj {
+                if let d = val as? [String: Any] {
+                    let earned = (d["earned"] as? Bool) ?? ((d["earned"] as? Int) == 1)
+                        || ((d["Achieved"] as? Int) == 1) || ((d["achieved"] as? Int) == 1)
+                    if earned { result.insert(name) }
+                }
+            }
+        }
+        return Array(result)
+    }
 }
 
 // MARK: - Steam Game Downloads (DepotDownloader — native, no Wine needed to download)
@@ -1411,10 +1663,10 @@ final class SteamDownloadManager: ObservableObject {
     }
 
     private func runDepotDownloader(appid: String, name: String, steamAccountName: String,
-                                    forceQR: Bool = false, pubfileID: String? = nil,
+                                    pubfileID: String? = nil,
                                     onComplete: @escaping () -> Void) {
         let tool = DepotDownloaderManager.installPath.path
-        downloadStatusText = "Starting download…"
+        downloadStatusText = "Signing in with your Steam login…"
 
         let installDir: URL
         if let pubfileID {
@@ -1425,52 +1677,29 @@ final class SteamDownloadManager: ObservableObject {
         }
         try? FileManager.default.createDirectory(at: installDir, withIntermediateDirectories: true)
 
-        // Try to reuse DepotDownloader's own cached session (see
-        // reusableAccountsKey) instead of asking for another QR scan. -username
-        // with -remember-password and no -password makes DepotDownloader use its
-        // cached token when one exists (Program.cs only prompts interactively when
-        // RememberPassword is false or no cached token is found for that
-        // username) — but if the cached token has expired or was never actually
-        // saved, that same code path blocks on an unanswerable interactive prompt
-        // with no stdin to satisfy it. The watchdog below detects that stall and
-        // falls back to -qr rather than hanging the UI forever.
-        let reuse = !forceQR && Self.canReuseSession(for: steamAccountName)
-        let pubfileArgs = pubfileID.map { ["-pubfile", $0] } ?? []
-        var args: [String]
-        if reuse {
-            args = ["-app", appid, "-os", "windows", "-dir", installDir.path,
+        // Single-login: our patched DepotDownloader seeds Mist's own persistent
+        // session token (passed via MIST_REFRESH_TOKEN) into its login store, so
+        // "-username <account> -remember-password" logs in non-interactively with
+        // Mist's one QR sign-in — no separate DepotDownloader QR scan, ever.
+        var args = ["-app", appid, "-os", "windows", "-dir", installDir.path,
                     "-username", steamAccountName, "-remember-password"]
-            downloadStatusText = "Signing in with saved session…"
-        } else {
-            args = ["-app", appid, "-os", "windows", "-dir", installDir.path, "-remember-password", "-qr"]
-        }
-        args += pubfileArgs
+        if let pubfileID { args += ["-pubfile", pubfileID] }
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: tool)
         proc.arguments = args
+        var env = ProcessInfo.processInfo.environment
+        if let token = Self.sessionRefreshToken() { env["MIST_REFRESH_TOKEN"] = token }
+        proc.environment = env
 
         let outPipe = Pipe()
         proc.standardOutput = outPipe
         proc.standardError = outPipe
 
-        let qrRegex = try? NSRegularExpression(pattern: "https://s\\.team/q/\\S+")
-        // DepotDownloader prints "NN.NN% path/to/file" for each chunk — the only line
+        // DepotDownloader prints "NN.NN% path/to/file" per chunk — the only line
         // type treated as real, user-facing progress.
         let progressRegex = try? NSRegularExpression(pattern: "^(\\d+\\.\\d+)%")
-
         recentOutputLines = []
-        isCapturingQRArt = false
-        qrArtBuffer = []
-        sawMeaningfulOutputThisRun = false
-        reuseWatchdog?.invalidate()
-        reuseWatchdog = nil
-
-        // Declared here (not inline in terminationHandler below) so the output
-        // parser can also trigger it the moment it recognizes the exact hang
-        // signature, instead of only from the timeout-based watchdog.
-        var fallingBackToQR = false
-        var lastOutputAt = Date()
 
         outPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
@@ -1478,80 +1707,20 @@ final class SteamDownloadManager: ObservableObject {
             DispatchQueue.main.async {
                 guard let self else { return }
                 for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
-                    // Only strip \r (line-ending noise) here — trimming whitespace is
-                    // done separately below ONLY for detection/status purposes. The QR
-                    // art buffer keeps the untrimmed line: different rows of the
-                    // pattern have different amounts of leading blank space (that's
-                    // part of the encoded data), so trimming it shifts each row's dark
-                    // squares by a different amount and completely scrambles the grid
-                    // — confirmed as the actual cause of the QR not scanning at all.
-                    let raw = String(rawLine).replacingOccurrences(of: "\r", with: "")
-                    let l = raw.trimmingCharacters(in: .whitespaces)
-
-                    if !l.isEmpty {
-                        self.recentOutputLines.append(l)
-                        if self.recentOutputLines.count > self.maxRecentLines {
-                            self.recentOutputLines.removeFirst()
-                        }
-                        lastOutputAt = Date()
+                    let l = String(rawLine).replacingOccurrences(of: "\r", with: "")
+                        .trimmingCharacters(in: .whitespaces)
+                    guard !l.isEmpty else { continue }
+                    self.recentOutputLines.append(l)
+                    if self.recentOutputLines.count > self.maxRecentLines {
+                        self.recentOutputLines.removeFirst()
                     }
-
-                    // "Enter account password for ..." is DepotDownloader's exact,
-                    // unambiguous tell that the cached-session reuse lookup failed
-                    // (LoginTokens had no entry for this username) and it's about to
-                    // block on Console.ReadLine() forever, since we give it no
-                    // stdin. Catch this instantly rather than waiting for the
-                    // watchdog timeout — this is the real hang, not a slow network.
-                    if reuse && !fallingBackToQR && l.localizedCaseInsensitiveContains("enter account password for") {
-                        fallingBackToQR = true
-                        Self.forgetReusableSession(for: steamAccountName)
-                        self.downloadStatusText = "Saved session no longer valid — scan again…"
-                        proc.terminate()
-                    }
-
-                    // DepotDownloader (this version) never prints a plain QR URL —
-                    // only a terminal ASCII-art rendering using Unicode block
-                    // characters, announced by a "sign in with this QR code" line. We
-                    // capture the whole block (including its blank-line quiet-zone
-                    // padding, part of the QR standard) and rasterize it into a real
-                    // bitmap with guaranteed-square modules, since there's no URL to
-                    // re-render as a clean generated image and text rendering can't
-                    // reliably reproduce exact column alignment.
-                    let isAsciiArt = l.unicodeScalars.contains { (0x2580...0x259F).contains($0.value) }
-
-                    if let regex = qrRegex,
-                       let match = regex.firstMatch(in: l, range: NSRange(l.startIndex..., in: l)),
-                       let range = Range(match.range, in: l) {
-                        self.isCapturingQRArt = false
-                        self.downloadQRImage = nil
-                        self.downloadQRURL = String(l[range])
-                        self.downloadStatusText = "Scan with the Steam Mobile app to authorize downloads"
-                    } else if let regex = progressRegex,
-                              let match = regex.firstMatch(in: l, range: NSRange(l.startIndex..., in: l)),
-                              let range = Range(match.range(at: 1), in: l),
-                              let pct = Double(l[range]) {
-                        self.isCapturingQRArt = false
-                        self.downloadQRURL = nil
-                        self.downloadQRImage = nil
+                    if let regex = progressRegex,
+                       let m = regex.firstMatch(in: l, range: NSRange(l.startIndex..., in: l)),
+                       let r = Range(m.range(at: 1), in: l), let pct = Double(l[r]) {
                         self.downloadProgress = pct / 100
                         self.downloadStatusText = "Downloading \(name)…"
-                        // Real download progress is proof the cached-session
-                        // reuse path actually worked — cancel the fallback watchdog.
-                        self.sawMeaningfulOutputThisRun = true
-                        self.reuseWatchdog?.invalidate()
-                        self.reuseWatchdog = nil
-                    } else if l.localizedCaseInsensitiveContains("sign in with this qr code") {
-                        self.isCapturingQRArt = true
-                        self.qrArtBuffer = []
-                        self.downloadStatusText = "Scan with the Steam Mobile app to authorize downloads"
-                    } else if self.isCapturingQRArt && (isAsciiArt || l.isEmpty) {
-                        self.qrArtBuffer.append(raw)
-                        self.downloadQRImage = Self.renderTerminalQR(lines: self.qrArtBuffer)
-                    } else if !l.isEmpty {
-                        self.isCapturingQRArt = false
-                        if !isAsciiArt {
-                            self.downloadStatusText = l
-                        }
+                    } else {
+                        self.downloadStatusText = l
                     }
                 }
             }
@@ -1561,25 +1730,13 @@ final class SteamDownloadManager: ObservableObject {
             outPipe.fileHandleForReading.readabilityHandler = nil
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.reuseWatchdog?.invalidate()
-                self.reuseWatchdog = nil
-
-                if fallingBackToQR {
-                    self.runDepotDownloader(appid: appid, name: name, steamAccountName: steamAccountName,
-                                            forceQR: true, pubfileID: pubfileID, onComplete: onComplete)
-                    return
-                }
-
                 if p.terminationStatus == 0 {
                     self.isDownloading = false
                     self.downloadingAppID = nil
                     self.downloadingName = nil
-                    self.downloadQRURL = nil
-                    self.downloadQRImage = nil
                     self.downloadProgress = nil
                     self.connectionRetryCount = 0
                     self.downloadStatusText = "Done!"
-                    Self.markSessionReusable(for: steamAccountName)
                     if pubfileID == nil {
                         let size = Self.directorySize(installDir)
                         MistManifest.add(MistInstalledGame(appid: appid, name: name, installDir: installDir.path, sizeBytes: size),
@@ -1592,19 +1749,9 @@ final class SteamDownloadManager: ObservableObject {
                 let looksLikeConnectionHiccup = Self.connectionFailureMarkers.contains { marker in
                     self.recentOutputLines.contains { $0.contains(marker) }
                 }
-                if reuse && !self.sawMeaningfulOutputThisRun {
-                    // The saved session likely failed (expired/revoked token) rather
-                    // than a transient connection hiccup — forget it and fall back
-                    // to a fresh QR scan instead of endlessly retrying a bad session.
-                    Self.forgetReusableSession(for: steamAccountName)
-                    self.downloadStatusText = "Saved session no longer valid — scan again…"
-                    self.runDepotDownloader(appid: appid, name: name, steamAccountName: steamAccountName,
-                                            forceQR: true, pubfileID: pubfileID, onComplete: onComplete)
-                } else if looksLikeConnectionHiccup && self.connectionRetryCount < self.maxConnectionRetries {
+                if looksLikeConnectionHiccup && self.connectionRetryCount < self.maxConnectionRetries {
                     self.connectionRetryCount += 1
                     self.downloadStatusText = "Steam connection hiccup — retrying (\(self.connectionRetryCount)/\(self.maxConnectionRetries))…"
-                    self.downloadQRURL = nil
-                    self.downloadQRImage = nil
                     self.downloadProgress = nil
                     DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
                         self.runDepotDownloader(appid: appid, name: name, steamAccountName: steamAccountName,
@@ -1614,8 +1761,6 @@ final class SteamDownloadManager: ObservableObject {
                     self.isDownloading = false
                     self.downloadingAppID = nil
                     self.downloadingName = nil
-                    self.downloadQRURL = nil
-                    self.downloadQRImage = nil
                     self.downloadProgress = nil
                     self.connectionRetryCount = 0
                     let tail = self.recentOutputLines.suffix(6).joined(separator: "\n")
@@ -1627,32 +1772,22 @@ final class SteamDownloadManager: ObservableObject {
         do {
             try proc.run()
             process = proc
-
-            if reuse {
-                // Backstop only — the password-prompt phrase check above catches
-                // the actual known hang instantly. This just guards against a
-                // truly silent stall (e.g. connection to Steam3 never completes)
-                // that doesn't print anything at all. Steam's license/app-info
-                // check before the first "%" line can legitimately take a while on
-                // a slow connection, so this only fires after real silence, not
-                // just "no progress yet" — polling every 5s and resetting whenever
-                // ANY output arrives (see lastOutputAt), not just progress lines.
-                reuseWatchdog = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] timer in
-                    guard let self, self.process === proc, proc.isRunning else { timer.invalidate(); return }
-                    guard !self.sawMeaningfulOutputThisRun, !fallingBackToQR else { return }
-                    guard Date().timeIntervalSince(lastOutputAt) > 45 else { return }
-                    fallingBackToQR = true
-                    Self.forgetReusableSession(for: steamAccountName)
-                    self.downloadStatusText = "Saved session didn't respond — scan again…"
-                    proc.terminate()
-                }
-            }
         } catch {
             isDownloading = false
             downloadingAppID = nil
             downloadingName = nil
             downloadError = "Couldn't start DepotDownloader: \(error.localizedDescription)"
         }
+    }
+
+    // Mist's own persistent refresh token, read from the session file — passed to
+    // our patched DepotDownloader so downloads reuse the single QR login.
+    private static func sessionRefreshToken() -> String? {
+        let url = MistEnv.supportDir.appendingPathComponent("steam_session.json")
+        guard let data = try? Data(contentsOf: url),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tok = obj["refreshToken"] as? String, !tok.isEmpty else { return nil }
+        return tok
     }
 
     func cancel() {
@@ -1791,11 +1926,58 @@ class ProcessManager: ObservableObject {
         env["WINEDLLOVERRIDES"] = "d3d11,d3d10core,d3d12,d3d12core=n,b"
         env["EOS_USE_ANTICHEATCLIENTNULL"] = "1"
         env["DOTNET_EnableWriteXorExecute"] = "0"
-        MistEnv.killWineserver()
-        let args = [exe] + GameSettingsStore.tokenize(GameSettingsStore.customArgs(for: game.id))
-        runProcess(path: MistEnv.wineBinary.path, arguments: args, env: env,
-                   cwd: URL(fileURLWithPath: exe).deletingLastPathComponent())
-        startDialogKiller()
+
+        // In-game achievements: for Steam games, swap in gbe_fork so the game runs
+        // thinking Steam is present and records unlocks locally. After it exits we
+        // push those unlocks to the real profile via the relay (see syncAchievements).
+        let achievementsGame: Game? = (game.source == .steam && GBEManager.isInstalled) ? game : nil
+
+        let launchArgs = [exe] + GameSettingsStore.tokenize(GameSettingsStore.customArgs(for: game.id))
+        let launchCwd = URL(fileURLWithPath: exe).deletingLastPathComponent()
+        let onExit: (() -> Void)? = achievementsGame.map { g in { [weak self] in self?.syncAchievements(for: g) } }
+
+        let start: ([String: String]) -> Void = { [weak self] finalEnv in
+            guard let self else { return }
+            MistEnv.killWineserver()
+            self.runProcess(path: MistEnv.wineBinary.path, arguments: launchArgs, env: finalEnv,
+                            cwd: launchCwd, onExit: onExit)
+            self.startDialogKiller()
+        }
+
+        guard let g = achievementsGame else { start(env); return }
+
+        // Deploy the emulator AND fetch/write the achievement schema BEFORE the game
+        // process starts — gbe_fork reads steam_settings/achievements.json once at
+        // init, so the schema must already be on disk or the game's achievement
+        // calls that session are silently dropped.
+        Task { @MainActor in
+            var gameEnv = env
+            do {
+                try GBEManager.deploy(gameDir: g.installDir, appid: g.id)
+                gameEnv["SteamAppId"] = g.id
+                gameEnv["SteamGameId"] = g.id
+                self.outputLog += "Achievements: preparing the Steam emulator (appid \(g.id))…\n"
+                await GBEManager.installSchema(gameDir: g.installDir, appid: g.id)
+                self.outputLog += "Achievements: running through the Steam emulator.\n\n"
+            } catch {
+                self.outputLog += "Achievements: emulator setup skipped (\(error.localizedDescription)).\n\n"
+            }
+            start(gameEnv)
+        }
+    }
+
+    // After a Steam game (run through gbe_fork) exits, push any achievements it
+    // recorded locally to the real profile via the relay. Best-effort + async.
+    private func syncAchievements(for game: Game) {
+        Task { @MainActor in
+            let unlocked = GBEManager.locallyUnlocked(gameDir: game.installDir, appid: game.id)
+            guard !unlocked.isEmpty else { return }
+            self.outputLog += "\nSyncing \(unlocked.count) achievement(s) to your Steam profile…\n"
+            for apiname in unlocked {
+                let ok = (try? await RelayManager.unlock(appid: game.id, apiname: apiname)) ?? false
+                self.outputLog += ok ? "  ✓ \(apiname)\n" : "  ✗ \(apiname) (couldn't sync)\n"
+            }
+        }
     }
 
     // Launch via Apple's Game Porting Toolkit (D3DMetal) in a dedicated prefix, so
@@ -1916,7 +2098,8 @@ class ProcessManager: ObservableObject {
     // everything it spawned) actually quits.
     private func runProcess(path: String, arguments: [String],
                             env: [String: String], cwd: URL? = nil,
-                            waitForWineserverAfter: Bool = false) {
+                            waitForWineserverAfter: Bool = false,
+                            onExit: (() -> Void)? = nil) {
         isRunning = true
 
         let proc = Process()
@@ -1954,6 +2137,7 @@ class ProcessManager: ObservableObject {
                     self?.currentGame = nil
                     self?.dialogKillerTimer?.invalidate()
                     self?.dialogKillerTimer = nil
+                    onExit?()
                 }
             }
             if waitForWineserverAfter {
@@ -2812,6 +2996,8 @@ struct GameDetailView: View {
     var onShowInFinder: () -> Void = {}
     var onLaunchOptions: () -> Void = {}
     var onInstallWorkshopItem: () -> Void = {}
+    var onInstallWorkshopID: (String) -> Void = { _ in }
+    var onOpenSettings: () -> Void = {}
 
     @Environment(\.dismiss) private var dismiss
     @State private var details: SteamAppDetails?
@@ -2819,12 +3005,35 @@ struct GameDetailView: View {
     @State private var achievementsError: String?
     @State private var isLoadingAchievements = false
     @State private var workshopItems: [WorkshopItem] = []
+    @State private var showingWorkshopBrowse = false
 
     private var gptkInstalled: Bool {
         FileManager.default.fileExists(atPath: "/Applications/Game Porting Toolkit.app")
     }
 
     var body: some View {
+        // The Workshop browser is rendered INLINE (swapping the sheet's content)
+        // rather than as its own sheet. A sheet presented from within this
+        // already-a-sheet detail view is a nested sheet, and on macOS the
+        // interactive controls inside a nested sheet's ScrollView silently stop
+        // receiving clicks — verified: header buttons worked, the in-scroll
+        // Install buttons didn't. Swapping content in-place keeps a single sheet.
+        Group {
+            if showingWorkshopBrowse {
+                WorkshopBrowseView(game: game, steamAuth: steamAuth,
+                                   onInstall: onInstallWorkshopID,
+                                   onBack: { showingWorkshopBrowse = false })
+            } else {
+                detailContent
+            }
+        }
+        .frame(width: 680, height: 620)
+        .task(id: game.id) {
+            await loadAll()
+        }
+    }
+
+    private var detailContent: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
                 banner
@@ -2849,10 +3058,6 @@ struct GameDetailView: View {
                 }
                 .padding(20)
             }
-        }
-        .frame(width: 640, height: 620)
-        .task(id: game.id) {
-            await loadAll()
         }
     }
 
@@ -3003,8 +3208,18 @@ struct GameDetailView: View {
                                 .font(.system(size: 14))
                                 .frame(width: 18)
                             VStack(alignment: .leading, spacing: 1) {
-                                Text(ach.name ?? ach.apiname)
-                                    .font(.system(size: 12.5, weight: .medium))
+                                HStack(spacing: 6) {
+                                    Text(ach.name ?? ach.apiname)
+                                        .font(.system(size: 12.5, weight: .medium))
+                                    if let rarity = ach.rarityLabel {
+                                        Text(rarity)
+                                            .font(.system(size: 9, weight: .bold))
+                                            .padding(.horizontal, 5)
+                                            .padding(.vertical, 1)
+                                            .background(Color.purple.opacity(0.22), in: Capsule())
+                                            .foregroundColor(.purple)
+                                    }
+                                }
                                 if let desc = ach.description, !desc.isEmpty {
                                     Text(desc)
                                         .font(.system(size: 11))
@@ -3012,13 +3227,18 @@ struct GameDetailView: View {
                                 }
                             }
                             Spacer()
+                            if let pct = ach.globalPercent {
+                                Text(String(format: "%.1f%%", pct))
+                                    .font(.system(size: 11, weight: .medium).monospacedDigit())
+                                    .foregroundColor(.secondary)
+                            }
                         }
                         .opacity(ach.achieved == 1 ? 1 : 0.55)
                     }
                 }
             }
 
-            Text("Read-only — shows Steam's own record of your progress. Mist doesn't run a Steam client under Wine, so it can't unlock achievements live during gameplay.")
+            Text("Your unlock status and each achievement's global rarity, read live from Steam over your single sign-in.")
                 .font(.system(size: 10.5))
                 .foregroundColor(.secondary)
         }
@@ -3031,16 +3251,26 @@ struct GameDetailView: View {
                 Label("Workshop Items", systemImage: "shippingbox.fill")
                     .font(.system(size: 13, weight: .semibold))
                 Spacer()
-                Button("Install Item…", action: onInstallWorkshopItem)
+                Button {
+                    showingWorkshopBrowse = true
+                } label: {
+                    Label("Browse", systemImage: "magnifyingglass")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                Button("By ID…", action: onInstallWorkshopItem)
                     .buttonStyle(.bordered)
                     .controlSize(.small)
             }
 
             if workshopItems.isEmpty {
-                Text("No workshop items downloaded for this game yet.")
+                Text("No workshop items downloaded for this game yet. Browse to find some.")
                     .font(.caption)
                     .foregroundColor(.secondary)
             } else {
+                Text("Downloaded")
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundColor(.secondary)
                 VStack(spacing: 4) {
                     ForEach(workshopItems) { item in
                         HStack {
@@ -3069,13 +3299,224 @@ struct GameDetailView: View {
         guard game.source == .steam, steamAuth.isLoggedIn else { return }
         isLoadingAchievements = true
         do {
-            let token = try await steamAuth.mintAccessToken()
-            achievements = try await SteamLibraryService.fetchAchievements(
-                appid: game.id, steamID: steamAuth.steamID, accessToken: token)
+            var list = try await SteamLibraryService.fetchAchievements(
+                appid: game.id, steamID: steamAuth.steamID)
+            // Overlay global rarity (best-effort; keyless, never throws) then sort
+            // unlocked-first, and within each group rarest-last so the standout
+            // "Ultra Rare" ones you HAVE surface at the top.
+            let percents = await SteamLibraryService.fetchGlobalAchievementPercents(appid: game.id)
+            for i in list.indices { list[i].globalPercent = percents[list[i].apiname] }
+            list.sort { a, b in
+                if a.achieved != b.achieved { return a.achieved > b.achieved }
+                return (a.globalPercent ?? 101) < (b.globalPercent ?? 101)
+            }
+            achievements = list
         } catch {
-            achievementsError = "No achievement data available for this game."
+            achievementsError = (error as? SteamAuthError)?.errorDescription
+                ?? "No achievement data available for this game."
         }
         isLoadingAchievements = false
+    }
+}
+
+struct WorkshopBrowseView: View {
+    let game: Game
+    @ObservedObject var steamAuth: SteamAuthManager
+    let onInstall: (String) -> Void
+    var onBack: () -> Void = {}
+
+    @State private var items: [WorkshopBrowseItem] = []
+    @State private var search = ""
+    @State private var page = 1
+    @State private var isLoading = false
+    @State private var loadError: String?
+    @State private var canLoadMore = true
+    // Item IDs the user has clicked Install on this session — so the button can
+    // flip to a confirmation without needing to watch the actual download state
+    // (which lives in a different manager up in ContentView).
+    @State private var requested: Set<String> = []
+
+    private let columns = [GridItem(.adaptive(minimum: 260, maximum: 340), spacing: 12)]
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            Divider()
+            content
+        }
+        .task { await load(reset: true) }
+    }
+
+    private var header: some View {
+        HStack(spacing: 10) {
+            Button(action: onBack) {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 13, weight: .semibold))
+            }
+            .buttonStyle(.plain)
+            .keyboardShortcut(.cancelAction)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Workshop")
+                    .font(.headline)
+                Text(game.name)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            Spacer()
+            HStack(spacing: 5) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                TextField("Search the Workshop", text: $search)
+                    .textFieldStyle(.plain)
+                    .frame(width: 200)
+                    .onSubmit { Task { await load(reset: true) } }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 7))
+        }
+        .padding(14)
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if let err = loadError, items.isEmpty {
+            VStack(spacing: 10) {
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.system(size: 28))
+                    .foregroundColor(.secondary)
+                Text(err)
+                    .font(.callout)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 380)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if items.isEmpty && isLoading {
+            ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if items.isEmpty {
+            Text("No workshop items found.")
+                .foregroundColor(.secondary)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ScrollView {
+                LazyVGrid(columns: columns, spacing: 12) {
+                    ForEach(items) { item in
+                        WorkshopBrowseCard(
+                            item: item,
+                            requested: requested.contains(item.id),
+                            onInstall: {
+                                requested.insert(item.id)
+                                onInstall(item.id)
+                            }
+                        )
+                    }
+                }
+                .padding(14)
+                if canLoadMore && !items.isEmpty {
+                    Button {
+                        Task { await load(reset: false) }
+                    } label: {
+                        if isLoading { ProgressView().controlSize(.small) }
+                        else { Text("Load more") }
+                    }
+                    .buttonStyle(.bordered)
+                    .padding(.bottom, 16)
+                }
+            }
+        }
+    }
+
+    private func load(reset: Bool) async {
+        guard !isLoading else { return }
+        guard steamAuth.isLoggedIn else {
+            loadError = "Sign in to Steam to browse the Workshop."
+            return
+        }
+        isLoading = true
+        if reset { page = 1; canLoadMore = true }
+        do {
+            let token = try await steamAuth.mintAccessToken()
+            let fetched = try await SteamLibraryService.fetchWorkshopItems(
+                appid: game.id, accessToken: token, page: page, search: search)
+            if reset { items = fetched } else { items += fetched }
+            canLoadMore = !fetched.isEmpty
+            if canLoadMore { page += 1 }
+            loadError = nil
+        } catch {
+            loadError = (error as? SteamAuthError)?.errorDescription
+                ?? "Couldn't load the Workshop. You can still install items by ID."
+        }
+        isLoading = false
+    }
+}
+
+struct WorkshopBrowseCard: View {
+    let item: WorkshopBrowseItem
+    let requested: Bool
+    let onInstall: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            AsyncImage(url: URL(string: item.preview_url ?? "")) { phase in
+                switch phase {
+                case .success(let image): image.resizable().scaledToFill()
+                default: Color.primary.opacity(0.06)
+                }
+            }
+            .frame(height: 120)
+            .frame(maxWidth: .infinity)
+            .clipped()
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            // scaledToFill renders past the 120px frame (workshop previews are
+            // wide); .clipped() hides that visually but the overflow still
+            // hit-tests over the Install button below, swallowing its clicks —
+            // the image is decorative, so opt it out of hit testing entirely.
+            .allowsHitTesting(false)
+
+            Text(item.title ?? "Untitled")
+                .font(.system(size: 12.5, weight: .semibold))
+                .lineLimit(1)
+
+            if let desc = item.short_description, !desc.isEmpty {
+                Text(desc)
+                    .font(.system(size: 10.5))
+                    .foregroundColor(.secondary)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            HStack(spacing: 8) {
+                if let subs = item.subscriptions {
+                    Label(compact(subs), systemImage: "person.2.fill")
+                }
+                if let size = item.sizeFormatted {
+                    Label(size, systemImage: "internaldrive")
+                }
+            }
+            .font(.system(size: 10))
+            .foregroundColor(.secondary)
+
+            Button(action: onInstall) {
+                Label(requested ? "Installing…" : "Install",
+                      systemImage: requested ? "checkmark" : "arrow.down.circle.fill")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(requested)
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(.regularMaterial))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.primary.opacity(0.06)))
+    }
+
+    private func compact(_ n: Int) -> String {
+        if n >= 1_000_000 { return String(format: "%.1fM", Double(n) / 1_000_000) }
+        if n >= 1_000 { return String(format: "%.1fk", Double(n) / 1_000) }
+        return "\(n)"
     }
 }
 
@@ -3911,6 +4352,14 @@ struct ContentView: View {
                                                     .font(.caption)
                                                     .foregroundColor(.red)
                                             }
+                                            if steamAuth.isLoggedIn {
+                                                Divider()
+                                                Label("Your library, downloads, and achievements all use this one sign-in — no separate keys or logins needed.",
+                                                      systemImage: "checkmark.seal")
+                                                    .font(.caption)
+                                                    .foregroundColor(.secondary)
+                                                    .fixedSize(horizontal: false, vertical: true)
+                                            }
                                         }
                                     }
 
@@ -4118,7 +4567,18 @@ struct ContentView: View {
                 onUninstall: { pendingUninstall = game },
                 onShowInFinder: { handleShowInFinder(game) },
                 onLaunchOptions: { gameForLaunchOptions = game },
-                onInstallWorkshopItem: { gameForWorkshopInstall = game }
+                onInstallWorkshopItem: { gameForWorkshopInstall = game },
+                onInstallWorkshopID: { pubfileID in
+                    downloadManager.installWorkshopItem(appid: game.id, pubfileID: pubfileID,
+                                                        gameName: game.name,
+                                                        steamAccountName: steamAuth.accountName) {
+                        library.scan()
+                    }
+                },
+                onOpenSettings: {
+                    gameForDetail = nil
+                    sidebarSelection = "settings"
+                }
             )
         }
         .focusedSceneValue(\.rescanAction, { library.scan() })
