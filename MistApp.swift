@@ -1886,6 +1886,59 @@ final class SteamDownloadManager: ObservableObject {
     }
 }
 
+// MARK: - D3DMetal provider (Apple's Direct3D→Metal, for D3D11/D3D12 titles)
+
+// Mist's bundled Wine engine renders D3D only through wined3d, whose Vulkan path
+// (via the bundled MoltenVK) is too weak on Apple Silicon for many modern games —
+// they fail at graphics init. Apple's D3DMetal fixes this, but it's proprietary and
+// can't be redistributed. Instead we detect it on the user's machine, from either a
+// Game Porting Toolkit install or a CrossOver install (both ship the same
+// "apple_gptk" D3DMetal), and launch through that when present.
+struct D3DMetalProvider {
+    let name: String            // human label, e.g. "CrossOver"
+    let wineBin: String         // wine/wineloader to exec
+    let wineserverBin: String
+    let prefixSuffix: String    // dedicated prefix suffix so we never touch the main one
+    let extraEnv: [String: String]
+
+    static func detect() -> D3DMetalProvider? {
+        let fm = FileManager.default
+        // 1) Apple's Game Porting Toolkit — its Wine bundles D3DMetal internally, so
+        //    no extra wiring is needed beyond pointing PATH at it.
+        let gptk = "/Applications/Game Porting Toolkit.app/Contents/Resources/wine/bin/wine64"
+        if fm.fileExists(atPath: gptk) {
+            let bin = (gptk as NSString).deletingLastPathComponent
+            return D3DMetalProvider(
+                name: "Game Porting Toolkit", wineBin: gptk,
+                wineserverBin: "\(bin)/wineserver", prefixSuffix: "-gptk",
+                extraEnv: ["PATH": "\(bin):/usr/bin:/bin"])
+        }
+        // 2) CrossOver ships the same D3DMetal under lib64/apple_gptk, but its Wine
+        //    finds it only when we wire WINEDLLPATH + libd3dshared + the framework
+        //    path by hand (CrossOver's own `wine` wrapper refuses to run outside a
+        //    CrossOver bottle, so we drive wineloader directly). This recipe is
+        //    verified to bring up a real D3D11 device under D3DMetal.
+        let cx = "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver"
+        let loader = "\(cx)/bin/wineloader"
+        let gptkWin = "\(cx)/lib64/apple_gptk/wine/x86_64-windows"
+        if fm.fileExists(atPath: loader), fm.fileExists(atPath: gptkWin) {
+            return D3DMetalProvider(
+                name: "CrossOver", wineBin: loader,
+                wineserverBin: "\(cx)/bin/wineserver", prefixSuffix: "-cx",
+                extraEnv: [
+                    "CX_ROOT": cx,
+                    "WINELOADER": loader,
+                    "WINESERVER": "\(cx)/bin/wineserver",
+                    "WINEDLLPATH": "\(gptkWin):\(cx)/lib/wine/x86_64-windows:\(cx)/lib/wine/i386-windows",
+                    "DYLD_LIBRARY_PATH": "\(cx)/lib64:\(cx)/lib",
+                    "DYLD_FALLBACK_FRAMEWORK_PATH": "\(cx)/lib64/apple_gptk/external",
+                    "CX_APPLEGPTK_LIBD3DSHARED_PATH": "\(cx)/lib64/apple_gptk/external/libd3dshared.dylib",
+                ])
+        }
+        return nil
+    }
+}
+
 // MARK: - Wine/Game Process Manager
 
 class ProcessManager: ObservableObject {
@@ -1900,9 +1953,6 @@ class ProcessManager: ObservableObject {
     init(library: GameLibrary) {
         self.library = library
     }
-
-    private let gptkWinePath =
-        "/Applications/Game Porting Toolkit.app/Contents/Resources/wine/bin/wine64"
 
     enum LaunchMode: String {
         case normal = "Normal"
@@ -1932,11 +1982,11 @@ class ProcessManager: ObservableObject {
                 launchGameDirect(game)
             case .normal, .gptk:
                 // Use legendary for the launch (handles Epic auth / cloud saves),
-                // pointing it at GPTK/D3DMetal when installed (reliable for D3D12).
-                let useGPTK = FileManager.default.fileExists(atPath: gptkWinePath)
-                let wineBin = useGPTK ? gptkWinePath : MistEnv.wineBinary.path
+                // pointing it at D3DMetal (GPTK/CrossOver) when available (reliable for D3D12).
+                let provider = D3DMetalProvider.detect()
+                let wineBin = provider?.wineBin ?? MistEnv.wineBinary.path
                 var env: [String: String]
-                if useGPTK {
+                if let provider {
                     env = ProcessInfo.processInfo.environment
                     env["WINEPREFIX"] = MistEnv.winePrefix.path
                     env["WINEARCH"] = "win64"
@@ -1945,7 +1995,8 @@ class ProcessManager: ObservableObject {
                     env["WINEESYNC"] = "1"
                     // Force builtin DirectX DLLs so D3DMetal handles rendering
                     env["WINEDLLOVERRIDES"] = "d3d9,d3d10,d3d10core,d3d11,d3d12,d3d12core,dxgi=b"
-                    env["PATH"] = "\((gptkWinePath as NSString).deletingLastPathComponent):/usr/bin:/bin"
+                    env["PATH"] = "\((provider.wineBin as NSString).deletingLastPathComponent):/usr/bin:/bin"
+                    for (k, v) in provider.extraEnv { env[k] = v }
                 } else {
                     env = MistEnv.baseEnvironment()
                 }
@@ -2030,35 +2081,39 @@ class ProcessManager: ObservableObject {
     // are symlinked in, keeping the same C:\ paths without re-downloading games.
     private func launchGameGPTK(_ game: Game) {
         let fm = FileManager.default
-        guard fm.fileExists(atPath: gptkWinePath) else {
-            outputLog += "ERROR: Game Porting Toolkit is not installed.\n"
-                + "Install it with: brew install --cask gcenx/wine/game-porting-toolkit\n"
+        guard let provider = D3DMetalProvider.detect() else {
+            outputLog += "ERROR: D3DMetal isn't available.\n"
+                + "Install Apple's Game Porting Toolkit, or CrossOver, to run D3D11/D3D12 games.\n"
             return
         }
-        let gptkBin = (gptkWinePath as NSString).deletingLastPathComponent
-        let gptkPrefix = URL(fileURLWithPath: MistEnv.winePrefix.path + "-gptk")
+        // Dedicated prefix per provider, so its (different) Wine never reconfigures
+        // the bundled engine's main prefix. The game libraries are symlinked in,
+        // keeping the same C:\ paths without re-downloading anything.
+        let d3dPrefix = URL(fileURLWithPath: MistEnv.winePrefix.path + provider.prefixSuffix)
 
         var env = ProcessInfo.processInfo.environment
-        env["WINEPREFIX"] = gptkPrefix.path
+        env["WINEPREFIX"] = d3dPrefix.path
         env["WINEARCH"] = "win64"
         if env["WINEDEBUG"] == nil { env["WINEDEBUG"] = "-all" }
         env["WINEMSYNC"] = "1"
         env["WINEESYNC"] = "1"
+        // Builtin DirectX DLLs so D3DMetal (from the provider's WINEDLLPATH) renders.
         env["WINEDLLOVERRIDES"] = "d3d9,d3d10,d3d10core,d3d11,d3d12,d3d12core,dxgi=b"
         env["EOS_USE_ANTICHEATCLIENTNULL"] = "1"
-        env["PATH"] = "\(gptkBin):/usr/bin:/bin"
+        env["PATH"] = "\((provider.wineBin as NSString).deletingLastPathComponent):/usr/bin:/bin"
+        for (k, v) in provider.extraEnv { env[k] = v }   // provider wiring wins
 
-        if !fm.fileExists(atPath: gptkPrefix.appendingPathComponent("system.reg").path) {
-            outputLog += "Setting up dedicated GPTK prefix (one-time)…\n"
-            try? fm.createDirectory(at: gptkPrefix, withIntermediateDirectories: true)
-            MistEnv.run(URL(fileURLWithPath: gptkWinePath), ["wineboot", "--init"], env: env)
-            MistEnv.run(URL(fileURLWithPath: "\(gptkBin)/wineserver"), ["-w"], env: env)
+        if !fm.fileExists(atPath: d3dPrefix.appendingPathComponent("system.reg").path) {
+            outputLog += "Setting up dedicated \(provider.name) prefix (one-time)…\n"
+            try? fm.createDirectory(at: d3dPrefix, withIntermediateDirectories: true)
+            MistEnv.run(URL(fileURLWithPath: provider.wineBin), ["wineboot", "--init"], env: env)
+            MistEnv.run(URL(fileURLWithPath: provider.wineserverBin), ["-w"], env: env)
         }
         let sharedC = MistEnv.winePrefix.appendingPathComponent("drive_c")
-        let gptkC = gptkPrefix.appendingPathComponent("drive_c")
+        let d3dC = d3dPrefix.appendingPathComponent("drive_c")
         let steamSrc = sharedC.appendingPathComponent("Program Files (x86)/Steam")
         if fm.fileExists(atPath: steamSrc.path) {
-            let pfDir = gptkC.appendingPathComponent("Program Files (x86)")
+            let pfDir = d3dC.appendingPathComponent("Program Files (x86)")
             try? fm.createDirectory(at: pfDir, withIntermediateDirectories: true)
             let link = pfDir.appendingPathComponent("Steam")
             if !fm.fileExists(atPath: link.path) {
@@ -2067,7 +2122,7 @@ class ProcessManager: ObservableObject {
         }
         let epicSrc = sharedC.appendingPathComponent("Epic Games")
         if fm.fileExists(atPath: epicSrc.path) {
-            let link = gptkC.appendingPathComponent("Epic Games")
+            let link = d3dC.appendingPathComponent("Epic Games")
             if !fm.fileExists(atPath: link.path) {
                 try? fm.createSymbolicLink(at: link, withDestinationURL: epicSrc)
             }
@@ -2077,9 +2132,9 @@ class ProcessManager: ObservableObject {
             outputLog += "ERROR: couldn't find the game's executable in \(game.installDir)\n"
             return
         }
-        outputLog += "Exe: \(exe)\nRenderer: D3DMetal (GPTK)\n\n"
+        outputLog += "Exe: \(exe)\nRenderer: D3DMetal (\(provider.name))\n\n"
         let args = [exe] + GameSettingsStore.tokenize(GameSettingsStore.customArgs(for: game.id))
-        runProcess(path: gptkWinePath, arguments: args, env: env,
+        runProcess(path: provider.wineBin, arguments: args, env: env,
                    cwd: URL(fileURLWithPath: exe).deletingLastPathComponent())
         startDialogKiller()
     }
@@ -2468,9 +2523,7 @@ struct GameCardView: View {
 
     @State private var isHovering = false
 
-    private var gptkInstalled: Bool {
-        FileManager.default.fileExists(atPath: "/Applications/Game Porting Toolkit.app")
-    }
+    private var d3dMetalAvailable: Bool { D3DMetalProvider.detect() != nil }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -2633,16 +2686,19 @@ struct GameCardView: View {
                     // (D3DMetal) when installed, which is required for D3D12 titles.
                     Menu {
                         Section("Online play not supported (anti-cheat)") {
-                            Button(action: onLaunchNoEAC) {
+                            // D3DMetal path (launchGameGPTK) already runs with the null
+                            // anti-cheat client, so it's the offline launch too — prefer
+                            // it when available so the D3DMetal label actually delivers it.
+                            Button(action: d3dMetalAvailable ? onLaunchGPTK : onLaunchNoEAC) {
                                 Label(
-                                    gptkInstalled
+                                    d3dMetalAvailable
                                         ? "Play Offline — No Anti-Cheat (D3DMetal)"
                                         : "Play Offline — No Anti-Cheat",
                                     systemImage: "play.fill"
                                 )
                             }
-                            if !gptkInstalled {
-                                Text("Install Game Porting Toolkit for D3D12 games (e.g. Elden Ring)")
+                            if !d3dMetalAvailable {
+                                Text("Install Apple's Game Porting Toolkit or CrossOver for D3D11/D3D12 games (e.g. Elden Ring)")
                             }
                         }
                         if game.source == .epic {
@@ -2663,7 +2719,7 @@ struct GameCardView: View {
                     }
                     .menuStyle(.borderedButton)
                     .tint(game.source == .steam ? .blue : .purple)
-                } else if game.source == .steam && gptkInstalled {
+                } else if game.source == .steam && d3dMetalAvailable {
                     // Default to GPTK/D3DMetal (reliable for D3D11 + D3D12), direct
                     // launch as the alternative.
                     Menu {
@@ -3052,9 +3108,7 @@ struct GameDetailView: View {
     @State private var workshopItems: [WorkshopItem] = []
     @State private var showingWorkshopBrowse = false
 
-    private var gptkInstalled: Bool {
-        FileManager.default.fileExists(atPath: "/Applications/Game Porting Toolkit.app")
-    }
+    private var d3dMetalAvailable: Bool { D3DMetalProvider.detect() != nil }
 
     var body: some View {
         // The Workshop browser is rendered INLINE (swapping the sheet's content)
@@ -3183,7 +3237,7 @@ struct GameDetailView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(game.source == .steam ? .blue : .purple)
-                } else if game.source == .steam && gptkInstalled {
+                } else if game.source == .steam && d3dMetalAvailable {
                     Button(action: onLaunchGPTK) {
                         Label("Play (D3DMetal)", systemImage: "play.fill")
                     }
