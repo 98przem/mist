@@ -1389,6 +1389,17 @@ private struct MistInstalledGame: Codable {
     let sizeBytes: Int64
 }
 
+// Windows (and therefore Wine) silently strip trailing dots and spaces from every
+// path component. A game whose Steam title ends in one — e.g. "Easy Delivery Co."
+// — installs into a folder Wine then can't address, so launching fails with
+// "could not open working directory". Trim those trailing chars (and replace "/")
+// so the on-disk folder name is Wine-safe.
+func wineSafeDirName(_ name: String) -> String {
+    var s = name.replacingOccurrences(of: "/", with: "-")
+    while let c = s.last, c == "." || c == " " { s.removeLast() }
+    return s.isEmpty ? "game" : s
+}
+
 // DepotDownloader doesn't write Steam-format appmanifest_*.acf files, so Mist tracks
 // what it has installed itself in a small JSON file alongside the real Steam manifests.
 enum MistManifest {
@@ -1412,10 +1423,31 @@ enum MistManifest {
     }
 
     // Games Mist installed itself, in Game model form for merging into the library.
+    // Also migrates any legacy install folder with a Wine-unsafe name (trailing
+    // dot/space) by renaming it in place and rewriting the manifest — so games
+    // installed before wineSafeDirName existed become launchable.
     static func installedGames(steamAppsDir: URL) -> [Game] {
-        load(steamAppsDir: steamAppsDir).map {
+        let fm = FileManager.default
+        var list = load(steamAppsDir: steamAppsDir)
+        var changed = false
+        for i in list.indices {
+            let url = URL(fileURLWithPath: list[i].installDir)
+            let safe = wineSafeDirName(url.lastPathComponent)
+            guard safe != url.lastPathComponent else { continue }
+            let newURL = url.deletingLastPathComponent().appendingPathComponent(safe)
+            if fm.fileExists(atPath: url.path), !fm.fileExists(atPath: newURL.path) {
+                try? fm.moveItem(at: url, to: newURL)
+            }
+            list[i] = MistInstalledGame(appid: list[i].appid, name: list[i].name,
+                                        installDir: newURL.path, sizeBytes: list[i].sizeBytes)
+            changed = true
+        }
+        if changed, let data = try? JSONEncoder().encode(list) {
+            try? data.write(to: fileURL(steamAppsDir: steamAppsDir))
+        }
+        return list.map {
             Game(id: $0.appid, name: $0.name, source: .steam, installDir: $0.installDir,
-                sizeBytes: $0.sizeBytes, isInstalled: FileManager.default.fileExists(atPath: $0.installDir),
+                sizeBytes: $0.sizeBytes, isInstalled: fm.fileExists(atPath: $0.installDir),
                 imageURL: SteamLibraryService.coverURL(forAppID: $0.appid))
         }
     }
@@ -1685,7 +1717,7 @@ final class SteamDownloadManager: ObservableObject {
         if let pubfileID {
             installDir = steamAppsDir.appendingPathComponent("workshop/content/\(appid)/\(pubfileID)")
         } else {
-            let safeName = name.replacingOccurrences(of: "/", with: "-")
+            let safeName = wineSafeDirName(name)
             installDir = steamAppsDir.appendingPathComponent("common").appendingPathComponent(safeName)
         }
         try? FileManager.default.createDirectory(at: installDir, withIntermediateDirectories: true)
