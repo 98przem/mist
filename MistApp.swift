@@ -1011,6 +1011,34 @@ enum SteamLibraryService {
         return map
     }
 
+    // Real achievement icons. Steam's client-protocol schema (what the relay reads
+    // for viewing/unlocking) carries only name/description/hidden — no icon fields
+    // at all, confirmed by dumping a live schema — and the Web API's schema
+    // endpoint that DOES include icons (ISteamUserStats/GetSchemaForGame) requires
+    // a per-developer Web API key, which Mist deliberately doesn't ask users for.
+    // The public, keyless community stats page lists the same game's achievements
+    // with real icon URLs, in the same order the schema defines them in — so we
+    // scrape that ordering and zip it onto the relay's list positionally. Global,
+    // not per-user (same icon for everyone), so this needs no login either.
+    static func fetchAchievementIcons(appid: String) async -> [String] {
+        guard let url = URL(string: "https://steamcommunity.com/stats/\(appid)/achievements/"),
+              let (data, response) = try? await URLSession.shared.data(from: url),
+              let http = response as? HTTPURLResponse, http.statusCode == 200,
+              let html = String(data: data, encoding: .utf8) else { return [] }
+        // Each achievement row embeds one icon <img src="https://.../community_assets/images/apps/<appid>/<hash>.jpg">.
+        guard let regex = try? NSRegularExpression(
+            pattern: #"https://[^"']+/community_assets/images/apps/\#(appid)/[a-fA-F0-9]+\.jpg"#
+        ) else { return [] }
+        let ns = html as NSString
+        var urls: [String] = []
+        var seen = Set<String>()
+        for m in regex.matches(in: html, range: NSRange(location: 0, length: ns.length)) {
+            let u = ns.substring(with: m.range)
+            if seen.insert(u).inserted { urls.append(u) }
+        }
+        return urls
+    }
+
     // Browse an app's Workshop. Uses the logged-in user's access_token (the same
     // webapi token GetOwnedGames/GetPlayerAchievements accept). If Steam rejects
     // it, throws — the caller keeps the manual URL/ID install path as a fallback.
@@ -1078,6 +1106,9 @@ struct SteamAchievement: Identifiable, Decodable {
     // Joined in from GetGlobalAchievementPercentagesForApp after fetch (not part
     // of the GetPlayerAchievements response, so it's a mutable overlay).
     var globalPercent: Double? = nil
+    // Joined in from fetchAchievementIcons after fetch — see that function for why
+    // this can't come from the relay/client-protocol schema.
+    var iconURL: String? = nil
 
     private enum CodingKeys: String, CodingKey {
         case apiname, achieved, unlocktime, name, description
@@ -3400,6 +3431,12 @@ struct GameDetailView: View {
         do {
             var list = try await SteamLibraryService.fetchAchievements(
                 appid: game.id, steamID: steamAuth.steamID)
+            // Icons are positional (see fetchAchievementIcons) so zip them onto the
+            // list BEFORE it gets reordered below.
+            let icons = await SteamLibraryService.fetchAchievementIcons(appid: game.id)
+            if icons.count == list.count {
+                for i in list.indices { list[i].iconURL = icons[i] }
+            }
             // Overlay global rarity (best-effort; keyless, never throws) then sort
             // unlocked-first, and within each group rarest-last so the standout
             // "Ultra Rare" ones you HAVE surface at the top.
