@@ -1188,6 +1188,71 @@ struct StoreSearchResult: Identifiable, Decodable {
     var priceLabel: String { price?.final_formatted ?? "View on Steam" }
 }
 
+// One Epic Games Store weekly free promotion. Mist can't run Epic's checkout
+// flow (that needs an authenticated purchase-flow call we don't reverse-
+// engineer — see claimURL), so this is a discovery surface: what's free right
+// now / coming up, with a direct link to actually claim it on epicgames.com.
+struct EpicFreeGame: Identifiable {
+    let id: String
+    let title: String
+    let imageURL: String?
+    let pageSlug: String?
+    let endDate: Date?
+    let isCurrentlyFree: Bool
+
+    var claimURL: URL? {
+        guard let pageSlug else { return URL(string: "https://store.epicgames.com/en-US/free-games") }
+        return URL(string: "https://store.epicgames.com/en-US/p/\(pageSlug)")
+    }
+}
+
+enum EpicPromotionsService {
+    // Public, keyless endpoint — the same one store.epicgames.com's own free-games
+    // shelf calls. No Epic login needed to see what's free.
+    static func fetchFreeGames() async -> [EpicFreeGame] {
+        guard let url = URL(string: "https://store-site-backend-static.ak.epicgames.com/freeGamesPromotions?locale=en-US&country=US&allowCountries=US"),
+              let (data, response) = try? await URLSession.shared.data(from: url),
+              let http = response as? HTTPURLResponse, http.statusCode == 200 else { return [] }
+
+        struct Resp: Decodable {
+            struct DataWrap: Decodable { let Catalog: Catalog }
+            struct Catalog: Decodable { let searchStore: SearchStore }
+            struct SearchStore: Decodable { let elements: [Element] }
+            struct Element: Decodable {
+                let title: String
+                let id: String
+                let keyImages: [KeyImage]?
+                let offerMappings: [Mapping]?
+                let promotions: Promotions?
+            }
+            struct KeyImage: Decodable { let type: String; let url: String }
+            struct Mapping: Decodable { let pageSlug: String }
+            struct Promotions: Decodable {
+                let promotionalOffers: [OfferWindow]?
+                let upcomingPromotionalOffers: [OfferWindow]?
+            }
+            struct OfferWindow: Decodable { let promotionalOffers: [Offer] }
+            struct Offer: Decodable { let endDate: String }
+            let data: DataWrap
+        }
+        guard let decoded = try? JSONDecoder().decode(Resp.self, from: data) else { return [] }
+
+        let iso = ISO8601DateFormatter()
+        return decoded.data.Catalog.searchStore.elements.compactMap { el -> EpicFreeGame? in
+            let active = el.promotions?.promotionalOffers?.first?.promotionalOffers.first
+            let upcoming = el.promotions?.upcomingPromotionalOffers?.first?.promotionalOffers.first
+            guard let window = active ?? upcoming else { return nil }
+            let image = el.keyImages?.first(where: { $0.type == "OfferImageWide" || $0.type == "Thumbnail" })?.url
+            return EpicFreeGame(
+                id: el.id, title: el.title, imageURL: image,
+                pageSlug: el.offerMappings?.first?.pageSlug,
+                endDate: iso.date(from: window.endDate),
+                isCurrentlyFree: active != nil
+            )
+        }
+    }
+}
+
 struct WorkshopBrowseItem: Identifiable, Decodable {
     var id: String { publishedfileid }
     let publishedfileid: String
@@ -3074,6 +3139,9 @@ struct SidebarView: View {
                 SidebarRow(title: "Epic", systemImage: "bolt.fill", tint: Fog.epic, count: epicCount,
                           needsAttention: !epicLoggedIn, isSelected: selection == "epic",
                           action: { selection = "epic" }, isFocused: focusedRow == "epic")
+                SidebarRow(title: "Free Games", systemImage: "gift.fill", tint: Fog.epic,
+                          isSelected: selection == "epicfree", action: { selection = "epicfree" },
+                          isFocused: focusedRow == "epicfree")
                 SidebarRow(title: "Store", systemImage: "magnifyingglass", tint: Fog.inkDim,
                           isSelected: selection == "store", action: { selection = "store" },
                           isFocused: focusedRow == "store")
@@ -3314,6 +3382,107 @@ struct StoreResultCard: View {
             .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Fog.hairline))
         }
         .buttonStyle(.plain)
+    }
+}
+
+// This week's (and next weeks') Epic Games Store free promotions. Mist can't
+// run Epic's authenticated checkout flow, so "unlock" here means: tell you
+// what's free before you forget, and get you one click from actually
+// claiming it on the real store.
+struct EpicFreeGamesView: View {
+    @State private var games: [EpicFreeGame] = []
+    @State private var isLoading = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Epic Free Games")
+                    .font(Fog.display(24, weight: .medium))
+                    .foregroundColor(Fog.ink)
+                Text("Claim links open the real Epic Games Store — Mist doesn't run checkout itself.")
+                    .font(.callout)
+                    .foregroundColor(Fog.inkDim)
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 18)
+            .padding(.bottom, 14)
+
+            if isLoading {
+                Spacer()
+                ProgressView().controlSize(.small)
+                Spacer()
+            } else if games.isEmpty {
+                Spacer()
+                VStack(spacing: 10) {
+                    Image(systemName: "gift").font(.system(size: 30)).foregroundColor(Fog.inkFaint)
+                    Text("Couldn't load Epic's free games right now").foregroundColor(Fog.inkDim)
+                }
+                .frame(maxWidth: .infinity)
+                Spacer()
+            } else {
+                ScrollView {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 220, maximum: 260), spacing: 12)], spacing: 12) {
+                        ForEach(games) { game in
+                            EpicFreeGameCard(game: game)
+                        }
+                    }
+                    .padding(20)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Fog.bg)
+        .task {
+            games = await EpicPromotionsService.fetchFreeGames()
+            isLoading = false
+        }
+    }
+}
+
+struct EpicFreeGameCard: View {
+    let game: EpicFreeGame
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            AsyncImage(url: game.imageURL.flatMap(URL.init)) { phase in
+                if case .success(let image) = phase { image.resizable().scaledToFill() }
+                else { Fog.haze }
+            }
+            .frame(height: 100)
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+            Text(game.title)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(Fog.ink)
+                .lineLimit(1)
+
+            HStack {
+                Label(game.isCurrentlyFree ? "Free now" : "Coming soon",
+                      systemImage: game.isCurrentlyFree ? "gift.fill" : "clock")
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundColor(game.isCurrentlyFree ? Fog.good : Fog.warn)
+                Spacer()
+                if let end = game.endDate {
+                    Text(end, style: .relative)
+                        .font(.system(size: 10))
+                        .foregroundColor(Fog.inkFaint)
+                }
+            }
+
+            if game.isCurrentlyFree, let url = game.claimURL {
+                Link(destination: url) {
+                    Label("Claim on Epic Games Store", systemImage: "arrow.up.right")
+                        .font(.system(size: 11.5, weight: .medium))
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(Fog.epic)
+                .controlSize(.small)
+            }
+        }
+        .padding(10)
+        .background(Fog.bgElevated, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Fog.hairline))
     }
 }
 
@@ -4583,7 +4752,7 @@ struct SettingsInfoRow: View {
     }
 }
 
-let sidebarNavOrder = ["all", "steam", "epic", "store", "settings"]
+let sidebarNavOrder = ["all", "steam", "epic", "epicfree", "store", "settings"]
 
 // MARK: - Gamepad navigation
 //
@@ -4795,6 +4964,8 @@ struct ContentView: View {
                             })
                         } else if sidebarSelection == "store" {
                             SteamStoreBrowseView(ownedAppIDs: Set(library.games.filter { $0.source == .steam }.map(\.id)))
+                        } else if sidebarSelection == "epicfree" {
+                            EpicFreeGamesView()
                         } else if sidebarSelection == "settings" {
                             ScrollView {
                                 VStack(alignment: .leading, spacing: 16) {
@@ -4879,7 +5050,7 @@ struct ContentView: View {
                                 onLaunchOptions: { game in gameForLaunchOptions = game },
                                 onInstallWorkshopItem: { game in gameForWorkshopInstall = game },
                                 onSelect: { game in gameForDetail = game },
-                                focusedGameID: filteredGames.indices.contains(focusedGameIndex)
+                                focusedGameID: (gamepad.isConnected && filteredGames.indices.contains(focusedGameIndex))
                                     ? filteredGames[focusedGameIndex].id : nil
                             )
                         }
