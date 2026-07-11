@@ -3,6 +3,7 @@ import Cocoa
 import Foundation
 import CryptoKit
 import CoreImage.CIFilterBuiltins
+import GameController
 
 // MARK: - Foglight design tokens
 //
@@ -3036,7 +3037,7 @@ struct SidebarView: View {
     let steamLoggedIn: Bool
     var focusedRow: String? = nil
 
-    private let navOrder = ["all", "steam", "epic", "store", "settings"]
+    private let navOrder = sidebarNavOrder
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -4582,12 +4583,85 @@ struct SettingsInfoRow: View {
     }
 }
 
+let sidebarNavOrder = ["all", "steam", "epic", "store", "settings"]
+
+// MARK: - Gamepad navigation
+//
+// Basic controller support: D-pad/left stick moves a linear focus cursor
+// through whatever grid is on screen (not full 2-D spatial navigation — that
+// needs column-count awareness the adaptive grid doesn't expose), shoulder
+// buttons switch sidebar sections, A activates, B backs out of the game
+// detail sheet. Debounced so a held direction doesn't fire every poll tick.
+final class GamepadNavigator: ObservableObject {
+    @Published private(set) var isConnected = false
+
+    var onMove: ((Int) -> Void)?
+    var onActivate: (() -> Void)?
+    var onBack: (() -> Void)?
+    var onCycleSection: ((Int) -> Void)?
+
+    private var observers: [NSObjectProtocol] = []
+    private var lastFired: [String: Date] = [:]
+    private let debounceInterval: TimeInterval = 0.22
+
+    init() {
+        observers.append(NotificationCenter.default.addObserver(
+            forName: .GCControllerDidConnect, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let controller = note.object as? GCController else { return }
+            self?.configure(controller)
+        })
+        observers.append(NotificationCenter.default.addObserver(
+            forName: .GCControllerDidDisconnect, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.isConnected = GCController.controllers().contains { $0.extendedGamepad != nil }
+        })
+        GCController.controllers().forEach(configure)
+    }
+
+    private func configure(_ controller: GCController) {
+        guard let gamepad = controller.extendedGamepad else { return }
+        isConnected = true
+        gamepad.valueChangedHandler = { [weak self] pad, _ in
+            guard let self else { return }
+            let dpadX = pad.dpad.xAxis.value, dpadY = pad.dpad.yAxis.value
+            let stickX = pad.leftThumbstick.xAxis.value, stickY = pad.leftThumbstick.yAxis.value
+            self.handleDirectional(x: dpadX != 0 ? dpadX : stickX, y: dpadY != 0 ? dpadY : stickY)
+            if pad.buttonA.isPressed { self.fire("A") { self.onActivate?() } }
+            if pad.buttonB.isPressed { self.fire("B") { self.onBack?() } }
+            if pad.leftShoulder.isPressed { self.fire("L1") { self.onCycleSection?(-1) } }
+            if pad.rightShoulder.isPressed { self.fire("R1") { self.onCycleSection?(1) } }
+        }
+    }
+
+    private func handleDirectional(x: Float, y: Float) {
+        let threshold: Float = 0.5
+        if abs(x) > abs(y) {
+            if x > threshold { fire("right") { self.onMove?(1) } }
+            else if x < -threshold { fire("left") { self.onMove?(-1) } }
+        } else {
+            if y > threshold { fire("up") { self.onMove?(-1) } }
+            else if y < -threshold { fire("down") { self.onMove?(1) } }
+        }
+    }
+
+    private func fire(_ key: String, _ action: () -> Void) {
+        let now = Date()
+        if let last = lastFired[key], now.timeIntervalSince(last) < debounceInterval { return }
+        lastFired[key] = now
+        action()
+    }
+
+    deinit { observers.forEach(NotificationCenter.default.removeObserver) }
+}
+
 struct ContentView: View {
     @StateObject private var library: GameLibrary
     @StateObject private var processManager: ProcessManager
     @StateObject private var setup = SetupManager()
     @StateObject private var steamAuth = SteamAuthManager()
     @StateObject private var downloadManager: SteamDownloadManager
+    @StateObject private var gamepad = GamepadNavigator()
     @State private var sidebarSelection: String? = "all"
     @State private var showRunningView = false
     @State private var searchText = ""
@@ -4595,6 +4669,7 @@ struct ContentView: View {
     @State private var gameForLaunchOptions: Game?
     @State private var gameForWorkshopInstall: Game?
     @State private var gameForDetail: Game?
+    @State private var focusedGameIndex = 0
 
     init() {
         let lib = GameLibrary()
@@ -4672,6 +4747,30 @@ struct ContentView: View {
         }
 
         return games
+    }
+
+    // Wires the connected controller's D-pad/stick, A/B, and shoulder buttons to
+    // grid focus, activation, sheet dismissal, and sidebar-section switching. See
+    // GamepadNavigator for why this is linear focus, not full spatial navigation.
+    private func configureGamepad() {
+        gamepad.onMove = { delta in
+            guard !filteredGames.isEmpty else { return }
+            focusedGameIndex = max(0, min(filteredGames.count - 1, focusedGameIndex + delta))
+        }
+        gamepad.onActivate = {
+            guard gameForDetail == nil, filteredGames.indices.contains(focusedGameIndex) else { return }
+            gameForDetail = filteredGames[focusedGameIndex]
+        }
+        gamepad.onBack = {
+            if gameForDetail != nil { gameForDetail = nil }
+            else if showRunningView { showRunningView = false }
+        }
+        gamepad.onCycleSection = { delta in
+            guard let current = sidebarSelection, let idx = sidebarNavOrder.firstIndex(of: current) else { return }
+            let next = (idx + delta + sidebarNavOrder.count) % sidebarNavOrder.count
+            sidebarSelection = sidebarNavOrder[next]
+            focusedGameIndex = 0
+        }
     }
 
     var body: some View {
@@ -4779,7 +4878,9 @@ struct ContentView: View {
                                 onShowInFinder: handleShowInFinder,
                                 onLaunchOptions: { game in gameForLaunchOptions = game },
                                 onInstallWorkshopItem: { game in gameForWorkshopInstall = game },
-                                onSelect: { game in gameForDetail = game }
+                                onSelect: { game in gameForDetail = game },
+                                focusedGameID: filteredGames.indices.contains(focusedGameIndex)
+                                    ? filteredGames[focusedGameIndex].id : nil
                             )
                         }
                     }
@@ -4947,6 +5048,7 @@ struct ContentView: View {
         }
         .focusedSceneValue(\.rescanAction, { library.scan() })
         .focusedSceneValue(\.showSettingsAction, { sidebarSelection = "settings" })
+        .onAppear(perform: configureGamepad)
     }
 }
 
