@@ -4,6 +4,32 @@ import Foundation
 import CryptoKit
 import CoreImage.CIFilterBuiltins
 
+// MARK: - Foglight design tokens
+//
+// Mist's visual identity: a dark shelf lit by a soft periwinkle glow, titles set
+// in the system serif for a quieter voice than another sans-only launcher.
+// Deliberately dark-only — a "daytime fog" mode would dilute the idea — so these
+// are fixed hex values, not adaptive system colors.
+enum Fog {
+    static let bg = Color(red: 0x0d/255, green: 0x10/255, blue: 0x15/255)
+    static let bgElevated = Color(red: 0x14/255, green: 0x17/255, blue: 0x1f/255)
+    static let haze = Color(red: 0x1c/255, green: 0x21/255, blue: 0x30/255)
+    static let hairline = Color(red: 0x26/255, green: 0x2c/255, blue: 0x3c/255)
+    static let accent = Color(red: 0x7c/255, green: 0x9c/255, blue: 1.0)
+    static let accentSoft = Fog.accent.opacity(0.14)
+    static let ink = Color(red: 0xe9/255, green: 0xec/255, blue: 0xf5/255)
+    static let inkDim = Color(red: 0x87/255, green: 0x90/255, blue: 0xa8/255)
+    static let inkFaint = Color(red: 0x5b/255, green: 0x62/255, blue: 0x74/255)
+    static let steam = Color(red: 0x6f/255, green: 0x9b/255, blue: 1.0)
+    static let epic = Color(red: 0xb9/255, green: 0x8a/255, blue: 0xf0/255)
+    static let good = Color(red: 0x6b/255, green: 0xcf/255, blue: 0x9a/255)
+    static let warn = Color(red: 0xe6/255, green: 0xb3/255, blue: 0x58/255)
+    static let display = Font.system(.title3, design: .serif)
+    static func display(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
+        .system(size: size, weight: weight, design: .serif)
+    }
+}
+
 // MARK: - Data Models
 
 enum GameSource: String, Codable {
@@ -1075,6 +1101,25 @@ enum SteamLibraryService {
         return (decoded.response?.publishedfiledetails ?? []).filter { $0.result == 1 }
     }
 
+    // Search the whole Steam catalog — not just what the user owns — so Mist can
+    // show games to browse/wishlist even if they're not installed or owned. Public,
+    // keyless; the same endpoint store.steampowered.com's own search box calls.
+    static func searchStore(query: String) async throws -> [StoreSearchResult] {
+        guard !query.trimmingCharacters(in: .whitespaces).isEmpty else { return [] }
+        var comps = URLComponents(string: "https://store.steampowered.com/api/storesearch/")!
+        comps.queryItems = [
+            URLQueryItem(name: "term", value: query),
+            URLQueryItem(name: "cc", value: "us"),
+            URLQueryItem(name: "l", value: "english"),
+        ]
+        let (data, response) = try await URLSession.shared.data(from: comps.url!)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw SteamAuthError(message: "Couldn't reach the Steam store.")
+        }
+        struct Resp: Decodable { let items: [StoreSearchResult] }
+        return try JSONDecoder().decode(Resp.self, from: data).items
+    }
+
     // Public store metadata (description, tags) — no login needed, same endpoint
     // the store page itself uses.
     static func fetchAppDetails(appid: String) async throws -> SteamAppDetails {
@@ -1126,6 +1171,18 @@ struct SteamAppDetails: Decodable {
     struct Genre: Decodable { let description: String }
     let short_description: String?
     let genres: [Genre]?
+}
+
+// One result from the public storesearch API — the wider Steam catalog, not
+// filtered to what the signed-in account owns.
+struct StoreSearchResult: Identifiable, Decodable {
+    let id: Int
+    let name: String
+    let tiny_image: String?
+    struct Price: Decodable { let final_formatted: String? }
+    let price: Price?
+    var appid: String { String(id) }
+    var priceLabel: String { price?.final_formatted ?? "Free / N-A" }
 }
 
 struct WorkshopBrowseItem: Identifiable, Decodable {
@@ -2551,6 +2608,7 @@ struct GameCardView: View {
     var onLaunchOptions: () -> Void = {}
     var onInstallWorkshopItem: () -> Void = {}
     var onSelect: () -> Void = {}
+    var isFocused: Bool = false
 
     @State private var isHovering = false
 
@@ -2580,22 +2638,23 @@ struct GameCardView: View {
                     .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
-                .tint(game.source == .steam ? .blue : .purple)
+                .tint(game.source == .steam ? Fog.steam : Fog.epic)
             }
         }
         .padding(10)
         .background(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(.regularMaterial)
+                .fill(Fog.bgElevated)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.07))
+                .strokeBorder(isFocused ? Fog.accent : Fog.hairline, lineWidth: isFocused ? 2 : 1)
         )
-        .shadow(color: .black.opacity(isHovering ? 0.28 : 0.12),
+        .shadow(color: .black.opacity(isHovering ? 0.4 : 0.2),
                radius: isHovering ? 16 : 6, y: isHovering ? 8 : 3)
-        .scaleEffect(isHovering ? 1.015 : 1)
+        .scaleEffect(isHovering || isFocused ? 1.015 : 1)
         .animation(.spring(response: 0.28, dampingFraction: 0.8), value: isHovering)
+        .animation(.spring(response: 0.28, dampingFraction: 0.8), value: isFocused)
         .onHover { isHovering = $0 }
         .onTapGesture(perform: onSelect)
         .contextMenu {
@@ -2643,7 +2702,7 @@ struct GameCardView: View {
 
                 VStack(alignment: .leading, spacing: 3) {
                     Text(game.name)
-                        .font(.system(size: 14, weight: .semibold))
+                        .font(Fog.display(14, weight: .semibold))
                         .foregroundColor(.white)
                         .lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
@@ -2749,7 +2808,7 @@ struct GameCardView: View {
                         .frame(maxWidth: .infinity)
                     }
                     .menuStyle(.borderedButton)
-                    .tint(game.source == .steam ? .blue : .purple)
+                    .tint(game.source == .steam ? Fog.steam : Fog.epic)
                 } else if game.source == .steam && d3dMetalAvailable {
                     // Default to GPTK/D3DMetal (reliable for D3D11 + D3D12), direct
                     // launch as the alternative.
@@ -2771,7 +2830,7 @@ struct GameCardView: View {
                         .frame(maxWidth: .infinity)
                     }
                     .menuStyle(.borderedButton)
-                    .tint(.blue)
+                    .tint(Fog.steam)
                 } else if game.source == .steam {
                     Button(action: onLaunchNoEAC) {
                         HStack {
@@ -2781,7 +2840,7 @@ struct GameCardView: View {
                         .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
-                    .tint(.blue)
+                    .tint(Fog.steam)
                 } else {
                     Button(action: onLaunch) {
                         HStack {
@@ -2791,7 +2850,7 @@ struct GameCardView: View {
                         .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
-                    .tint(.purple)
+                    .tint(Fog.epic)
                 }
         }
     }
@@ -2812,10 +2871,10 @@ struct GameCardView: View {
     }
 
     var fallbackCover: some View {
-        let tint = game.source == .steam ? Color.blue : Color.purple
+        let tint = game.source == .steam ? Fog.steam : Fog.epic
         return ZStack {
-            LinearGradient(colors: [tint.opacity(0.35), tint.opacity(0.1)],
-                          startPoint: .topLeading, endPoint: .bottomTrailing)
+            LinearGradient(colors: [Fog.haze, Fog.bg], startPoint: .topLeading, endPoint: .bottomTrailing)
+            RadialGradient(colors: [tint.opacity(0.35), .clear], center: .topLeading, startRadius: 0, endRadius: 140)
             Image(systemName: "gamecontroller.fill")
                 .font(.system(size: 34))
                 .foregroundColor(tint.opacity(0.8))
@@ -2878,7 +2937,7 @@ struct SetupView: View {
                         setup.runFullSetup()
                     }
                     .buttonStyle(.borderedProminent)
-                    .tint(.purple)
+                    .tint(Fog.epic)
                     .controlSize(.large)
                 }
             }
@@ -2901,6 +2960,7 @@ struct SidebarRow: View {
     var needsAttention: Bool = false
     let isSelected: Bool
     let action: () -> Void
+    var isFocused: Bool = false
 
     @State private var isHovering = false
 
@@ -2917,20 +2977,20 @@ struct SidebarRow: View {
                 }
                 Text(title)
                     .font(.system(size: 13, weight: isSelected ? .semibold : .regular))
-                    .foregroundColor(.primary)
+                    .foregroundColor(isSelected ? Fog.ink : Fog.inkDim)
                 Spacer(minLength: 4)
                 if needsAttention {
                     Circle()
-                        .fill(.orange)
+                        .fill(Fog.warn)
                         .frame(width: 6, height: 6)
                 }
                 if let count {
                     Text("\(count)")
                         .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(.secondary)
+                        .foregroundColor(Fog.inkFaint)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
-                        .background(Color.primary.opacity(0.06))
+                        .background(Fog.haze)
                         .clipShape(Capsule())
                 }
             }
@@ -2939,8 +2999,12 @@ struct SidebarRow: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(isSelected ? Color.accentColor.opacity(0.16)
-                          : (isHovering ? Color.primary.opacity(0.05) : .clear))
+                    .fill(isSelected ? Fog.accentSoft
+                          : (isHovering ? Color.white.opacity(0.05) : .clear))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(isFocused ? Fog.accent : .clear, lineWidth: 1.5)
             )
         }
         .buttonStyle(.plain)
@@ -2955,7 +3019,7 @@ struct SidebarSectionLabel: View {
         Text(title.uppercased())
             .font(.system(size: 10.5, weight: .semibold))
             .tracking(0.6)
-            .foregroundColor(.secondary)
+            .foregroundColor(Fog.inkFaint)
             .padding(.horizontal, 8)
             .padding(.top, 14)
             .padding(.bottom, 2)
@@ -2968,21 +3032,28 @@ struct SidebarView: View {
     let epicCount: Int
     let epicLoggedIn: Bool
     let steamLoggedIn: Bool
+    var focusedRow: String? = nil
+
+    private let navOrder = ["all", "steam", "epic", "store", "settings"]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             // Brand header
-            HStack(spacing: 8) {
+            HStack(spacing: 9) {
                 ZStack {
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(LinearGradient(colors: [.purple, .blue], startPoint: .topLeading, endPoint: .bottomTrailing))
-                        .frame(width: 28, height: 28)
+                        .fill(RadialGradient(colors: [Color(red: 0x9d/255, green: 0xb8/255, blue: 1),
+                                                       Fog.accent, Color(red: 0x47/255, green: 0x63/255, blue: 0xc2/255)],
+                                             center: .init(x: 0.3, y: 0.25), startRadius: 0, endRadius: 20))
+                        .frame(width: 26, height: 26)
+                        .shadow(color: Fog.accent.opacity(0.5), radius: 8)
                     Image(systemName: "cloud.fog.fill")
-                        .font(.system(size: 13, weight: .semibold))
+                        .font(.system(size: 12, weight: .semibold))
                         .foregroundColor(.white)
                 }
                 Text("Mist")
-                    .font(.system(size: 16, weight: .bold))
+                    .font(Fog.display(16))
+                    .foregroundColor(Fog.ink)
                 Spacer()
             }
             .padding(.horizontal, 10)
@@ -2991,26 +3062,33 @@ struct SidebarView: View {
 
             SidebarSectionLabel(title: "Library")
             VStack(spacing: 2) {
-                SidebarRow(title: "All Games", systemImage: "square.grid.2x2.fill", tint: .indigo,
-                          isSelected: selection == "all") { selection = "all" }
-                SidebarRow(title: "Steam", systemImage: "cloud.fill", tint: .blue, count: steamCount,
-                          isSelected: selection == "steam") { selection = "steam" }
-                SidebarRow(title: "Epic", systemImage: "bolt.fill", tint: .purple, count: epicCount,
-                          needsAttention: !epicLoggedIn, isSelected: selection == "epic") { selection = "epic" }
+                SidebarRow(title: "All Games", systemImage: "square.grid.2x2.fill", tint: Fog.accent,
+                          isSelected: selection == "all", action: { selection = "all" },
+                          isFocused: focusedRow == "all")
+                SidebarRow(title: "Steam", systemImage: "cloud.fill", tint: Fog.steam, count: steamCount,
+                          isSelected: selection == "steam", action: { selection = "steam" },
+                          isFocused: focusedRow == "steam")
+                SidebarRow(title: "Epic", systemImage: "bolt.fill", tint: Fog.epic, count: epicCount,
+                          needsAttention: !epicLoggedIn, isSelected: selection == "epic",
+                          action: { selection = "epic" }, isFocused: focusedRow == "epic")
+                SidebarRow(title: "Store", systemImage: "magnifyingglass", tint: Fog.inkDim,
+                          isSelected: selection == "store", action: { selection = "store" },
+                          isFocused: focusedRow == "store")
             }
             .padding(.horizontal, 8)
 
             Spacer()
-            Divider()
+            Divider().background(Fog.hairline)
             VStack(spacing: 2) {
-                SidebarRow(title: "Settings", systemImage: "gearshape.fill", tint: .gray,
+                SidebarRow(title: "Settings", systemImage: "gearshape.fill", tint: Fog.inkFaint,
                           needsAttention: !steamLoggedIn || !epicLoggedIn,
-                          isSelected: selection == "settings") { selection = "settings" }
+                          isSelected: selection == "settings", action: { selection = "settings" },
+                          isFocused: focusedRow == "settings")
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 8)
         }
-        .background(.thinMaterial)
+        .background(LinearGradient(colors: [Fog.bgElevated, Fog.bg], startPoint: .top, endPoint: .bottom))
     }
 }
 
@@ -3031,6 +3109,7 @@ struct GameGridView: View {
     var onLaunchOptions: (Game) -> Void = { _ in }
     var onInstallWorkshopItem: (Game) -> Void = { _ in }
     var onSelect: (Game) -> Void = { _ in }
+    var focusedGameID: Game.ID? = nil
 
     @State private var sortOrder: GameSortOrder = .installedFirst
 
@@ -3051,16 +3130,17 @@ struct GameGridView: View {
         if games.isEmpty {
             VStack(spacing: 14) {
                 ZStack {
-                    Circle().fill(Color.primary.opacity(0.05)).frame(width: 84, height: 84)
+                    Circle().fill(Fog.haze).frame(width: 84, height: 84)
                     Image(systemName: "tray")
                         .font(.system(size: 32))
-                        .foregroundColor(.secondary)
+                        .foregroundColor(Fog.inkFaint)
                 }
                 Text("No games found")
-                    .font(.title3.weight(.medium))
+                    .font(Fog.display(19, weight: .medium))
+                    .foregroundColor(Fog.ink)
                 Text("Install games through Steam or Epic Games")
                     .font(.callout)
-                    .foregroundColor(.secondary)
+                    .foregroundColor(Fog.inkDim)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
@@ -3069,12 +3149,12 @@ struct GameGridView: View {
                     HStack {
                         Text("\(games.count) games")
                             .font(.system(size: 12, weight: .medium))
-                            .foregroundColor(.secondary)
+                            .foregroundColor(Fog.inkDim)
                         Text("·")
-                            .foregroundColor(.secondary)
+                            .foregroundColor(Fog.inkFaint)
                         Text("\(installedCount) installed")
                             .font(.system(size: 12, weight: .medium))
-                            .foregroundColor(.secondary)
+                            .foregroundColor(Fog.inkDim)
                         Spacer()
                         Menu {
                             Picker("Sort", selection: $sortOrder) {
@@ -3088,6 +3168,7 @@ struct GameGridView: View {
                         }
                         .menuStyle(.borderlessButton)
                         .fixedSize()
+                        .tint(Fog.inkDim)
                     }
                     .padding(.horizontal, 16)
                     .padding(.top, 10)
@@ -3105,14 +3186,131 @@ struct GameGridView: View {
                                 onShowInFinder: { onShowInFinder(g) },
                                 onLaunchOptions: { onLaunchOptions(g) },
                                 onInstallWorkshopItem: { onInstallWorkshopItem(g) },
-                                onSelect: { onSelect(g) }
+                                onSelect: { onSelect(g) },
+                                isFocused: focusedGameID == g.id
                             )
+                            .id(g.id)
                         }
                     }
                     .padding(16)
                 }
             }
         }
+    }
+}
+
+// Browse the wider Steam catalog — games you don't own yet. Mist can't buy
+// anything (no checkout flow), so results link out to the real store page;
+// this is a discovery/wishlist surface, not a storefront.
+struct SteamStoreBrowseView: View {
+    let ownedAppIDs: Set<String>
+
+    @State private var query = ""
+    @State private var results: [StoreSearchResult] = []
+    @State private var isSearching = false
+    @State private var searchTask: Task<Void, Never>?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Steam Store")
+                    .font(Fog.display(24, weight: .medium))
+                    .foregroundColor(Fog.ink)
+                Text("Browse games you don't own yet. Mist can't purchase for you — results open the real store page.")
+                    .font(.callout)
+                    .foregroundColor(Fog.inkDim)
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 18)
+            .padding(.bottom, 12)
+
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass").foregroundColor(Fog.inkFaint)
+                TextField("Search the Steam catalog", text: $query)
+                    .textFieldStyle(.plain)
+                    .onChange(of: query) { _, newValue in
+                        searchTask?.cancel()
+                        searchTask = Task {
+                            try? await Task.sleep(nanoseconds: 350_000_000)
+                            guard !Task.isCancelled else { return }
+                            await runSearch(newValue)
+                        }
+                    }
+                if isSearching { ProgressView().controlSize(.small) }
+            }
+            .padding(10)
+            .background(Fog.haze, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+            .padding(.horizontal, 20)
+            .padding(.bottom, 14)
+
+            if results.isEmpty {
+                Spacer()
+                VStack(spacing: 10) {
+                    Image(systemName: "cloud.fill").font(.system(size: 30)).foregroundColor(Fog.inkFaint)
+                    Text(query.isEmpty ? "Search for a game" : "No results")
+                        .foregroundColor(Fog.inkDim)
+                }
+                .frame(maxWidth: .infinity)
+                Spacer()
+            } else {
+                ScrollView {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 220, maximum: 260), spacing: 12)], spacing: 12) {
+                        ForEach(results) { item in
+                            StoreResultCard(item: item, owned: ownedAppIDs.contains(item.appid))
+                        }
+                    }
+                    .padding(20)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Fog.bg)
+    }
+
+    private func runSearch(_ text: String) async {
+        guard !text.trimmingCharacters(in: .whitespaces).isEmpty else {
+            await MainActor.run { results = []; isSearching = false }
+            return
+        }
+        await MainActor.run { isSearching = true }
+        let found = (try? await SteamLibraryService.searchStore(query: text)) ?? []
+        guard !Task.isCancelled else { return }
+        await MainActor.run { results = found; isSearching = false }
+    }
+}
+
+struct StoreResultCard: View {
+    let item: StoreSearchResult
+    let owned: Bool
+
+    var body: some View {
+        Link(destination: URL(string: "https://store.steampowered.com/app/\(item.appid)")!) {
+            HStack(spacing: 12) {
+                AsyncImage(url: item.tiny_image.flatMap(URL.init)) { phase in
+                    if case .success(let image) = phase { image.resizable().scaledToFill() }
+                    else { Fog.haze }
+                }
+                .frame(width: 92, height: 43)
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(item.name)
+                        .font(.system(size: 12.5, weight: .medium))
+                        .foregroundColor(Fog.ink)
+                        .lineLimit(2)
+                    if owned {
+                        Text("In your library").font(.system(size: 10.5)).foregroundColor(Fog.good)
+                    } else {
+                        Text(item.priceLabel).font(.system(size: 10.5)).foregroundColor(Fog.inkFaint)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(8)
+            .background(Fog.bgElevated, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Fog.hairline))
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -3267,25 +3465,25 @@ struct GameDetailView: View {
                         Label("Play Offline — No Anti-Cheat", systemImage: "play.fill")
                     }
                     .buttonStyle(.borderedProminent)
-                    .tint(game.source == .steam ? .blue : .purple)
+                    .tint(game.source == .steam ? Fog.steam : Fog.epic)
                 } else if game.source == .steam && d3dMetalAvailable {
                     Button(action: onLaunchGPTK) {
                         Label("Play (D3DMetal)", systemImage: "play.fill")
                     }
                     .buttonStyle(.borderedProminent)
-                    .tint(.blue)
+                    .tint(Fog.steam)
                 } else if game.source == .steam {
                     Button(action: onLaunchNoEAC) {
                         Label("Launch", systemImage: "play.fill")
                     }
                     .buttonStyle(.borderedProminent)
-                    .tint(.blue)
+                    .tint(Fog.steam)
                 } else {
                     Button(action: onLaunch) {
                         Label("Launch", systemImage: "play.fill")
                     }
                     .buttonStyle(.borderedProminent)
-                    .tint(.purple)
+                    .tint(Fog.epic)
                 }
                 Button("Launch Options…", action: onLaunchOptions)
                     .buttonStyle(.bordered)
@@ -3300,7 +3498,7 @@ struct GameDetailView: View {
                 Label("Install", systemImage: "arrow.down.circle.fill")
             }
             .buttonStyle(.borderedProminent)
-            .tint(game.source == .steam ? .blue : .purple)
+            .tint(game.source == .steam ? Fog.steam : Fog.epic)
         }
     }
 
@@ -3333,10 +3531,7 @@ struct GameDetailView: View {
                 VStack(spacing: 6) {
                     ForEach(achievements) { ach in
                         HStack(spacing: 10) {
-                            Image(systemName: ach.achieved == 1 ? "checkmark.seal.fill" : "lock.fill")
-                                .foregroundColor(ach.achieved == 1 ? .yellow : .secondary)
-                                .font(.system(size: 14))
-                                .frame(width: 18)
+                            achievementIcon(for: ach)
                             VStack(alignment: .leading, spacing: 1) {
                                 HStack(spacing: 6) {
                                     Text(ach.name ?? ach.apiname)
@@ -3346,8 +3541,8 @@ struct GameDetailView: View {
                                             .font(.system(size: 9, weight: .bold))
                                             .padding(.horizontal, 5)
                                             .padding(.vertical, 1)
-                                            .background(Color.purple.opacity(0.22), in: Capsule())
-                                            .foregroundColor(.purple)
+                                            .background(Fog.accentSoft, in: Capsule())
+                                            .foregroundColor(Fog.accent)
                                     }
                                 }
                                 if let desc = ach.description, !desc.isEmpty {
@@ -3372,6 +3567,35 @@ struct GameDetailView: View {
                 .font(.system(size: 10.5))
                 .foregroundColor(.secondary)
         }
+    }
+
+    // The real Steam icon (see SteamLibraryService.fetchAchievementIcons), desaturated
+    // while locked so the same real art still reads as "locked" without Valve's
+    // separate gray asset. Falls back to a generic seal/lock glyph if the icon never
+    // loaded (e.g. the fetch failed, or the game has zero public rarity page).
+    @ViewBuilder
+    private func achievementIcon(for ach: SteamAchievement) -> some View {
+        Group {
+            if let iconURL = ach.iconURL, let url = URL(string: iconURL) {
+                AsyncImage(url: url) { phase in
+                    switch phase {
+                    case .success(let image):
+                        image.resizable().scaledToFill()
+                    default:
+                        Image(systemName: ach.achieved == 1 ? "checkmark.seal.fill" : "lock.fill")
+                            .foregroundColor(ach.achieved == 1 ? Fog.warn : Fog.inkFaint)
+                    }
+                }
+            } else {
+                Image(systemName: ach.achieved == 1 ? "checkmark.seal.fill" : "lock.fill")
+                    .foregroundColor(ach.achieved == 1 ? Fog.warn : Fog.inkFaint)
+            }
+        }
+        .frame(width: 30, height: 30)
+        .background(Fog.haze, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .saturation(ach.achieved == 1 ? 1 : 0.15)
+        .font(.system(size: 14))
     }
 
     @ViewBuilder
@@ -3961,7 +4185,7 @@ struct EpicStoreView: View {
                                     processManager.epicOpenLoginPage()
                                 }
                                 .buttonStyle(.borderedProminent)
-                                .tint(.purple)
+                                .tint(Fog.epic)
                             }
                         }
 
@@ -3991,7 +4215,7 @@ struct EpicStoreView: View {
                                         loginCode = ""
                                     }
                                     .buttonStyle(.borderedProminent)
-                                    .tint(.purple)
+                                    .tint(Fog.epic)
                                     .disabled(loginCode.isEmpty)
 
                                     Button("Cancel") {
@@ -4040,7 +4264,7 @@ struct EpicStoreView: View {
                                     processManager.epicInstall(appName: installName)
                                 }
                                 .buttonStyle(.borderedProminent)
-                                .tint(.purple)
+                                .tint(Fog.epic)
                                 .disabled(installName.isEmpty || processManager.epicInstalling)
                             }
 
@@ -4108,7 +4332,7 @@ struct QuickInstallButton: View {
             .frame(width: 90, height: 60)
         }
         .buttonStyle(.bordered)
-        .tint(.purple)
+        .tint(Fog.epic)
     }
 }
 
@@ -4468,6 +4692,8 @@ struct ContentView: View {
                             RunningGameView(processManager: processManager, onDismiss: {
                                 showRunningView = false
                             })
+                        } else if sidebarSelection == "store" {
+                            SteamStoreBrowseView(ownedAppIDs: Set(library.games.filter { $0.source == .steam }.map(\.id)))
                         } else if sidebarSelection == "settings" {
                             ScrollView {
                                 VStack(alignment: .leading, spacing: 16) {
@@ -4755,6 +4981,7 @@ struct MistApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .preferredColorScheme(.dark)
         }
         .windowStyle(.titleBar)
         .defaultSize(width: 1160, height: 760)
