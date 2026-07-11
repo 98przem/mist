@@ -56,6 +56,7 @@ struct Game: Identifiable, Hashable {
     var antiCheat: AntiCheatStatus = .none
     var hasLinuxEAC: Bool = false
     var imageURL: String = ""  // cover art URL
+    var isFamilyShared: Bool = false  // available via Steam Family library sharing, not owned outright
 
     var sizeFormatted: String {
         if sizeBytes > 1_073_741_824 {
@@ -434,6 +435,7 @@ class GameLibrary: ObservableObject {
     // last doesn't clobber the other's contribution.
     private var scannedGames: [Game] = []
     private var ownedSteamGames: [OwnedGame] = []
+    private var familySharedGames: [FamilySharedGame] = []
 
     let supportDir = MistEnv.supportDir
     let wineDir = MistEnv.wineDir
@@ -474,7 +476,18 @@ class GameLibrary: ObservableObject {
             Game(id: og.id, name: og.name, source: .steam, installDir: "",
                 sizeBytes: 0, isInstalled: false, imageURL: og.coverURL)
         }
-        games = (scannedGames + placeholders).sorted { $0.name.lowercased() < $1.name.lowercased() }
+        let ownedOrScannedIDs = existingIDs.union(ownedSteamGames.map(\.id))
+        // Games available via Steam Family library sharing that this account doesn't
+        // already own/have installed outright. Same install path as any other Steam
+        // game (handleInstall/DepotDownloader) — Steam authorizes the download based
+        // on the account's real (if temporary) family-shared license, no special-
+        // casing needed there.
+        let familyPlaceholders = familySharedGames.filter { !ownedOrScannedIDs.contains($0.id) }.map { fg in
+            Game(id: fg.id, name: fg.name, source: .steam, installDir: "",
+                sizeBytes: 0, isInstalled: false,
+                imageURL: SteamLibraryService.coverURL(forAppID: fg.id), isFamilyShared: true)
+        }
+        games = (scannedGames + placeholders + familyPlaceholders).sorted { $0.name.lowercased() < $1.name.lowercased() }
     }
 
     private func scanSteamGames() -> [Game] {
@@ -530,6 +543,12 @@ class GameLibrary: ObservableObject {
     // the library with an "Install" button, matching how Epic games already work.
     func applyOwnedSteamGames(_ owned: [OwnedGame]) {
         ownedSteamGames = owned
+        recomputeGames()
+    }
+
+    // Games shared into this account's Steam Family library (see RelayManager.familyLibrary).
+    func applyFamilyLibraryGames(_ shared: [FamilySharedGame]) {
+        familySharedGames = shared
         recomputeGames()
     }
 
@@ -1333,6 +1352,21 @@ enum RelayManager {
     static func gbeSchema(appid: String) async throws -> Data {
         try await run([appid, "--schema"])
     }
+
+    // Steam Family library sharing: appids another family member owns that this
+    // account can currently install/play, over the same client-protocol session
+    // (no separate family-management login). Empty array if not in a family.
+    static func familyLibrary() async throws -> [FamilySharedGame] {
+        let data = try await run(["--family"])
+        return try JSONDecoder().decode([FamilySharedGame].self, from: data)
+    }
+}
+
+struct FamilySharedGame: Decodable {
+    let appid: Int
+    let name: String
+    let ownerSteamID: UInt64
+    var id: String { String(appid) }
 }
 
 // MARK: - GBE (Steamworks emulator) — in-game achievements + overlay
@@ -2802,6 +2836,20 @@ struct GameCardView: View {
                 .padding(.vertical, 3)
                 .background(.black.opacity(0.6), in: Capsule())
                 .foregroundColor(game.hasLinuxEAC ? .orange : .red)
+                .padding(7)
+            }
+        }
+        .overlay(alignment: .topLeading) {
+            if game.isFamilyShared {
+                HStack(spacing: 3) {
+                    Image(systemName: "person.2.fill")
+                    Text("Shared")
+                }
+                .font(.system(size: 9, weight: .semibold))
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .background(.black.opacity(0.6), in: Capsule())
+                .foregroundColor(Fog.accent)
                 .padding(7)
             }
         }
@@ -4864,6 +4912,13 @@ struct ContentView: View {
                 await MainActor.run {
                     library.lastError = "Couldn't fetch your Steam library: \(error.localizedDescription)"
                 }
+            }
+        }
+        // Best-effort: most accounts aren't in a Steam Family, so an empty/failed
+        // result here just means "no shared games" — never surfaced as an error.
+        Task {
+            if let shared = try? await RelayManager.familyLibrary() {
+                await MainActor.run { library.applyFamilyLibraryGames(shared) }
             }
         }
     }

@@ -4,15 +4,18 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using SteamKit2;
 using SteamKit2.Internal;
 
 // Mist Steam-stats relay. Uses Mist's single persistent session token to talk to
-// Steam's client protocol (no Steam client, no Web API key) for achievements.
+// Steam's client protocol (no Steam client, no Web API key) for achievements and
+// Steam Family library sharing.
 //
 //   relay <session.json> <appid>                 → print achievements as JSON (viewing)
 //   relay <session.json> <appid> --unlock <name> → unlock one achievement
 //   relay <session.json> <appid> --unlock-auto   → unlock first currently-locked one
+//   relay <session.json> --family                → print Family-shared library as JSON
 //
 // session.json is Mist's steam_session.json (accountName, steamID, refreshToken).
 // Exit 0 = success. All human status goes to stderr; stdout is JSON only.
@@ -26,22 +29,26 @@ class Program
     static string accountName = "", refreshToken = "";
     static ulong steamId = 0;
     static uint appId = 0;
-    static string mode = "view";      // view | unlock
+    static string mode = "view";      // view | unlock | schema | family
     static string? unlockName = null;  // specific name, or null for --unlock-auto
     static bool running = true;
     static int exitCode = 1;
 
     static int Main(string[] args)
     {
-        if (args.Length < 2) { Err("usage: <session.json> <appid> [--unlock <name> | --unlock-auto]"); return 2; }
+        if (args.Length < 2) { Err("usage: <session.json> <appid|--family> [--unlock <name> | --unlock-auto]"); return 2; }
         var json = File.ReadAllText(args[0]);
         accountName = Extract(json, "accountName");
         refreshToken = Extract(json, "refreshToken");
         steamId = ulong.TryParse(Extract(json, "steamID"), out var s) ? s : 0;
-        appId = uint.Parse(args[1]);
-        if (args.Length >= 3 && args[2] == "--unlock") { mode = "unlock"; unlockName = args.Length >= 4 ? args[3] : null; }
-        else if (args.Length >= 3 && args[2] == "--unlock-auto") { mode = "unlock"; unlockName = null; }
-        else if (args.Length >= 3 && args[2] == "--schema") { mode = "schema"; }
+        if (args[1] == "--family") { mode = "family"; }
+        else
+        {
+            appId = uint.Parse(args[1]);
+            if (args.Length >= 3 && args[2] == "--unlock") { mode = "unlock"; unlockName = args.Length >= 4 ? args[3] : null; }
+            else if (args.Length >= 3 && args[2] == "--unlock-auto") { mode = "unlock"; unlockName = null; }
+            else if (args.Length >= 3 && args[2] == "--schema") { mode = "schema"; }
+        }
 
         if (string.IsNullOrEmpty(refreshToken)) { Err("no refreshToken in session"); return 2; }
 
@@ -52,15 +59,76 @@ class Program
 
         manager.Subscribe<SteamClient.ConnectedCallback>(OnConnected);
         manager.Subscribe<SteamClient.DisconnectedCallback>(_ => running = false);
-        manager.Subscribe<SteamUser.LoggedOnCallback>(OnLoggedOn);
+        manager.Subscribe<SteamUser.LoggedOnCallback>(cb =>
+        {
+            if (mode == "family") _ = OnLoggedOnFamily(cb);
+            else OnLoggedOn(cb);
+        });
 
-        Err($"connecting as {accountName} for app {appId} ({mode})…");
+        Err($"connecting as {accountName} ({mode})…");
         steamClient.Connect();
         var deadline = DateTime.UtcNow.AddSeconds(45);
         while (running && DateTime.UtcNow < deadline)
             manager.RunWaitCallbacks(TimeSpan.FromMilliseconds(200));
         try { steamUser.LogOff(); } catch { }
         return exitCode;
+    }
+
+    // Steam Family library sharing: this account's shared appids that are
+    // actually available to play/install right now (exclude_reason names
+    // containing "Excluded" mean genuinely unavailable — e.g. the lending
+    // account is currently playing it, or licensing rules block it).
+    static async Task OnLoggedOnFamily(SteamUser.LoggedOnCallback cb)
+    {
+        if (cb.Result != EResult.OK) { Err($"logon failed: {cb.Result}/{cb.ExtendedResult}"); exitCode = 1; running = false; return; }
+        try
+        {
+            var unified = steamClient.GetHandler<SteamUnifiedMessages>()!;
+            var family = unified.CreateService<FamilyGroups>();
+
+            var groupResp = await family.GetFamilyGroupForUser(
+                new CFamilyGroups_GetFamilyGroupForUser_Request { steamid = steamId, include_family_group_response = false });
+            var group = groupResp.Body;
+            if (groupResp.Result != EResult.OK || group.is_not_member_of_any_group || group.family_groupid == 0)
+            {
+                Console.Out.Write("[]");
+                exitCode = 0; running = false; return;
+            }
+
+            var appsResp = await family.GetSharedLibraryApps(new CFamilyGroups_GetSharedLibraryApps_Request
+            {
+                family_groupid = group.family_groupid,
+                steamid = steamId,
+                include_own = false,
+                include_excluded = false,
+                max_apps = 5000,
+            });
+
+            var sb = new StringBuilder("[");
+            bool first = true;
+            foreach (var a in appsResp.Body.apps)
+            {
+                if (a.exclude_reason.ToString().Contains("Excluded")) continue;
+                if (!first) sb.Append(','); first = false;
+                sb.Append('{')
+                  .Append("\"appid\":").Append(a.appid).Append(',')
+                  .Append("\"name\":").Append(JStr(a.name)).Append(',')
+                  .Append("\"ownerSteamID\":").Append(a.owner_steamids.FirstOrDefault())
+                  .Append('}');
+            }
+            sb.Append(']');
+            Console.Out.Write(sb.ToString());
+            exitCode = 0;
+        }
+        catch (Exception ex)
+        {
+            Err("family query failed: " + ex.Message);
+            exitCode = 1;
+        }
+        finally
+        {
+            running = false;
+        }
     }
 
     static void OnConnected(SteamClient.ConnectedCallback cb) =>
