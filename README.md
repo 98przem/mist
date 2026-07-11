@@ -29,9 +29,21 @@ Mist is a native macOS launcher that downloads and runs Windows Steam and Epic g
 
 ## Install
 
-Download **Mist.dmg** from the [latest release](../../releases/latest), open it, and drag **Mist.app** to Applications.
+**Homebrew** (recommended — always tracks the latest release):
+
+```sh
+brew install --cask 98przem/tap/mist
+```
+
+Or download **Mist.dmg** from the [latest release](../../releases/latest), open it, and drag **Mist.app** to Applications.
 
 > Mist isn't notarized, so on first launch macOS will block it — **right-click the app → Open** to get past Gatekeeper. That's the only manual step.
+
+Mist keeps itself up to date — it checks for new releases on launch and can install them from **Settings → Updates**. To remove it and every trace of its data (Wine prefix, downloaded games, engine, logins):
+
+```sh
+brew uninstall --zap mist
+```
 
 ## Quick Start
 
