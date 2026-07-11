@@ -61,7 +61,9 @@ Mist reads and writes your real Steam achievements over Steam's client protocol 
 
 ## Compatibility
 
-Most indie games and single-player AAA titles (DX9–12) work well; DX12 needs the Game Porting Toolkit. **Online/multiplayer with anti-cheat (EAC, BattlEye, Vanguard) is not supported** — Mist doesn't circumvent anti-cheat, though many such games offer an offline mode. Check [ProtonDB](https://www.protondb.com/): if a game runs on Proton, it'll likely run here.
+Most indie games and single-player AAA titles work well. **D3D9–11 runs out of the box** on a bundled Metal-tuned DXVK — no extra installs. **D3D12** titles run best through Apple's **Game Porting Toolkit** or an installed **CrossOver** (Mist detects either and routes D3D games through its D3DMetal automatically); many D3D12 games with a D3D11 fallback also just work without it.
+
+**Online/multiplayer with anti-cheat (EAC, BattlEye, Vanguard) is not supported** — Mist doesn't circumvent anti-cheat, though many such games offer an offline mode. Check [ProtonDB](https://www.protondb.com/): if a game runs on Proton, it'll likely run here.
 
 ## Building from Source
 

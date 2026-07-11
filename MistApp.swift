@@ -1445,6 +1445,47 @@ struct RelayOwnedGame: Decodable {
 // runs under Wine thinking Steam is present — recording achievement unlocks (and
 // showing the overlay) with no Steam client. Unlocks land in a local gse_save/
 // folder next to the exe; after the game exits, syncAchievements() pushes any new
+// Deploys DXVK-macOS (a MoltenVK-tuned DXVK) into the Wine prefix so D3D10/11
+// games render on Mist's OWN engine — no CrossOver or Game Porting Toolkit
+// needed. Stock upstream DXVK can't do this on Apple Silicon (it needs Vulkan
+// 1.3 + geometry/tessellation shaders the GPU lacks); this build targets Vulkan
+// 1.1 and relaxes those. Verified to bring up a native "Apple M2" D3D11 device.
+// D3D12-only titles still need the D3DMetal path (D3DMetalProvider); D3D12 games
+// with a D3D11 fallback (most Unity) auto-select DXVK here and work.
+enum DXVKManager {
+    static var dllDir: URL { MistEnv.toolsDir.appendingPathComponent("dxvk") }
+    static var isBundled: Bool {
+        FileManager.default.fileExists(atPath: dllDir.appendingPathComponent("d3d11.dll").path)
+    }
+
+    // The DXVK-macOS DLLs to drop over wine's builtins. dxgi stays builtin — this
+    // build pairs with wine's dxgi rather than shipping its own.
+    private static let dlls = ["d3d11.dll", "d3d10core.dll"]
+
+    // WINEDLLOVERRIDES value: DXVK d3d11/d3d10core as native, everything else
+    // (dxgi, d3d12, d3d9) left to wine's builtins. Only meaningful once deploy()
+    // has copied the DLLs into system32.
+    static let overrides = "d3d11,d3d10core=n;dxgi,d3d9,d3d12,d3d12core=b"
+
+    // Copy the DLLs into the prefix's system32 (idempotent — skips if the bundled
+    // and installed files already match by size). Safe to call before every launch.
+    static func deployIfNeeded() {
+        guard isBundled else { return }
+        let fm = FileManager.default
+        let sys32 = MistEnv.winePrefix.appendingPathComponent("drive_c/windows/system32")
+        guard fm.fileExists(atPath: sys32.path) else { return }
+        for name in dlls {
+            let src = dllDir.appendingPathComponent(name)
+            let dst = sys32.appendingPathComponent(name)
+            let srcSize = (try? fm.attributesOfItem(atPath: src.path)[.size] as? Int) ?? nil
+            let dstSize = (try? fm.attributesOfItem(atPath: dst.path)[.size] as? Int) ?? nil
+            if srcSize != nil, srcSize == dstSize { continue }  // already deployed
+            try? fm.removeItem(at: dst)
+            try? fm.copyItem(at: src, to: dst)
+        }
+    }
+}
+
 // ones to the real Steam profile via RelayManager. This is the emulator half of
 // the in-game achievements feature; the relay is the "make it real" half.
 enum GBEManager {
@@ -2279,7 +2320,16 @@ class ProcessManager: ObservableObject {
         }
         outputLog += "Exe: \(exe)\n\n"
         var env = MistEnv.baseEnvironment()
-        env["WINEDLLOVERRIDES"] = "d3d11,d3d10core,d3d12,d3d12core=n,b"
+        // Bundled DXVK-macOS renders D3D10/11 far better than wined3d on Apple
+        // Silicon (native "Apple M2" D3D11 device). Deploy it into the prefix and
+        // point the overrides at it; d3d12/d3d9 stay on wine's builtins.
+        if DXVKManager.isBundled {
+            DXVKManager.deployIfNeeded()
+            env["WINEDLLOVERRIDES"] = DXVKManager.overrides
+            outputLog += "Renderer: DXVK (D3D10/11)\n"
+        } else {
+            env["WINEDLLOVERRIDES"] = "d3d11,d3d10core,d3d12,d3d12core=n,b"
+        }
         env["EOS_USE_ANTICHEATCLIENTNULL"] = "1"
         env["DOTNET_EnableWriteXorExecute"] = "0"
 

@@ -64,5 +64,18 @@ cp "$GBE_R/experimental/x64/steamclient64.dll"              "$OUT/gbe/steamclien
 cp "$GBE_R/steamclient_experimental/GameOverlayRenderer64.dll" "$OUT/gbe/GameOverlayRenderer64.dll"
 rm -rf "$GBE_TMP"
 
+echo "[tools] fetching DXVK-macOS (D3D10/11 on Apple Silicon)…"
+mkdir -p "$OUT/dxvk"
+DXVK_URL="$(sed -n 's/^url=//p' "$HERE/dxvk_macos.pin")"
+DXVK_SHA="$(sed -n 's/^sha256=//p' "$HERE/dxvk_macos.pin")"
+DXVK_TMP="$(mktemp -d)"
+curl -fsSL -o "$DXVK_TMP/dxvk.tar.gz" "$DXVK_URL"
+echo "$DXVK_SHA  $DXVK_TMP/dxvk.tar.gz" | shasum -a 256 -c - >/dev/null
+tar xf "$DXVK_TMP/dxvk.tar.gz" -C "$DXVK_TMP"
+DXVK_X64="$(dirname "$(find "$DXVK_TMP" -path '*/x64/d3d11.dll' | head -1)")"
+cp "$DXVK_X64/d3d11.dll"     "$OUT/dxvk/d3d11.dll"
+cp "$DXVK_X64/d3d10core.dll" "$OUT/dxvk/d3d10core.dll"
+rm -rf "$DXVK_TMP"
+
 echo "[tools] done → $OUT"
-ls -la "$OUT" "$OUT/gbe"
+ls -la "$OUT" "$OUT/gbe" "$OUT/dxvk"
