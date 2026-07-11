@@ -79,6 +79,55 @@ struct Game: Identifiable, Hashable {
     }
 }
 
+// Decides how to actually run a game so the UI can offer one obvious "Play" button
+// instead of a menu of cryptic runtime choices. Shared by the library card and the
+// game detail view so they never disagree.
+enum GameActions {
+    struct Bundle {
+        let onLaunch: () -> Void      // Epic's own launcher (legendary)
+        let onLaunchNoEAC: () -> Void // direct exe, basic renderer
+        let onLaunchGPTK: () -> Void  // D3DMetal (GPTK/CrossOver), also nulls anti-cheat
+    }
+
+    struct Alternate {
+        let title: String
+        let icon: String
+        let run: (Bundle) -> Void
+    }
+
+    // The single best way to launch `game` right now.
+    static func bestPlay(for game: Game, d3dMetalAvailable: Bool) -> (Bundle) -> Void {
+        if game.source == .steam {
+            // D3DMetal handles D3D11/12 far better than the built-in renderer; use it
+            // when present, otherwise the direct launch.
+            return d3dMetalAvailable ? { $0.onLaunchGPTK() } : { $0.onLaunchNoEAC() }
+        }
+        // Epic: an anti-cheat title can only run offline (Mist doesn't defeat anti-
+        // cheat); D3DMetal's path already runs offline, so prefer it there.
+        if game.antiCheat != .none { return d3dMetalAvailable ? { $0.onLaunchGPTK() } : { $0.onLaunchNoEAC() } }
+        return { $0.onLaunch() }
+    }
+
+    // Everything the primary button DIDN'T pick, for the ••• menu.
+    static func alternates(for game: Game, d3dMetalAvailable: Bool) -> [Alternate] {
+        var out: [Alternate] = []
+        if game.source == .steam {
+            if d3dMetalAvailable {
+                out.append(.init(title: "Play with basic renderer", icon: "square.stack.3d.up") { $0.onLaunchNoEAC() })
+            }
+        } else {
+            if game.antiCheat == .none {
+                out.append(.init(title: "Play offline (no anti-cheat)", icon: "shield.slash") {
+                    d3dMetalAvailable ? $0.onLaunchGPTK() : $0.onLaunchNoEAC()
+                })
+            } else {
+                out.append(.init(title: "Launch through Epic", icon: "arrowshape.turn.up.right") { $0.onLaunch() })
+            }
+        }
+        return out
+    }
+}
+
 // MARK: - Mist Environment (native Wine paths + env — no shell scripts)
 
 enum MistEnv {
@@ -1367,12 +1416,26 @@ enum RelayManager {
         let data = try await run(["--family"])
         return try JSONDecoder().decode([FamilySharedGame].self, from: data)
     }
+
+    // The account's own owned games over the same client-protocol session — used
+    // instead of the Steam Web API's GetOwnedGames (which needs a separately-minted
+    // web token Mist's one-QR flow doesn't reliably have). Empty on any failure.
+    static func ownedLibrary() async throws -> [RelayOwnedGame] {
+        let data = try await run(["--owned"])
+        return try JSONDecoder().decode([RelayOwnedGame].self, from: data)
+    }
 }
 
 struct FamilySharedGame: Decodable {
     let appid: Int
     let name: String
     let ownerSteamID: UInt64
+    var id: String { String(appid) }
+}
+
+struct RelayOwnedGame: Decodable {
+    let appid: Int
+    let name: String
     var id: String { String(appid) }
 }
 
@@ -2866,116 +2929,45 @@ struct GameCardView: View {
     @ViewBuilder
     private var overflowMenu: some View {
         Menu {
-            Button(action: onShowInFinder) {
-                Label("Show in Finder", systemImage: "folder")
+            // Alternate runtimes — the plain Play button already picks the best one
+            // (see GameActions.bestPlay); these are here only for the rare case you
+            // want to force a specific renderer or Epic's own launcher.
+            ForEach(Array(GameActions.alternates(for: game, d3dMetalAvailable: d3dMetalAvailable).enumerated()), id: \.offset) { _, alt in
+                Button { alt.run(actionsBundle) } label: { Label(alt.title, systemImage: alt.icon) }
             }
-            Button(action: onLaunchOptions) {
-                Label("Launch Options…", systemImage: "slider.horizontal.3")
-            }
+            if !GameActions.alternates(for: game, d3dMetalAvailable: d3dMetalAvailable).isEmpty { Divider() }
+
+            Button(action: onShowInFinder) { Label("Show in Finder", systemImage: "folder") }
+            Button(action: onLaunchOptions) { Label("Launch Options…", systemImage: "slider.horizontal.3") }
             if game.source == .steam {
-                Button(action: onInstallWorkshopItem) {
-                    Label("Install Workshop Item…", systemImage: "shippingbox")
-                }
+                Button(action: onInstallWorkshopItem) { Label("Install Workshop Item…", systemImage: "shippingbox") }
             }
             Divider()
-            Button(role: .destructive, action: onUninstall) {
-                Label("Uninstall", systemImage: "trash")
-            }
+            Button(role: .destructive, action: onUninstall) { Label("Uninstall", systemImage: "trash") }
         } label: {
-            Image(systemName: "ellipsis")
-                .frame(width: 8)
+            Image(systemName: "ellipsis").frame(width: 8)
         }
         .menuStyle(.borderedButton)
         .fixedSize()
     }
 
-    @ViewBuilder
+    private var actionsBundle: GameActions.Bundle {
+        .init(onLaunch: onLaunch, onLaunchNoEAC: onLaunchNoEAC, onLaunchGPTK: onLaunchGPTK)
+    }
+
+    // One button, one obvious action: play the game the best way we can. The
+    // runtime choice (D3DMetal vs the basic renderer, offline-vs-Epic) is decided
+    // for you — see GameActions.bestPlay — with alternatives tucked into the ••• menu.
     private var primaryActionButton: some View {
-        Group {
-            if game.antiCheat != .none {
-                    // Anti-cheat game: online/multiplayer isn't supported (Mist
-                    // doesn't circumvent anti-cheat). The offline launch runs the
-                    // game without its anti-cheat — via Apple's Game Porting Toolkit
-                    // (D3DMetal) when installed, which is required for D3D12 titles.
-                    Menu {
-                        Section("Online play not supported (anti-cheat)") {
-                            // D3DMetal path (launchGameGPTK) already runs with the null
-                            // anti-cheat client, so it's the offline launch too — prefer
-                            // it when available so the D3DMetal label actually delivers it.
-                            Button(action: d3dMetalAvailable ? onLaunchGPTK : onLaunchNoEAC) {
-                                Label(
-                                    d3dMetalAvailable
-                                        ? "Play Offline — No Anti-Cheat (D3DMetal)"
-                                        : "Play Offline — No Anti-Cheat",
-                                    systemImage: "play.fill"
-                                )
-                            }
-                            if !d3dMetalAvailable {
-                                Text("Install Apple's Game Porting Toolkit or CrossOver for D3D11/D3D12 games (e.g. Elden Ring)")
-                            }
-                        }
-                        if game.source == .epic {
-                            Divider()
-                            Button(action: onLaunch) {
-                                Label("Standard Launch (through Epic)", systemImage: "arrowshape.turn.up.right")
-                            }
-                        }
-                    } label: {
-                        HStack {
-                            Image(systemName: "play.fill")
-                            Text("Launch")
-                            Spacer()
-                            Image(systemName: "chevron.down")
-                                .font(.caption2)
-                        }
-                        .frame(maxWidth: .infinity)
-                    }
-                    .menuStyle(.borderedButton)
-                    .tint(game.source == .steam ? Fog.steam : Fog.epic)
-                } else if game.source == .steam && d3dMetalAvailable {
-                    // Default to GPTK/D3DMetal (reliable for D3D11 + D3D12), direct
-                    // launch as the alternative.
-                    Menu {
-                        Button(action: onLaunchGPTK) {
-                            Label("Play (D3DMetal)", systemImage: "play.fill")
-                        }
-                        Button(action: onLaunchNoEAC) {
-                            Label("Play (Direct)", systemImage: "arrowshape.turn.up.right")
-                        }
-                    } label: {
-                        HStack {
-                            Image(systemName: "play.fill")
-                            Text("Play")
-                            Spacer()
-                            Image(systemName: "chevron.down")
-                                .font(.caption2)
-                        }
-                        .frame(maxWidth: .infinity)
-                    }
-                    .menuStyle(.borderedButton)
-                    .tint(Fog.steam)
-                } else if game.source == .steam {
-                    Button(action: onLaunchNoEAC) {
-                        HStack {
-                            Image(systemName: "play.fill")
-                            Text("Launch")
-                        }
-                        .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(Fog.steam)
-                } else {
-                    Button(action: onLaunch) {
-                        HStack {
-                            Image(systemName: "play.fill")
-                            Text("Launch")
-                        }
-                        .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(Fog.epic)
-                }
+        Button { GameActions.bestPlay(for: game, d3dMetalAvailable: d3dMetalAvailable)(actionsBundle) } label: {
+            HStack {
+                Image(systemName: "play.fill")
+                Text(game.antiCheat != .none ? "Play Offline" : "Play")
+            }
+            .frame(maxWidth: .infinity)
         }
+        .buttonStyle(.borderedProminent)
+        .tint(game.source == .steam ? Fog.steam : Fog.epic)
     }
 
     @ViewBuilder
@@ -3117,7 +3109,7 @@ struct SidebarRow: View {
                         .clipShape(Capsule())
                 }
             }
-            .padding(.horizontal, 16)
+            .padding(.horizontal, 8)
             .padding(.vertical, 6)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
@@ -3194,13 +3186,19 @@ struct SidebarView: View {
                 SidebarRow(title: "Epic", systemImage: "bolt.fill", tint: Fog.epic, count: epicCount,
                           needsAttention: !epicLoggedIn, isSelected: selection == "epic",
                           action: { selection = "epic" }, isFocused: focusedRow == "epic")
-                SidebarRow(title: "Free Games", systemImage: "gift.fill", tint: Fog.epic,
-                          isSelected: selection == "epicfree", action: { selection = "epicfree" },
-                          isFocused: focusedRow == "epicfree")
-                SidebarRow(title: "Store", systemImage: "magnifyingglass", tint: Fog.inkDim,
+            }
+            .padding(.horizontal, 8)
+
+            SidebarSectionLabel(title: "Discover")
+            VStack(spacing: 2) {
+                SidebarRow(title: "Steam Store", systemImage: "magnifyingglass", tint: Fog.steam,
                           isSelected: selection == "store", action: { selection = "store" },
                           isFocused: focusedRow == "store")
+                SidebarRow(title: "Epic Free Games", systemImage: "gift.fill", tint: Fog.epic,
+                          isSelected: selection == "epicfree", action: { selection = "epicfree" },
+                          isFocused: focusedRow == "epicfree")
             }
+            .padding(.horizontal, 8)
 
             Spacer()
             Divider().background(Fog.hairline)
@@ -3210,20 +3208,34 @@ struct SidebarView: View {
                           isSelected: selection == "settings", action: { selection = "settings" },
                           isFocused: focusedRow == "settings")
             }
+            .padding(.horizontal, 8)
             .padding(.vertical, 8)
         }
         .background(LinearGradient(colors: [Fog.bgElevated, Fog.bg], startPoint: .top, endPoint: .bottom))
     }
 }
 
-enum GameSortOrder: String, CaseIterable, Identifiable {
-    case installedFirst = "Installed First"
-    case titleAZ = "Title (A–Z)"
+// What subset of the current source's games to show. Replaces the old opaque
+// "Installed First / Title A–Z" sort menu — sorting is now always the sensible
+// installed-first, then alphabetical, and these chips do the filtering instead.
+enum LibraryFilter: String, CaseIterable, Identifiable {
+    case all = "All"
+    case installed = "Installed"
+    case notInstalled = "Not Installed"
+    case shared = "Family Shared"
     var id: String { rawValue }
+    var systemImage: String {
+        switch self {
+        case .all: return "square.grid.2x2"
+        case .installed: return "arrow.down.circle.fill"
+        case .notInstalled: return "icloud"
+        case .shared: return "person.2.fill"
+        }
+    }
 }
 
 struct GameGridView: View {
-    let games: [Game]
+    let games: [Game]           // already source/search/filter-narrowed by ContentView
     var onLaunch: (Game) -> Void = { _ in }
     var onLaunchNoEAC: (Game) -> Void = { _ in }
     var onLaunchGPTK: (Game) -> Void = { _ in }
@@ -3234,109 +3246,144 @@ struct GameGridView: View {
     var onInstallWorkshopItem: (Game) -> Void = { _ in }
     var onSelect: (Game) -> Void = { _ in }
     var focusedGameID: Game.ID? = nil
-    @Binding var sortOrder: GameSortOrder
+    @Binding var filter: LibraryFilter
+    var availableFilters: [LibraryFilter] = LibraryFilter.allCases
     // Reported up so gamepad up/down navigation (owned by ContentView, which
     // doesn't know the grid's actual rendered width) can move by a full row
     // instead of a single card. See onGridWidthChange below for how it's measured.
     var onGridWidthChange: (CGFloat) -> Void = { _ in }
 
-    private let cardMinWidth: CGFloat = 160
-    private let cardSpacing: CGFloat = 14
+    let columns = [GridItem(.adaptive(minimum: 160, maximum: 200), spacing: 14)]
 
-    let columns = [
-        GridItem(.adaptive(minimum: 160, maximum: 200), spacing: 14)
-    ]
-
-    var sortedGames: [Game] { Self.sorted(games, by: sortOrder) }
-
-    static func sorted(_ games: [Game], by order: GameSortOrder) -> [Game] {
+    // The single canonical order used everywhere (grid rendering AND gamepad focus
+    // index): installed first, then alphabetical. Sectioning below just draws a
+    // header between the two blocks — it never reorders, so focus stays in sync.
+    static func ordered(_ games: [Game]) -> [Game] {
         games.sorted { a, b in
-            if order == .installedFirst, a.isInstalled != b.isInstalled { return a.isInstalled }
+            if a.isInstalled != b.isInstalled { return a.isInstalled }
             return a.name.lowercased() < b.name.lowercased()
         }
     }
 
-    var installedCount: Int { games.filter(\.isInstalled).count }
+    private var installed: [Game] { Self.ordered(games.filter(\.isInstalled)) }
+    private var notInstalled: [Game] { Self.ordered(games.filter { !$0.isInstalled }) }
 
     var body: some View {
-        if games.isEmpty {
-            VStack(spacing: 14) {
-                ZStack {
-                    Circle().fill(Fog.haze).frame(width: 84, height: 84)
-                    Image(systemName: "tray")
-                        .font(.system(size: 32))
-                        .foregroundColor(Fog.inkFaint)
-                }
-                Text("No games found")
-                    .font(Fog.display(19, weight: .medium))
-                    .foregroundColor(Fog.ink)
-                Text("Install games through Steam or Epic Games")
-                    .font(.callout)
-                    .foregroundColor(Fog.inkDim)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else {
-            ScrollViewReader { proxy in
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Text("\(games.count) games")
-                                .font(.system(size: 12, weight: .medium))
-                                .foregroundColor(Fog.inkDim)
-                            Text("·")
-                                .foregroundColor(Fog.inkFaint)
-                            Text("\(installedCount) installed")
-                                .font(.system(size: 12, weight: .medium))
-                                .foregroundColor(Fog.inkDim)
-                            Spacer()
-                            Menu {
-                                Picker("Sort", selection: $sortOrder) {
-                                    ForEach(GameSortOrder.allCases) { order in
-                                        Text(order.rawValue).tag(order)
-                                    }
-                                }
-                            } label: {
-                                Label(sortOrder.rawValue, systemImage: "arrow.up.arrow.down")
-                                    .font(.system(size: 11.5))
-                            }
-                            .menuStyle(.borderlessButton)
-                            .fixedSize()
-                            .tint(Fog.inkDim)
-                        }
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    filterBar
                         .padding(.horizontal, 16)
-                        .padding(.top, 10)
+                        .padding(.top, 12)
 
-                        LazyVGrid(columns: columns, spacing: 14) {
-                            ForEach(sortedGames) { game in
-                                let g = game
-                                GameCardView(
-                                    game: g,
-                                    onLaunch: { onLaunch(g) },
-                                    onLaunchNoEAC: { onLaunchNoEAC(g) },
-                                    onLaunchGPTK: { onLaunchGPTK(g) },
-                                    onInstall: { onInstall(g) },
-                                    onUninstall: { onUninstall(g) },
-                                    onShowInFinder: { onShowInFinder(g) },
-                                    onLaunchOptions: { onLaunchOptions(g) },
-                                    onInstallWorkshopItem: { onInstallWorkshopItem(g) },
-                                    onSelect: { onSelect(g) },
-                                    isFocused: focusedGameID == g.id
-                                )
-                                .id(g.id)
-                            }
+                    if games.isEmpty {
+                        emptyState
+                    } else {
+                        if !installed.isEmpty {
+                            section(title: "Installed", count: installed.count, games: installed)
                         }
-                        .padding(16)
-                        .background(GeometryReader { geo in
-                            Color.clear.preference(key: GridWidthKey.self, value: geo.size.width)
-                        })
+                        if !notInstalled.isEmpty {
+                            section(title: filter == .shared ? "Available to install" : "Not installed",
+                                    count: notInstalled.count, games: notInstalled)
+                        }
                     }
                 }
-                .onPreferenceChange(GridWidthKey.self) { onGridWidthChange($0) }
-                .onChange(of: focusedGameID) { _, newID in
-                    guard let newID else { return }
-                    withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(newID, anchor: .center) }
+                .padding(.bottom, 24)
+                .background(GeometryReader { geo in
+                    Color.clear.preference(key: GridWidthKey.self, value: geo.size.width)
+                })
+            }
+            .onPreferenceChange(GridWidthKey.self) { onGridWidthChange($0) }
+            .onChange(of: focusedGameID) { _, newID in
+                guard let newID else { return }
+                withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(newID, anchor: .center) }
+            }
+        }
+    }
+
+    private var filterBar: some View {
+        HStack(spacing: 8) {
+            ForEach(availableFilters) { f in
+                Button { filter = f } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: f.systemImage).font(.system(size: 10))
+                        Text(f.rawValue).font(.system(size: 12, weight: .medium))
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(filter == f ? Fog.accentSoft : Fog.haze,
+                                in: Capsule())
+                    .foregroundColor(filter == f ? Fog.accent : Fog.inkDim)
+                }
+                .buttonStyle(.plain)
+            }
+            Spacer()
+        }
+    }
+
+    private func section(title: String, count: Int, games: [Game]) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Text(title).font(Fog.display(15, weight: .medium)).foregroundColor(Fog.ink)
+                Text("\(count)")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(Fog.inkFaint)
+                    .padding(.horizontal, 6).padding(.vertical, 1)
+                    .background(Fog.haze, in: Capsule())
+            }
+            .padding(.horizontal, 16)
+
+            LazyVGrid(columns: columns, spacing: 14) {
+                ForEach(games) { game in
+                    let g = game
+                    GameCardView(
+                        game: g,
+                        onLaunch: { onLaunch(g) },
+                        onLaunchNoEAC: { onLaunchNoEAC(g) },
+                        onLaunchGPTK: { onLaunchGPTK(g) },
+                        onInstall: { onInstall(g) },
+                        onUninstall: { onUninstall(g) },
+                        onShowInFinder: { onShowInFinder(g) },
+                        onLaunchOptions: { onLaunchOptions(g) },
+                        onInstallWorkshopItem: { onInstallWorkshopItem(g) },
+                        onSelect: { onSelect(g) },
+                        isFocused: focusedGameID == g.id
+                    )
+                    .id(g.id)
                 }
             }
+            .padding(.horizontal, 16)
+        }
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 14) {
+            ZStack {
+                Circle().fill(Fog.haze).frame(width: 84, height: 84)
+                Image(systemName: filter == .installed ? "arrow.down.circle" : "tray")
+                    .font(.system(size: 32)).foregroundColor(Fog.inkFaint)
+            }
+            Text(emptyTitle).font(Fog.display(19, weight: .medium)).foregroundColor(Fog.ink)
+            Text(emptySubtitle).font(.callout).foregroundColor(Fog.inkDim)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 80)
+    }
+
+    private var emptyTitle: String {
+        switch filter {
+        case .installed: return "Nothing installed yet"
+        case .shared: return "No family-shared games"
+        case .notInstalled: return "Everything's installed"
+        case .all: return "No games here"
+        }
+    }
+    private var emptySubtitle: String {
+        switch filter {
+        case .installed: return "Install a game to see it here."
+        case .shared: return "Games shared into your Steam Family will appear here."
+        case .notInstalled: return "Nice — your whole library is downloaded."
+        case .all: return "Sign in to Steam or Epic to load your library."
         }
     }
 }
@@ -3704,39 +3751,34 @@ struct GameDetailView: View {
         }
     }
 
+    private var actionsBundle: GameActions.Bundle {
+        .init(onLaunch: onLaunch, onLaunchNoEAC: onLaunchNoEAC, onLaunchGPTK: onLaunchGPTK)
+    }
+
     @ViewBuilder
     private var actionRow: some View {
         if game.isInstalled {
             HStack(spacing: 8) {
-                if game.antiCheat != .none {
-                    Button(action: onLaunchNoEAC) {
-                        Label("Play Offline — No Anti-Cheat", systemImage: "play.fill")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(game.source == .steam ? Fog.steam : Fog.epic)
-                } else if game.source == .steam && d3dMetalAvailable {
-                    Button(action: onLaunchGPTK) {
-                        Label("Play (D3DMetal)", systemImage: "play.fill")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(Fog.steam)
-                } else if game.source == .steam {
-                    Button(action: onLaunchNoEAC) {
-                        Label("Launch", systemImage: "play.fill")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(Fog.steam)
-                } else {
-                    Button(action: onLaunch) {
-                        Label("Launch", systemImage: "play.fill")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(Fog.epic)
+                Button { GameActions.bestPlay(for: game, d3dMetalAvailable: d3dMetalAvailable)(actionsBundle) } label: {
+                    Label(game.antiCheat != .none ? "Play Offline" : "Play", systemImage: "play.fill")
                 }
-                Button("Launch Options…", action: onLaunchOptions)
-                    .buttonStyle(.bordered)
-                Button("Show in Finder", action: onShowInFinder)
-                    .buttonStyle(.bordered)
+                .buttonStyle(.borderedProminent)
+                .tint(game.source == .steam ? Fog.steam : Fog.epic)
+
+                let alts = GameActions.alternates(for: game, d3dMetalAvailable: d3dMetalAvailable)
+                Menu {
+                    ForEach(Array(alts.enumerated()), id: \.offset) { _, alt in
+                        Button { alt.run(actionsBundle) } label: { Label(alt.title, systemImage: alt.icon) }
+                    }
+                    if !alts.isEmpty { Divider() }
+                    Button("Launch Options…", action: onLaunchOptions)
+                    Button("Show in Finder", action: onShowInFinder)
+                } label: {
+                    Image(systemName: "ellipsis")
+                }
+                .menuStyle(.borderedButton)
+                .fixedSize()
+
                 Spacer()
                 Button("Uninstall", role: .destructive, action: onUninstall)
                     .buttonStyle(.bordered)
@@ -4918,7 +4960,7 @@ struct ContentView: View {
     @State private var gameForWorkshopInstall: Game?
     @State private var gameForDetail: Game?
     @State private var focusedGameIndex = 0
-    @State private var gameSortOrder: GameSortOrder = .installedFirst
+    @State private var libraryFilter: LibraryFilter = .all
     @State private var gridColumns = 1
     // Sections that actually contain a game grid — gamepad shoulder buttons only
     // cycle among these, so they never land on Store/Free Games/Settings and go
@@ -4934,18 +4976,25 @@ struct ContentView: View {
 
     private func refreshOwnedSteamGames() {
         guard steamAuth.isLoggedIn else { return }
+        // Owned games over the client protocol (relay), so this doesn't depend on a
+        // separately-minted Steam Web API token. Filtering the Family-shared list
+        // against this is what keeps games you actually own from being mislabelled
+        // "Shared". Falls back to the Web API only if the relay path fails.
         Task {
             do {
-                let token = try await steamAuth.mintAccessToken()
-                let owned = try await SteamLibraryService.fetchOwnedGames(accessToken: token, steamID: steamAuth.steamID)
+                let owned: [OwnedGame]
+                if let relayOwned = try? await RelayManager.ownedLibrary(), !relayOwned.isEmpty {
+                    owned = relayOwned.map { OwnedGame(id: $0.id, name: $0.name, playtimeForever: 0,
+                                                       coverURL: SteamLibraryService.coverURL(forAppID: $0.id)) }
+                } else {
+                    let token = try await steamAuth.mintAccessToken()
+                    owned = try await SteamLibraryService.fetchOwnedGames(accessToken: token, steamID: steamAuth.steamID)
+                }
                 await MainActor.run {
                     library.applyOwnedSteamGames(owned)
                     library.lastError = nil
                 }
             } catch {
-                // Locally-installed games still show up either way — this only affects
-                // owned-but-not-installed placeholders — but surface it in Settings
-                // rather than failing silently, since it's otherwise invisible.
                 await MainActor.run {
                     library.lastError = "Couldn't fetch your Steam library: \(error.localizedDescription)"
                 }
@@ -4993,28 +5042,42 @@ struct ContentView: View {
     var filteredGames: [Game] {
         var games = library.games
 
-        // Filter by source
+        // Filter by source (sidebar)
         switch sidebarSelection {
         case "steam": games = games.filter { $0.source == .steam }
         case "epic": games = games.filter { $0.source == .epic }
         default: break
         }
 
+        // Filter by the library chip (All / Installed / Not Installed / Shared)
+        switch libraryFilter {
+        case .all: break
+        case .installed: games = games.filter(\.isInstalled)
+        case .notInstalled: games = games.filter { !$0.isInstalled }
+        case .shared: games = games.filter(\.isFamilyShared)
+        }
+
         // Filter by search
         if !searchText.isEmpty {
-            games = games.filter {
-                $0.name.localizedCaseInsensitiveContains(searchText)
-            }
+            games = games.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
         }
 
         return games
     }
 
+    // Chips to offer for the current source: "Family Shared" only makes sense where
+    // Steam games are present (Epic has no family sharing).
+    private var availableFilters: [LibraryFilter] {
+        let hasShared = library.games.contains { $0.isFamilyShared &&
+            (sidebarSelection != "epic") }
+        return LibraryFilter.allCases.filter { $0 != .shared || hasShared }
+    }
+
     // The exact order GameGridView renders — computing focus over this (rather
     // than the unsorted filteredGames) is what keeps the gamepad cursor and the
-    // visible grid in sync; a mismatch here is what let "installed first" sorting
-    // silently skip/misalign the highlighted card.
-    private var displayedGames: [Game] { GameGridView.sorted(filteredGames, by: gameSortOrder) }
+    // visible grid in sync; a mismatch here is what let sorting silently skip or
+    // misalign the highlighted card.
+    private var displayedGames: [Game] { GameGridView.ordered(filteredGames) }
 
     // Wires the connected controller's D-pad/stick, A/B, and shoulder buttons to
     // grid focus, activation, sheet dismissal, and sidebar-section switching. See
@@ -5159,7 +5222,8 @@ struct ContentView: View {
                                 onSelect: { game in gameForDetail = game },
                                 focusedGameID: (gamepad.isConnected && displayedGames.indices.contains(focusedGameIndex))
                                     ? displayedGames[focusedGameIndex].id : nil,
-                                sortOrder: $gameSortOrder,
+                                filter: $libraryFilter,
+                                availableFilters: availableFilters,
                                 onGridWidthChange: { width in
                                     // Matches SwiftUI's .adaptive(minimum:maximum:) column
                                     // count: as many 160pt (+14pt spacing) columns as fit.

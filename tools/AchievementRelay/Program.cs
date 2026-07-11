@@ -42,6 +42,7 @@ class Program
         refreshToken = Extract(json, "refreshToken");
         steamId = ulong.TryParse(Extract(json, "steamID"), out var s) ? s : 0;
         if (args[1] == "--family") { mode = "family"; }
+        else if (args[1] == "--owned") { mode = "owned"; }
         else
         {
             appId = uint.Parse(args[1]);
@@ -62,6 +63,7 @@ class Program
         manager.Subscribe<SteamUser.LoggedOnCallback>(cb =>
         {
             if (mode == "family") _ = OnLoggedOnFamily(cb);
+            else if (mode == "owned") _ = OnLoggedOnOwned(cb);
             else OnLoggedOn(cb);
         });
 
@@ -116,6 +118,10 @@ class Program
             foreach (var a in appsResp.Body.apps)
             {
                 if (a.exclude_reason.ToString().Contains("Excluded")) continue;
+                // include_own=false only drops apps owned *solely* by this account.
+                // A game both you and a family member own still comes back (your id
+                // buried in owner_steamids) — that's YOUR game, not a borrowed one.
+                if (a.owner_steamids.Contains(steamId)) continue;
                 if (!seenAppIds.Add(a.appid)) continue;
                 if (!seenNames.Add(a.name)) continue;
                 if (!first) sb.Append(','); first = false;
@@ -132,6 +138,49 @@ class Program
         catch (Exception ex)
         {
             Err("family query failed: " + ex.Message);
+            exitCode = 1;
+        }
+        finally
+        {
+            running = false;
+        }
+    }
+
+    // The account's own owned games over the client protocol (IPlayerService),
+    // so Mist never needs a Steam Web API key or a separately-minted web token —
+    // just the same session everything else uses. Emitted as [{appid,name}].
+    static async Task OnLoggedOnOwned(SteamUser.LoggedOnCallback cb)
+    {
+        if (cb.Result != EResult.OK) { Err($"logon failed: {cb.Result}/{cb.ExtendedResult}"); exitCode = 1; running = false; return; }
+        try
+        {
+            var unified = steamClient.GetHandler<SteamUnifiedMessages>()!;
+            var player = unified.CreateService<Player>();
+            var resp = await player.GetOwnedGames(new CPlayer_GetOwnedGames_Request
+            {
+                steamid = steamId,
+                include_appinfo = true,
+                include_played_free_games = true,
+                include_free_sub = false,
+            });
+
+            var sb = new StringBuilder("[");
+            bool first = true;
+            foreach (var g in resp.Body.games)
+            {
+                if (!first) sb.Append(','); first = false;
+                sb.Append('{')
+                  .Append("\"appid\":").Append(g.appid).Append(',')
+                  .Append("\"name\":").Append(JStr(g.name ?? ""))
+                  .Append('}');
+            }
+            sb.Append(']');
+            Console.Out.Write(sb.ToString());
+            exitCode = 0;
+        }
+        catch (Exception ex)
+        {
+            Err("owned-games query failed: " + ex.Message);
             exitCode = 1;
         }
         finally
