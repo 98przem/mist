@@ -1,6 +1,12 @@
 # Build targets for Mist
 # Requires: Xcode command line tools (swiftc)
 
+# Marketing version baked into Info.plist (CFBundleShortVersionString) and used by
+# the in-app updater to compare against the latest GitHub release. CI passes this
+# from the git tag (see .github/workflows/release.yml); bump the default for local
+# builds when cutting a new version.
+VERSION ?= 0.3.0
+
 PREFIX ?= $(HOME)/Library/Application Support/Mist
 CEF_DIR = $(PREFIX)/drive_c/Program Files (x86)/Steam/bin/cef/cef.win64
 
@@ -45,6 +51,7 @@ Mist.app/Contents/MacOS/Mist: MistApp.swift $(TOOLS_SENTINEL) Mist.icns
 	@echo '<key>CFBundleIdentifier</key><string>com.mist.app</string>' >> Mist.app/Contents/Info.plist
 	@echo '<key>CFBundleName</key><string>Mist</string>' >> Mist.app/Contents/Info.plist
 	@echo '<key>CFBundleVersion</key><string>2.0</string>' >> Mist.app/Contents/Info.plist
+	@echo '<key>CFBundleShortVersionString</key><string>$(VERSION)</string>' >> Mist.app/Contents/Info.plist
 	@echo '<key>CFBundleIconFile</key><string>Mist.icns</string>' >> Mist.app/Contents/Info.plist
 	@echo '</dict></plist>' >> Mist.app/Contents/Info.plist
 	codesign --force --deep -s - Mist.app
@@ -69,6 +76,7 @@ bundle: Mist.icns
 	@echo '<key>CFBundleIdentifier</key><string>com.mist.app</string>' >> "$(BUNDLE_CONTENTS)/Info.plist"
 	@echo '<key>CFBundleName</key><string>Mist</string>' >> "$(BUNDLE_CONTENTS)/Info.plist"
 	@echo '<key>CFBundleVersion</key><string>2.0</string>' >> "$(BUNDLE_CONTENTS)/Info.plist"
+	@echo '<key>CFBundleShortVersionString</key><string>$(VERSION)</string>' >> "$(BUNDLE_CONTENTS)/Info.plist"
 	@echo '<key>CFBundleIconFile</key><string>Mist.icns</string>' >> "$(BUNDLE_CONTENTS)/Info.plist"
 	@echo '</dict></plist>' >> "$(BUNDLE_CONTENTS)/Info.plist"
 	# App icon

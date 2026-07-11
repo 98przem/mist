@@ -4870,6 +4870,70 @@ struct SettingsInfoRow: View {
     }
 }
 
+struct UpdatesSettingsView: View {
+    @ObservedObject var updater: UpdateManager
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Mist \(updater.currentVersion)").font(.callout)
+                    statusLine.font(.caption).foregroundColor(.secondary)
+                }
+                Spacer()
+                primaryButton
+            }
+            Toggle("Check for updates automatically on launch", isOn: $updater.autoCheck)
+                .font(.caption)
+                .toggleStyle(.checkbox)
+
+            if case .available(let version, let notes, _) = updater.state, !notes.isEmpty {
+                Divider()
+                Text("What's new in \(version)").font(.caption.weight(.semibold))
+                ScrollView {
+                    Text(notes)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                }
+                .frame(maxHeight: 120)
+            }
+        }
+    }
+
+    @ViewBuilder private var statusLine: some View {
+        switch updater.state {
+        case .idle: Text("Up to date, as far as we last checked.")
+        case .checking: Text("Checking…")
+        case .upToDate: Text("You're on the latest version.")
+        case .available(let v, _, _): Text("Version \(v) is available.").foregroundColor(Fog.accent)
+        case .downloading(let f): Text("Downloading… \(Int(f * 100))%")
+        case .readyToRelaunch: Text("Installing — Mist will relaunch.")
+        case .failed(let m): Text(m).foregroundColor(.orange)
+        }
+    }
+
+    @ViewBuilder private var primaryButton: some View {
+        switch updater.state {
+        case .checking:
+            ProgressView().controlSize(.small)
+        case .downloading(let f):
+            ProgressView(value: f).frame(width: 120)
+        case .available(let version, _, let zipURL):
+            Button("Install & Relaunch") {
+                updater.downloadAndInstall(version: version, zipURL: zipURL)
+            }
+            .buttonStyle(.borderedProminent).tint(Fog.accent)
+        case .readyToRelaunch:
+            ProgressView().controlSize(.small)
+        default:
+            Button("Check for Updates") { Task { await updater.check(userInitiated: true) } }
+                .buttonStyle(.bordered)
+        }
+    }
+}
+
 let sidebarNavOrder = ["all", "steam", "epic", "epicfree", "store", "settings"]
 
 // MARK: - Gamepad navigation
@@ -4945,6 +5009,176 @@ final class GamepadNavigator: ObservableObject {
     deinit { observers.forEach(NotificationCenter.default.removeObserver) }
 }
 
+// MARK: - In-app updater
+//
+// Checks GitHub Releases for a newer version and, on request, downloads the
+// release's Mist.zip and swaps the running .app in place. Mist is ad-hoc signed
+// and unsandboxed, so a small detached shell helper (waits for us to quit, moves
+// the new bundle over the old, relaunches) is enough — no Sparkle, no privileged
+// helper. Auto-check is opt-in and stored in UserDefaults.
+@MainActor
+final class UpdateManager: ObservableObject {
+    enum State: Equatable {
+        case idle
+        case checking
+        case upToDate
+        case available(version: String, notes: String, zipURL: URL)
+        case downloading(Double)
+        case readyToRelaunch
+        case failed(String)
+    }
+
+    @Published var state: State = .idle
+    @Published var autoCheck: Bool {
+        didSet { UserDefaults.standard.set(autoCheck, forKey: "autoCheckUpdates") }
+    }
+
+    static let repo = "98przem/mist"
+    var currentVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0"
+    }
+
+    init() {
+        // Default on: most users want updates. Stored so they can opt out.
+        if UserDefaults.standard.object(forKey: "autoCheckUpdates") == nil {
+            UserDefaults.standard.set(true, forKey: "autoCheckUpdates")
+        }
+        autoCheck = UserDefaults.standard.bool(forKey: "autoCheckUpdates")
+    }
+
+    private struct Release: Decodable {
+        let tag_name: String
+        let body: String?
+        let assets: [Asset]
+        struct Asset: Decodable { let name: String; let browser_download_url: String }
+    }
+
+    func checkOnLaunchIfEnabled() {
+        guard autoCheck else { return }
+        Task { await check(userInitiated: false) }
+    }
+
+    func check(userInitiated: Bool) async {
+        if case .downloading = state { return }
+        state = .checking
+        guard let url = URL(string: "https://api.github.com/repos/\(Self.repo)/releases/latest") else { return }
+        var req = URLRequest(url: url)
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
+                throw NSError(domain: "update", code: (resp as? HTTPURLResponse)?.statusCode ?? 0)
+            }
+            let release = try JSONDecoder().decode(Release.self, from: data)
+            let latest = release.tag_name.hasPrefix("v") ? String(release.tag_name.dropFirst()) : release.tag_name
+            guard Self.isNewer(latest, than: currentVersion),
+                  let zip = release.assets.first(where: { $0.name.hasSuffix(".zip") }),
+                  let zipURL = URL(string: zip.browser_download_url) else {
+                state = .upToDate
+                return
+            }
+            state = .available(version: latest, notes: release.body ?? "", zipURL: zipURL)
+        } catch {
+            // A silent auto-check that fails shouldn't nag; only a manual check reports.
+            state = userInitiated ? .failed("Couldn't check for updates: \(error.localizedDescription)") : .idle
+        }
+    }
+
+    // Numeric, dot-separated comparison (e.g. 0.10.0 > 0.9.0). Non-numeric parts
+    // are treated as 0 so a malformed tag never claims to be newer.
+    static func isNewer(_ candidate: String, than current: String) -> Bool {
+        func parts(_ s: String) -> [Int] { s.split(separator: ".").map { Int($0) ?? 0 } }
+        let a = parts(candidate), b = parts(current)
+        for i in 0..<max(a.count, b.count) {
+            let x = i < a.count ? a[i] : 0, y = i < b.count ? b[i] : 0
+            if x != y { return x > y }
+        }
+        return false
+    }
+
+    func downloadAndInstall(version: String, zipURL: URL) {
+        state = .downloading(0)
+        Task {
+            do {
+                let tmp = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("mist-update-\(UUID().uuidString)")
+                try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+                let zipDest = tmp.appendingPathComponent("Mist.zip")
+
+                // Stream the download so we can show progress.
+                let (bytes, resp) = try await URLSession.shared.bytes(from: zipURL)
+                let total = resp.expectedContentLength
+                var received: Int64 = 0
+                var buffer = Data()
+                buffer.reserveCapacity(1 << 20)
+                for try await byte in bytes {
+                    buffer.append(byte)
+                    received += 1
+                    if total > 0, received % (1 << 18) == 0 {
+                        let f = Double(received) / Double(total)
+                        await MainActor.run { self.state = .downloading(f) }
+                    }
+                }
+                try buffer.write(to: zipDest)
+
+                // Unzip and locate the new Mist.app.
+                try Self.run("/usr/bin/ditto", ["-xk", zipDest.path, tmp.path])
+                let newApp = tmp.appendingPathComponent("Mist.app")
+                guard FileManager.default.fileExists(atPath: newApp.path) else {
+                    throw NSError(domain: "update", code: -1,
+                                  userInfo: [NSLocalizedDescriptionKey: "Downloaded archive had no Mist.app"])
+                }
+
+                let currentApp = Bundle.main.bundleURL
+                try Self.spawnSwapAndRelaunch(newApp: newApp, currentApp: currentApp)
+                await MainActor.run { self.state = .readyToRelaunch }
+                // Give the helper a beat to start waiting on our PID, then quit.
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                await MainActor.run { NSApp.terminate(nil) }
+            } catch {
+                await MainActor.run { self.state = .failed("Update failed: \(error.localizedDescription)") }
+            }
+        }
+    }
+
+    @discardableResult
+    private static func run(_ launch: String, _ args: [String]) throws -> Int32 {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: launch)
+        p.arguments = args
+        try p.run(); p.waitUntilExit()
+        if p.terminationStatus != 0 {
+            throw NSError(domain: "update", code: Int(p.terminationStatus),
+                          userInfo: [NSLocalizedDescriptionKey: "\(launch) exited \(p.terminationStatus)"])
+        }
+        return p.terminationStatus
+    }
+
+    // A detached shell that waits for this process to exit, replaces the old
+    // bundle with the new one, and relaunches. Runs via `nohup … &` so it
+    // outlives us. We can't overwrite our own running bundle, hence the helper.
+    private static func spawnSwapAndRelaunch(newApp: URL, currentApp: URL) throws {
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let script = """
+        while kill -0 \(pid) 2>/dev/null; do sleep 0.2; done
+        rm -rf \(shq(currentApp.path))
+        /bin/mv \(shq(newApp.path)) \(shq(currentApp.path))
+        xattr -dr com.apple.quarantine \(shq(currentApp.path)) 2>/dev/null
+        /usr/bin/open \(shq(currentApp.path))
+        """
+        let scriptURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mist-update-\(pid).sh")
+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/bash")
+        p.arguments = ["-c", "nohup /bin/bash \(shq(scriptURL.path)) >/dev/null 2>&1 &"]
+        try p.run()
+    }
+
+    // Minimal shell single-quote escaping for paths we embed in the helper script.
+    private static func shq(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+}
+
 struct ContentView: View {
     @StateObject private var library: GameLibrary
     @StateObject private var processManager: ProcessManager
@@ -4952,6 +5186,7 @@ struct ContentView: View {
     @StateObject private var steamAuth = SteamAuthManager()
     @StateObject private var downloadManager: SteamDownloadManager
     @StateObject private var gamepad = GamepadNavigator()
+    @StateObject private var updater = UpdateManager()
     @State private var sidebarSelection: String? = "all"
     @State private var showRunningView = false
     @State private var searchText = ""
@@ -5169,6 +5404,10 @@ struct ContentView: View {
 
                                     SettingsCard(title: "Epic Account", systemImage: "bolt.fill", tint: .purple) {
                                         EpicStoreView(processManager: processManager)
+                                    }
+
+                                    SettingsCard(title: "Updates", systemImage: "arrow.triangle.2.circlepath", tint: .green) {
+                                        UpdatesSettingsView(updater: updater)
                                     }
 
                                     SettingsCard(title: "Storage & Engine", systemImage: "internaldrive.fill", tint: .gray) {
@@ -5396,7 +5635,14 @@ struct ContentView: View {
         }
         .focusedSceneValue(\.rescanAction, { library.scan() })
         .focusedSceneValue(\.showSettingsAction, { sidebarSelection = "settings" })
-        .onAppear(perform: configureGamepad)
+        .focusedSceneValue(\.checkUpdatesAction, {
+            sidebarSelection = "settings"
+            Task { await updater.check(userInitiated: true) }
+        })
+        .onAppear {
+            configureGamepad()
+            updater.checkOnLaunchIfEnabled()
+        }
     }
 }
 
@@ -5412,6 +5658,9 @@ private struct RescanActionKey: FocusedValueKey {
 private struct ShowSettingsActionKey: FocusedValueKey {
     typealias Value = () -> Void
 }
+private struct CheckUpdatesActionKey: FocusedValueKey {
+    typealias Value = () -> Void
+}
 extension FocusedValues {
     var rescanAction: (() -> Void)? {
         get { self[RescanActionKey.self] }
@@ -5421,6 +5670,10 @@ extension FocusedValues {
         get { self[ShowSettingsActionKey.self] }
         set { self[ShowSettingsActionKey.self] = newValue }
     }
+    var checkUpdatesAction: (() -> Void)? {
+        get { self[CheckUpdatesActionKey.self] }
+        set { self[CheckUpdatesActionKey.self] = newValue }
+    }
 }
 
 // MARK: - App Entry Point
@@ -5429,6 +5682,7 @@ extension FocusedValues {
 struct MistApp: App {
     @FocusedValue(\.rescanAction) private var rescanAction
     @FocusedValue(\.showSettingsAction) private var showSettingsAction
+    @FocusedValue(\.checkUpdatesAction) private var checkUpdatesAction
 
     var body: some Scene {
         WindowGroup {
@@ -5447,6 +5701,10 @@ struct MistApp: App {
                 Button("Settings…") { showSettingsAction?() }
                     .keyboardShortcut(",", modifiers: .command)
                     .disabled(showSettingsAction == nil)
+            }
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") { checkUpdatesAction?() }
+                    .disabled(checkUpdatesAction == nil)
             }
             CommandGroup(replacing: .help) {
                 Link("Mist on GitHub", destination: URL(string: "https://github.com/98przem/mist")!)
