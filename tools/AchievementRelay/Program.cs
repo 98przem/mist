@@ -105,14 +105,19 @@ class Program
             });
 
             // The same appid can appear more than once (e.g. shared by more than one
-            // family member, or listed under more than one package) — keep one.
+            // family member, or listed under more than one package) — keep one. Steam
+            // also has genuinely distinct appids for the same title (e.g. GTA III is
+            // both appid 12100 and 12230 in this account's shared library) — dedupe
+            // by name too, keeping whichever copy is listed first.
             var seenAppIds = new HashSet<uint>();
+            var seenNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var sb = new StringBuilder("[");
             bool first = true;
             foreach (var a in appsResp.Body.apps)
             {
                 if (a.exclude_reason.ToString().Contains("Excluded")) continue;
                 if (!seenAppIds.Add(a.appid)) continue;
+                if (!seenNames.Add(a.name)) continue;
                 if (!first) sb.Append(','); first = false;
                 sb.Append('{')
                   .Append("\"appid\":").Append(a.appid).Append(',')

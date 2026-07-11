@@ -483,8 +483,12 @@ class GameLibrary: ObservableObject {
         // on the account's real (if temporary) family-shared license, no special-
         // casing needed there.
         var seenFamilyIDs = Set<String>()
+        var seenFamilyNames = Set<String>()
         let familyPlaceholders = familySharedGames
-            .filter { !ownedOrScannedIDs.contains($0.id) && seenFamilyIDs.insert($0.id).inserted }
+            .filter {
+                !ownedOrScannedIDs.contains($0.id) && seenFamilyIDs.insert($0.id).inserted
+                    && seenFamilyNames.insert($0.name.lowercased()).inserted
+            }
             .map { fg in
                 Game(id: fg.id, name: fg.name, source: .steam, installDir: "",
                     sizeBytes: 0, isInstalled: false,
@@ -3113,7 +3117,7 @@ struct SidebarRow: View {
                         .clipShape(Capsule())
                 }
             }
-            .padding(.horizontal, 10)
+            .padding(.horizontal, 16)
             .padding(.vertical, 6)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
@@ -3139,7 +3143,7 @@ struct SidebarSectionLabel: View {
             .font(.system(size: 10.5, weight: .semibold))
             .tracking(0.6)
             .foregroundColor(Fog.inkFaint)
-            .padding(.horizontal, 10)
+            .padding(.horizontal, 16)
             .padding(.top, 14)
             .padding(.bottom, 2)
     }
@@ -3175,7 +3179,7 @@ struct SidebarView: View {
                     .foregroundColor(Fog.ink)
                 Spacer()
             }
-            .padding(.horizontal, 10)
+            .padding(.horizontal, 16)
             .padding(.top, 10)
             .padding(.bottom, 4)
 
