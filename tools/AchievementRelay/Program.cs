@@ -104,11 +104,15 @@ class Program
                 max_apps = 5000,
             });
 
+            // The same appid can appear more than once (e.g. shared by more than one
+            // family member, or listed under more than one package) — keep one.
+            var seenAppIds = new HashSet<uint>();
             var sb = new StringBuilder("[");
             bool first = true;
             foreach (var a in appsResp.Body.apps)
             {
                 if (a.exclude_reason.ToString().Contains("Excluded")) continue;
+                if (!seenAppIds.Add(a.appid)) continue;
                 if (!first) sb.Append(','); first = false;
                 sb.Append('{')
                   .Append("\"appid\":").Append(a.appid).Append(',')

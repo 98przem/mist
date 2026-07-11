@@ -482,11 +482,14 @@ class GameLibrary: ObservableObject {
         // game (handleInstall/DepotDownloader) — Steam authorizes the download based
         // on the account's real (if temporary) family-shared license, no special-
         // casing needed there.
-        let familyPlaceholders = familySharedGames.filter { !ownedOrScannedIDs.contains($0.id) }.map { fg in
-            Game(id: fg.id, name: fg.name, source: .steam, installDir: "",
-                sizeBytes: 0, isInstalled: false,
-                imageURL: SteamLibraryService.coverURL(forAppID: fg.id), isFamilyShared: true)
-        }
+        var seenFamilyIDs = Set<String>()
+        let familyPlaceholders = familySharedGames
+            .filter { !ownedOrScannedIDs.contains($0.id) && seenFamilyIDs.insert($0.id).inserted }
+            .map { fg in
+                Game(id: fg.id, name: fg.name, source: .steam, installDir: "",
+                    sizeBytes: 0, isInstalled: false,
+                    imageURL: SteamLibraryService.coverURL(forAppID: fg.id), isFamilyShared: true)
+            }
         games = (scannedGames + placeholders + familyPlaceholders).sorted { $0.name.lowercased() < $1.name.lowercased() }
     }
 
@@ -3110,7 +3113,7 @@ struct SidebarRow: View {
                         .clipShape(Capsule())
                 }
             }
-            .padding(.horizontal, 8)
+            .padding(.horizontal, 10)
             .padding(.vertical, 6)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
@@ -3136,7 +3139,7 @@ struct SidebarSectionLabel: View {
             .font(.system(size: 10.5, weight: .semibold))
             .tracking(0.6)
             .foregroundColor(Fog.inkFaint)
-            .padding(.horizontal, 8)
+            .padding(.horizontal, 10)
             .padding(.top, 14)
             .padding(.bottom, 2)
     }
@@ -3194,7 +3197,6 @@ struct SidebarView: View {
                           isSelected: selection == "store", action: { selection = "store" },
                           isFocused: focusedRow == "store")
             }
-            .padding(.horizontal, 8)
 
             Spacer()
             Divider().background(Fog.hairline)
@@ -3204,7 +3206,6 @@ struct SidebarView: View {
                           isSelected: selection == "settings", action: { selection = "settings" },
                           isFocused: focusedRow == "settings")
             }
-            .padding(.horizontal, 8)
             .padding(.vertical, 8)
         }
         .background(LinearGradient(colors: [Fog.bgElevated, Fog.bg], startPoint: .top, endPoint: .bottom))
@@ -3229,16 +3230,24 @@ struct GameGridView: View {
     var onInstallWorkshopItem: (Game) -> Void = { _ in }
     var onSelect: (Game) -> Void = { _ in }
     var focusedGameID: Game.ID? = nil
+    @Binding var sortOrder: GameSortOrder
+    // Reported up so gamepad up/down navigation (owned by ContentView, which
+    // doesn't know the grid's actual rendered width) can move by a full row
+    // instead of a single card. See onGridWidthChange below for how it's measured.
+    var onGridWidthChange: (CGFloat) -> Void = { _ in }
 
-    @State private var sortOrder: GameSortOrder = .installedFirst
+    private let cardMinWidth: CGFloat = 160
+    private let cardSpacing: CGFloat = 14
 
     let columns = [
         GridItem(.adaptive(minimum: 160, maximum: 200), spacing: 14)
     ]
 
-    var sortedGames: [Game] {
+    var sortedGames: [Game] { Self.sorted(games, by: sortOrder) }
+
+    static func sorted(_ games: [Game], by order: GameSortOrder) -> [Game] {
         games.sorted { a, b in
-            if sortOrder == .installedFirst, a.isInstalled != b.isInstalled { return a.isInstalled }
+            if order == .installedFirst, a.isInstalled != b.isInstalled { return a.isInstalled }
             return a.name.lowercased() < b.name.lowercased()
         }
     }
@@ -3263,59 +3272,74 @@ struct GameGridView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Text("\(games.count) games")
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundColor(Fog.inkDim)
-                        Text("·")
-                            .foregroundColor(Fog.inkFaint)
-                        Text("\(installedCount) installed")
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundColor(Fog.inkDim)
-                        Spacer()
-                        Menu {
-                            Picker("Sort", selection: $sortOrder) {
-                                ForEach(GameSortOrder.allCases) { order in
-                                    Text(order.rawValue).tag(order)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("\(games.count) games")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundColor(Fog.inkDim)
+                            Text("·")
+                                .foregroundColor(Fog.inkFaint)
+                            Text("\(installedCount) installed")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundColor(Fog.inkDim)
+                            Spacer()
+                            Menu {
+                                Picker("Sort", selection: $sortOrder) {
+                                    ForEach(GameSortOrder.allCases) { order in
+                                        Text(order.rawValue).tag(order)
+                                    }
                                 }
+                            } label: {
+                                Label(sortOrder.rawValue, systemImage: "arrow.up.arrow.down")
+                                    .font(.system(size: 11.5))
                             }
-                        } label: {
-                            Label(sortOrder.rawValue, systemImage: "arrow.up.arrow.down")
-                                .font(.system(size: 11.5))
+                            .menuStyle(.borderlessButton)
+                            .fixedSize()
+                            .tint(Fog.inkDim)
                         }
-                        .menuStyle(.borderlessButton)
-                        .fixedSize()
-                        .tint(Fog.inkDim)
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.top, 10)
+                        .padding(.horizontal, 16)
+                        .padding(.top, 10)
 
-                    LazyVGrid(columns: columns, spacing: 14) {
-                        ForEach(sortedGames) { game in
-                            let g = game
-                            GameCardView(
-                                game: g,
-                                onLaunch: { onLaunch(g) },
-                                onLaunchNoEAC: { onLaunchNoEAC(g) },
-                                onLaunchGPTK: { onLaunchGPTK(g) },
-                                onInstall: { onInstall(g) },
-                                onUninstall: { onUninstall(g) },
-                                onShowInFinder: { onShowInFinder(g) },
-                                onLaunchOptions: { onLaunchOptions(g) },
-                                onInstallWorkshopItem: { onInstallWorkshopItem(g) },
-                                onSelect: { onSelect(g) },
-                                isFocused: focusedGameID == g.id
-                            )
-                            .id(g.id)
+                        LazyVGrid(columns: columns, spacing: 14) {
+                            ForEach(sortedGames) { game in
+                                let g = game
+                                GameCardView(
+                                    game: g,
+                                    onLaunch: { onLaunch(g) },
+                                    onLaunchNoEAC: { onLaunchNoEAC(g) },
+                                    onLaunchGPTK: { onLaunchGPTK(g) },
+                                    onInstall: { onInstall(g) },
+                                    onUninstall: { onUninstall(g) },
+                                    onShowInFinder: { onShowInFinder(g) },
+                                    onLaunchOptions: { onLaunchOptions(g) },
+                                    onInstallWorkshopItem: { onInstallWorkshopItem(g) },
+                                    onSelect: { onSelect(g) },
+                                    isFocused: focusedGameID == g.id
+                                )
+                                .id(g.id)
+                            }
                         }
+                        .padding(16)
+                        .background(GeometryReader { geo in
+                            Color.clear.preference(key: GridWidthKey.self, value: geo.size.width)
+                        })
                     }
-                    .padding(16)
+                }
+                .onPreferenceChange(GridWidthKey.self) { onGridWidthChange($0) }
+                .onChange(of: focusedGameID) { _, newID in
+                    guard let newID else { return }
+                    withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(newID, anchor: .center) }
                 }
             }
         }
     }
+}
+
+private struct GridWidthKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
 }
 
 // Browse the wider Steam catalog — games you don't own yet. Mist can't buy
@@ -4812,7 +4836,9 @@ let sidebarNavOrder = ["all", "steam", "epic", "epicfree", "store", "settings"]
 final class GamepadNavigator: ObservableObject {
     @Published private(set) var isConnected = false
 
-    var onMove: ((Int) -> Void)?
+    // (dx, dy): each -1/0/1. Left/right move a column, up/down move a row — the
+    // consumer decides what "a row" means (it knows the actual column count).
+    var onMove: ((Int, Int) -> Void)?
     var onActivate: (() -> Void)?
     var onBack: (() -> Void)?
     var onCycleSection: ((Int) -> Void)?
@@ -4854,11 +4880,12 @@ final class GamepadNavigator: ObservableObject {
     private func handleDirectional(x: Float, y: Float) {
         let threshold: Float = 0.5
         if abs(x) > abs(y) {
-            if x > threshold { fire("right") { self.onMove?(1) } }
-            else if x < -threshold { fire("left") { self.onMove?(-1) } }
+            if x > threshold { fire("right") { self.onMove?(1, 0) } }
+            else if x < -threshold { fire("left") { self.onMove?(-1, 0) } }
         } else {
-            if y > threshold { fire("up") { self.onMove?(-1) } }
-            else if y < -threshold { fire("down") { self.onMove?(1) } }
+            // GCController convention: +y is up, -y is down.
+            if y > threshold { fire("up") { self.onMove?(0, -1) } }
+            else if y < -threshold { fire("down") { self.onMove?(0, 1) } }
         }
     }
 
@@ -4887,6 +4914,12 @@ struct ContentView: View {
     @State private var gameForWorkshopInstall: Game?
     @State private var gameForDetail: Game?
     @State private var focusedGameIndex = 0
+    @State private var gameSortOrder: GameSortOrder = .installedFirst
+    @State private var gridColumns = 1
+    // Sections that actually contain a game grid — gamepad shoulder buttons only
+    // cycle among these, so they never land on Store/Free Games/Settings and go
+    // dead (no focusable grid there).
+    private let gridSections = ["all", "steam", "epic"]
 
     init() {
         let lib = GameLibrary()
@@ -4973,26 +5006,41 @@ struct ContentView: View {
         return games
     }
 
+    // The exact order GameGridView renders — computing focus over this (rather
+    // than the unsorted filteredGames) is what keeps the gamepad cursor and the
+    // visible grid in sync; a mismatch here is what let "installed first" sorting
+    // silently skip/misalign the highlighted card.
+    private var displayedGames: [Game] { GameGridView.sorted(filteredGames, by: gameSortOrder) }
+
     // Wires the connected controller's D-pad/stick, A/B, and shoulder buttons to
     // grid focus, activation, sheet dismissal, and sidebar-section switching. See
-    // GamepadNavigator for why this is linear focus, not full spatial navigation.
+    // GamepadNavigator for why this is linear-per-row focus, not full spatial nav.
     private func configureGamepad() {
-        gamepad.onMove = { delta in
-            guard !filteredGames.isEmpty else { return }
-            focusedGameIndex = max(0, min(filteredGames.count - 1, focusedGameIndex + delta))
+        gamepad.onMove = { dx, dy in
+            let games = displayedGames
+            guard !games.isEmpty else { return }
+            // Left/right move one card; up/down move a full row (gridColumns is
+            // measured from the grid's actual on-screen width, see onGridWidthChange).
+            let step = dx != 0 ? dx : dy * max(1, gridColumns)
+            focusedGameIndex = max(0, min(games.count - 1, focusedGameIndex + step))
         }
         gamepad.onActivate = {
-            guard gameForDetail == nil, filteredGames.indices.contains(focusedGameIndex) else { return }
-            gameForDetail = filteredGames[focusedGameIndex]
+            let games = displayedGames
+            guard gameForDetail == nil, games.indices.contains(focusedGameIndex) else { return }
+            gameForDetail = games[focusedGameIndex]
         }
         gamepad.onBack = {
             if gameForDetail != nil { gameForDetail = nil }
             else if showRunningView { showRunningView = false }
         }
         gamepad.onCycleSection = { delta in
-            guard let current = sidebarSelection, let idx = sidebarNavOrder.firstIndex(of: current) else { return }
-            let next = (idx + delta + sidebarNavOrder.count) % sidebarNavOrder.count
-            sidebarSelection = sidebarNavOrder[next]
+            guard let current = sidebarSelection, let idx = gridSections.firstIndex(of: current) else {
+                sidebarSelection = gridSections.first
+                focusedGameIndex = 0
+                return
+            }
+            let next = (idx + delta + gridSections.count) % gridSections.count
+            sidebarSelection = gridSections[next]
             focusedGameIndex = 0
         }
     }
@@ -5105,8 +5153,14 @@ struct ContentView: View {
                                 onLaunchOptions: { game in gameForLaunchOptions = game },
                                 onInstallWorkshopItem: { game in gameForWorkshopInstall = game },
                                 onSelect: { game in gameForDetail = game },
-                                focusedGameID: (gamepad.isConnected && filteredGames.indices.contains(focusedGameIndex))
-                                    ? filteredGames[focusedGameIndex].id : nil
+                                focusedGameID: (gamepad.isConnected && displayedGames.indices.contains(focusedGameIndex))
+                                    ? displayedGames[focusedGameIndex].id : nil,
+                                sortOrder: $gameSortOrder,
+                                onGridWidthChange: { width in
+                                    // Matches SwiftUI's .adaptive(minimum:maximum:) column
+                                    // count: as many 160pt (+14pt spacing) columns as fit.
+                                    gridColumns = max(1, Int((width + 14) / (160 + 14)))
+                                }
                             )
                         }
                     }
