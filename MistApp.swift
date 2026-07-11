@@ -1182,7 +1182,9 @@ struct StoreSearchResult: Identifiable, Decodable {
     struct Price: Decodable { let final_formatted: String? }
     let price: Price?
     var appid: String { String(id) }
-    var priceLabel: String { price?.final_formatted ?? "Free / N-A" }
+    // The search API only includes `price` for some listings even when the game
+    // isn't free, so an absent price means "unknown," not "free" — don't guess.
+    var priceLabel: String { price?.final_formatted ?? "View on Steam" }
 }
 
 struct WorkshopBrowseItem: Identifiable, Decodable {
