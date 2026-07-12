@@ -586,9 +586,29 @@ class GameLibrary: ObservableObject {
                     sizeBytes: 0, isInstalled: false,
                     imageURL: SteamLibraryService.coverURL(forAppID: fg.id), isFamilyShared: true)
             }
-        games = (scannedGames + placeholders + familyPlaceholders)
-            .map(withStats)
-            .sorted { $0.name.lowercased() < $1.name.lowercased() }
+        let merged = (scannedGames + placeholders + familyPlaceholders).map(withStats)
+        games = stampFirstSeen(merged).sorted { $0.name.lowercased() < $1.name.lowercased() }
+    }
+
+    // Records when each game first appeared so the "New" ribbon only marks genuinely
+    // new arrivals — not the whole library on first run (that batch is backfilled as
+    // "already seen"). Stored in UserDefaults as [gameKey: unix-seconds].
+    private func stampFirstSeen(_ list: [Game]) -> [Game] {
+        let key = "libraryFirstSeen"
+        var seen = (UserDefaults.standard.dictionary(forKey: key) as? [String: Double]) ?? [:]
+        let firstRun = seen.isEmpty
+        let now = Date().timeIntervalSince1970
+        var changed = false
+        for g in list {
+            let k = "\(g.source.rawValue):\(g.id)"
+            if seen[k] == nil { seen[k] = firstRun ? 0 : now; changed = true }
+        }
+        if changed { UserDefaults.standard.set(seen, forKey: key) }
+        return list.map { g in
+            var g = g
+            if let t = seen["\(g.source.rawValue):\(g.id)"], t > 0 { g.addedAt = Date(timeIntervalSince1970: t) }
+            return g
+        }
     }
 
     private func scanSteamGames() -> [Game] {
@@ -2906,6 +2926,21 @@ struct GameCardView: View {
 
     private var d3dMetalAvailable: Bool { D3DMetalProvider.detect() != nil }
 
+    // A single status dot encodes state at a glance (idea 10).
+    private var statusColor: Color {
+        if game.isInstalled { return Fog.good }
+        if game.isFamilyShared { return Fog.accent }
+        return Color.white.opacity(0.35)
+    }
+    // The primary metadata line: playtime if you've played it, else size, else state.
+    private var metaPrimary: String {
+        if game.isInstalled {
+            if let pt = game.playtimeFormatted { return pt }
+            return game.sizeBytes > 0 ? game.sizeFormatted : "Installed"
+        }
+        return game.isFamilyShared ? "Family shared" : "Not installed"
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             poster
@@ -2998,15 +3033,14 @@ struct GameCardView: View {
                         .foregroundColor(.white)
                         .lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
-                    HStack(spacing: 4) {
-                        Image(systemName: game.source == .steam ? "cloud.fill" : "bolt.fill")
-                            .font(.system(size: 8))
-                        Text(game.isInstalled
-                             ? (game.sizeBytes > 0 ? game.sizeFormatted : game.source.rawValue)
-                             : "Not installed")
-                            .font(.system(size: 11))
+                    HStack(spacing: 5) {
+                        Circle().fill(statusColor).frame(width: 6, height: 6)
+                        Text(metaPrimary).font(.system(size: 11))
+                        if isHovering, let lp = game.lastPlayedFormatted, game.isInstalled {
+                            Text("· \(lp)").font(.system(size: 10.5)).foregroundColor(.white.opacity(0.5))
+                        }
                     }
-                    .foregroundColor(.white.opacity(0.7))
+                    .foregroundColor(.white.opacity(0.72))
                 }
                 .padding(10)
                 .frame(width: geo.size.width, alignment: .leading)
@@ -3030,18 +3064,26 @@ struct GameCardView: View {
             }
         }
         .overlay(alignment: .topLeading) {
-            if game.isFamilyShared {
-                HStack(spacing: 3) {
-                    Image(systemName: "person.2.fill")
-                    Text("Shared")
+            VStack(alignment: .leading, spacing: 5) {
+                if game.isNew {
+                    Text("NEW")
+                        .font(.system(size: 9, weight: .heavy)).tracking(0.5)
+                        .padding(.horizontal, 6).padding(.vertical, 3)
+                        .background(Fog.accent, in: Capsule())
+                        .foregroundColor(Color(red: 0x0b/255, green: 0x10/255, blue: 0x20/255))
                 }
-                .font(.system(size: 9, weight: .semibold))
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
-                .background(.black.opacity(0.6), in: Capsule())
-                .foregroundColor(Fog.accent)
-                .padding(7)
+                if game.isFamilyShared {
+                    HStack(spacing: 3) {
+                        Image(systemName: "person.2.fill")
+                        Text("Shared")
+                    }
+                    .font(.system(size: 9, weight: .semibold))
+                    .padding(.horizontal, 6).padding(.vertical, 3)
+                    .background(.black.opacity(0.6), in: Capsule())
+                    .foregroundColor(Fog.accent)
+                }
             }
+            .padding(7)
         }
         .allowsHitTesting(false)
     }
@@ -3388,6 +3430,45 @@ struct GameGridView: View {
     private var installed: [Game] { Self.ordered(games.filter(\.isInstalled)) }
     private var notInstalled: [Game] { Self.ordered(games.filter { !$0.isInstalled }) }
 
+    // The most-recently-played installed game, for the "Jump back in" hero (idea 6).
+    private var continueGame: Game? {
+        games.filter { $0.isInstalled && $0.lastPlayed != nil }
+            .max { ($0.lastPlayed ?? .distantPast) < ($1.lastPlayed ?? .distantPast) }
+    }
+
+    private func jumpBackIn(_ g: Game) -> some View {
+        Button { onSelect(g) } label: {
+            ZStack(alignment: .leading) {
+                AsyncImage(url: URL(string: SteamLibraryService.heroURL(forAppID: g.id))) { phase in
+                    if case .success(let image) = phase { image.resizable().scaledToFill() }
+                    else { LinearGradient(colors: [Fog.haze, Fog.bg], startPoint: .leading, endPoint: .trailing) }
+                }
+                .frame(height: 118).frame(maxWidth: .infinity).clipped()
+                LinearGradient(colors: [Fog.bg, Fog.bg.opacity(0.35), .clear], startPoint: .leading, endPoint: .trailing)
+                HStack(spacing: 16) {
+                    ZStack {
+                        Circle().fill(Fog.accent).frame(width: 46, height: 46)
+                        Image(systemName: "play.fill").font(.system(size: 17)).foregroundColor(Color(red: 0x0b/255, green: 0x10/255, blue: 0x20/255))
+                    }
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("JUMP BACK IN").font(.system(size: 10, weight: .heavy)).tracking(0.1).foregroundColor(Fog.accent)
+                        Text(g.name).font(Fog.display(20, weight: .medium)).foregroundColor(Fog.ink).lineLimit(1)
+                        if let pt = g.playtimeFormatted {
+                            Text("\(pt) played\(g.lastPlayedFormatted.map { " · \($0)" } ?? "")")
+                                .font(.system(size: 11.5)).foregroundColor(Fog.inkDim)
+                        }
+                    }
+                    Spacer()
+                }
+                .padding(.horizontal, 18)
+            }
+            .frame(height: 118)
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Fog.hairline))
+        }
+        .buttonStyle(.plain)
+    }
+
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
@@ -3399,6 +3480,9 @@ struct GameGridView: View {
                     if games.isEmpty {
                         emptyState
                     } else {
+                        if filter == .all, let cg = continueGame {
+                            jumpBackIn(cg).padding(.horizontal, 16)
+                        }
                         if !installed.isEmpty {
                             section(title: "Installed", count: installed.count, games: installed)
                         }
