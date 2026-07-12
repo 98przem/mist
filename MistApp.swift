@@ -3470,6 +3470,13 @@ struct GameGridView: View {
     }
 
     var body: some View {
+        ZStack {
+            FogAtmosphere()
+            gridScroll
+        }
+    }
+
+    private var gridScroll: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
@@ -3595,6 +3602,39 @@ struct GameGridView: View {
 private struct GridWidthKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
+}
+
+// A barely-moving periwinkle haze — the brand, alive but calm (idea 46). Honors
+// Reduce Motion by holding still. Cheap: three big blurred blobs on a timeline.
+struct FogAtmosphere: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    private let blobs: [(color: Color, size: CGFloat, x: CGFloat, y: CGFloat, sx: CGFloat, sy: CGFloat, period: Double)] = [
+        (Color(red: 0x7c/255, green: 0x9c/255, blue: 1.0), 520, 0.15, 0.10, 0.10, 0.06, 34),
+        (Color(red: 0x96/255, green: 0x78/255, blue: 0.94), 440, 0.85, 0.30, -0.09, -0.05, 44),
+        (Color(red: 0x46/255, green: 0x6e/255, blue: 0.86), 380, 0.55, 0.92, 0.06, -0.08, 52),
+    ]
+    var body: some View {
+        GeometryReader { geo in
+            TimelineView(.animation(minimumInterval: reduceMotion ? .infinity : 1/20)) { ctx in
+                let t = reduceMotion ? 0 : ctx.date.timeIntervalSinceReferenceDate
+                Canvas { c, size in
+                    for b in blobs {
+                        let phase = sin(t / b.period * .pi * 2)
+                        let cx = size.width * b.x + size.width * b.sx * phase
+                        let cy = size.height * b.y + size.height * b.sy * phase
+                        let rect = CGRect(x: cx - b.size/2, y: cy - b.size/2, width: b.size, height: b.size)
+                        c.fill(Circle().path(in: rect),
+                               with: .radialGradient(Gradient(colors: [b.color.opacity(0.34), .clear]),
+                                                     center: CGPoint(x: cx, y: cy), startRadius: 0, endRadius: b.size/2))
+                    }
+                }
+                .frame(width: geo.size.width, height: geo.size.height)
+                .blur(radius: 70)
+                .opacity(0.5)
+            }
+        }
+        .allowsHitTesting(false)
+    }
 }
 
 // Browse the wider Steam catalog — games you don't own yet. Mist can't buy
@@ -5249,6 +5289,55 @@ struct SettingsInfoRow: View {
     }
 }
 
+// Shows exactly which graphics backends Mist found, so how a game will render is
+// never a mystery — with a one-tap way to add what's missing (idea 42).
+struct GraphicsSettingsView: View {
+    private var provider: D3DMetalProvider? { D3DMetalProvider.detect() }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("How your games will render")
+                .font(.system(size: 12.5, weight: .medium)).foregroundColor(Fog.inkDim)
+                .padding(.bottom, 10)
+
+            row(name: "DXVK · bundled", detail: "Direct3D 10/11, self-contained",
+                on: DXVKManager.isBundled, status: "active")
+
+            row(name: provider != nil ? "D3DMetal · via \(provider!.name)" : "D3DMetal",
+                detail: "Best for Direct3D 12 titles",
+                on: provider != nil, status: provider != nil ? "detected" : nil,
+                fixURL: provider == nil ? "https://github.com/98przem/mist#compatibility" : nil,
+                fixLabel: "How to add")
+        }
+    }
+
+    @ViewBuilder
+    private func row(name: String, detail: String, on: Bool, status: String? = nil,
+                     fixURL: String? = nil, fixLabel: String = "Install") -> some View {
+        HStack(spacing: 11) {
+            ZStack {
+                Circle().fill(on ? Fog.good.opacity(0.16) : Fog.haze).frame(width: 20, height: 20)
+                if on {
+                    Image(systemName: "checkmark").font(.system(size: 9, weight: .bold)).foregroundColor(Fog.good)
+                }
+            }
+            VStack(alignment: .leading, spacing: 1) {
+                Text(name).font(.system(size: 13, weight: .semibold)).foregroundColor(Fog.ink)
+                Text(detail).font(.system(size: 11.5)).foregroundColor(Fog.inkFaint)
+            }
+            Spacer()
+            if on, let status {
+                Text(status).font(.system(size: 11, design: .monospaced)).foregroundColor(Fog.good)
+            } else if let fixURL, let url = URL(string: fixURL) {
+                Link(fixLabel, destination: url)
+                    .font(.system(size: 11, weight: .medium)).foregroundColor(Fog.accent)
+            }
+        }
+        .padding(.vertical, 9)
+        .overlay(alignment: .top) { Divider().overlay(Fog.hairline) }
+    }
+}
+
 struct UpdatesSettingsView: View {
     @ObservedObject var updater: UpdateManager
 
@@ -5784,6 +5873,10 @@ struct ContentView: View {
 
                                     SettingsCard(title: "Epic Account", systemImage: "bolt.fill", tint: .purple) {
                                         EpicStoreView(processManager: processManager)
+                                    }
+
+                                    SettingsCard(title: "Graphics", systemImage: "cpu", tint: Fog.accent) {
+                                        GraphicsSettingsView()
                                     }
 
                                     SettingsCard(title: "Updates", systemImage: "arrow.triangle.2.circlepath", tint: .green) {
