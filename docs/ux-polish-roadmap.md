@@ -2,7 +2,9 @@
 
 Working backlog for the post-Foglight polish pass. Phases ship one at a time: branch → PR → merge → tag release → tell the user, so each can be reviewed and installed via the in-app updater before the next starts.
 
-Shipped already (pre-dates this file): Phase 0 (data foundations: playtime/last-played/screenshots), Phase B (library cards/covers/badges), Phase C (game pages), Phase D (running state), the sign-out empty-state fix, and the Foglight app icon.
+Shipped already (pre-dates this file): Phase 0 (data foundations: playtime/last-played/screenshots), library cards/covers/badges, game pages, the running-state card, the sign-out empty-state fix, and the Foglight app icon. Also landed early, ahead of their numbered phase below: the Settings Graphics-detected panel (idea 42, part of Phase 6) and the ambient `FogAtmosphere` behind the library grid (idea 46, part of Phase 7) — both already live, so Phases 6/7 start partially done.
+
+**Phase 1 — shipped.** Guided Engine → Sign in → Play rail, Steam (QR) and Epic (browser) as independent tiles, skip-and-remember.
 
 ## Graphics stack — DONE, not backlog
 
