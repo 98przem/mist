@@ -2310,6 +2310,8 @@ class ProcessManager: ObservableObject {
     @Published var isRunning = false
     @Published var currentGame: Game?
     @Published var outputLog: String = ""
+    @Published var launchedAt: Date?      // when the current/last session started
+    @Published var endedAt: Date?         // when it ended (for the session summary)
 
     private var process: Process?
     private var dialogKillerTimer: Timer?
@@ -2575,6 +2577,8 @@ class ProcessManager: ObservableObject {
                             waitForWineserverAfter: Bool = false,
                             onExit: (() -> Void)? = nil) {
         isRunning = true
+        launchedAt = Date()
+        endedAt = nil
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: path)
@@ -2608,7 +2612,9 @@ class ProcessManager: ObservableObject {
                 DispatchQueue.main.async {
                     self?.outputLog += "\n[Process exited with code \(p.terminationStatus)]\n"
                     self?.isRunning = false
-                    self?.currentGame = nil
+                    self?.endedAt = Date()
+                    // currentGame is kept so the running view can show a session
+                    // summary; it's replaced on the next launch.
                     self?.dialogKillerTimer?.invalidate()
                     self?.dialogKillerTimer = nil
                     onExit?()
@@ -4986,57 +4992,128 @@ struct RunningGameView: View {
     @ObservedObject var processManager: ProcessManager
     let onDismiss: () -> Void
 
+    @State private var showLog = false
+
+    // "Launching…" for the first couple of seconds, then "Running".
+    private var isEarly: Bool {
+        guard let s = processManager.launchedAt else { return true }
+        return Date().timeIntervalSince(s) < 2.5
+    }
+
+    // Count achievements the post-session sync pushed (logged as "  ✓ NAME").
+    private var syncedCount: Int {
+        processManager.outputLog.components(separatedBy: "\n").filter { $0.hasPrefix("  ✓ ") }.count
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            // Header bar
-            HStack {
-                if processManager.isRunning {
-                    ProgressView()
-                        .controlSize(.small)
-                    Text("Running: \(processManager.currentGame?.name ?? "Game")")
-                        .font(.headline)
-                } else {
-                    Image(systemName: "checkmark.circle")
-                        .foregroundColor(.secondary)
-                    Text("Process ended")
-                        .font(.headline)
-                }
+            Spacer()
+            if processManager.isRunning { runningCard } else { endedCard }
+            Spacer()
+            logDisclosure
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Fog.bg)
+    }
 
-                Spacer()
-
-                if processManager.isRunning {
-                    Button("Stop") {
-                        processManager.stop()
-                    }
-                    .buttonStyle(.bordered)
-                    .tint(.red)
-                } else {
-                    Button("Back to Library") {
-                        onDismiss()
-                    }
-                    .buttonStyle(.borderedProminent)
+    private var runningCard: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            let elapsed = processManager.launchedAt.map { context.date.timeIntervalSince($0) } ?? 0
+            VStack(spacing: 20) {
+                ZStack {
+                    Circle().fill(Fog.good.opacity(0.14)).frame(width: 62, height: 62)
+                    Circle().fill(Fog.good).frame(width: 12, height: 12)
+                        .overlay(Circle().stroke(Fog.good, lineWidth: 2).scaleEffect(1 + (elapsed.truncatingRemainder(dividingBy: 2)) * 0.6)
+                                    .opacity(1 - (elapsed.truncatingRemainder(dividingBy: 2)) / 2))
                 }
+                VStack(spacing: 5) {
+                    Text(processManager.currentGame?.name ?? "Game")
+                        .font(Fog.display(24, weight: .medium)).foregroundColor(Fog.ink)
+                    Text(isEarly ? "Launching…" : "Running")
+                        .font(.system(size: 13)).foregroundColor(Fog.inkDim)
+                }
+                Text(timeString(elapsed))
+                    .font(.system(size: 30, weight: .light, design: .monospaced).monospacedDigit())
+                    .foregroundColor(Fog.ink)
+                if let g = processManager.currentGame { runnerChip(for: g) }
+                Button { processManager.stop() } label: {
+                    Label("Stop", systemImage: "stop.fill").frame(width: 120)
+                }
+                .buttonStyle(.bordered).tint(.red).controlSize(.large)
             }
-            .padding(12)
-            .background(.bar)
+        }
+    }
 
-            Divider()
+    private var endedCard: some View {
+        let dur = (processManager.endedAt ?? Date()).timeIntervalSince(processManager.launchedAt ?? Date())
+        return VStack(spacing: 18) {
+            ZStack {
+                Circle().fill(Fog.accentSoft).frame(width: 62, height: 62)
+                Image(systemName: "checkmark").font(.system(size: 24, weight: .semibold)).foregroundColor(Fog.accent)
+            }
+            VStack(spacing: 5) {
+                Text(processManager.currentGame?.name ?? "Session ended")
+                    .font(Fog.display(22, weight: .medium)).foregroundColor(Fog.ink)
+                Text("Played \(timeString(dur))\(syncedCount > 0 ? " · \(syncedCount) achievement\(syncedCount == 1 ? "" : "s") synced" : "")")
+                    .font(.system(size: 13)).foregroundColor(Fog.inkDim)
+            }
+            Button { onDismiss() } label: {
+                Label("Back to Library", systemImage: "chevron.left").frame(width: 150)
+            }
+            .buttonStyle(.borderedProminent).tint(Fog.accent).controlSize(.large)
+        }
+    }
 
-            // Log output
-            ScrollViewReader { proxy in
-                ScrollView {
-                    Text(processManager.outputLog.isEmpty ? "Starting..." : processManager.outputLog)
-                        .font(.system(.caption, design: .monospaced))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                        .padding(12)
-                        .id("log-bottom")
+    @ViewBuilder private func runnerChip(for game: Game) -> some View {
+        let provider = D3DMetalProvider.detect()
+        let label: String = game.source == .epic ? "Epic runtime"
+            : provider != nil ? "D3DMetal · \(provider!.name)"
+            : DXVKManager.isBundled ? "DXVK · bundled" : "Basic renderer"
+        HStack(spacing: 6) {
+            Image(systemName: "cpu").font(.system(size: 10))
+            Text(label)
+        }
+        .font(.system(size: 11.5, weight: .medium))
+        .padding(.horizontal, 10).padding(.vertical, 5)
+        .background(Fog.haze, in: Capsule())
+        .foregroundColor(Fog.inkDim)
+    }
+
+    private var logDisclosure: some View {
+        VStack(spacing: 0) {
+            Divider().overlay(Fog.hairline)
+            Button { withAnimation(.easeInOut(duration: 0.2)) { showLog.toggle() } } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.right").font(.system(size: 10, weight: .bold))
+                        .rotationEffect(.degrees(showLog ? 90 : 0))
+                    Text("Details & log").font(.system(size: 12, weight: .medium))
+                    Spacer()
                 }
-                .onChange(of: processManager.outputLog) { _ in
-                    proxy.scrollTo("log-bottom", anchor: .bottom)
+                .foregroundColor(Fog.inkFaint)
+                .padding(.horizontal, 16).padding(.vertical, 10)
+            }
+            .buttonStyle(.plain)
+            if showLog {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        Text(processManager.outputLog.isEmpty ? "Starting…" : processManager.outputLog)
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundColor(Fog.inkDim)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                            .padding(12).id("log-bottom")
+                    }
+                    .frame(height: 220)
+                    .background(Color.black.opacity(0.25))
+                    .onChange(of: processManager.outputLog) { _ in proxy.scrollTo("log-bottom", anchor: .bottom) }
                 }
             }
         }
+    }
+
+    private func timeString(_ t: TimeInterval) -> String {
+        let s = max(0, Int(t)); let h = s / 3600, m = (s % 3600) / 60, sec = s % 60
+        return h > 0 ? String(format: "%d:%02d:%02d", h, m, sec) : String(format: "%d:%02d", m, sec)
     }
 }
 
