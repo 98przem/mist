@@ -3410,6 +3410,13 @@ struct GameGridView: View {
     var focusedGameID: Game.ID? = nil
     @Binding var filter: LibraryFilter
     var availableFilters: [LibraryFilter] = LibraryFilter.allCases
+    // Whether the current source has ANY games before the chip filter is applied —
+    // so an empty grid can tell "you have games, this filter is empty" from "your
+    // library is empty (probably not signed in)". With the sign-in prompt + source
+    // label to word that case correctly.
+    var sourceHasGames: Bool = true
+    var needsSignIn: Bool = false
+    var sourceLabel: String = "your"
     // Reported up so gamepad up/down navigation (owned by ContentView, which
     // doesn't know the grid's actual rendered width) can move by a full row
     // instead of a single card. See onGridWidthChange below for how it's measured.
@@ -3568,20 +3575,42 @@ struct GameGridView: View {
     }
 
     private var emptyState: some View {
-        VStack(spacing: 14) {
+        VStack(spacing: 15) {
             ZStack {
-                Circle().fill(Fog.haze).frame(width: 84, height: 84)
-                Image(systemName: filter == .installed ? "arrow.down.circle" : "tray")
-                    .font(.system(size: 32)).foregroundColor(Fog.inkFaint)
+                // Soft accent bloom so the mark reads on the fog ground.
+                Circle().fill(Fog.accent).frame(width: 96, height: 96).blur(radius: 34).opacity(0.28)
+                Circle()
+                    .fill(LinearGradient(colors: [Fog.bgElevated, Fog.haze], startPoint: .top, endPoint: .bottom))
+                    .frame(width: 86, height: 86)
+                    .overlay(Circle().strokeBorder(Fog.hairline))
+                    .shadow(color: .black.opacity(0.35), radius: 12, y: 5)
+                Image(systemName: emptyIcon)
+                    .font(.system(size: 31, weight: .light)).foregroundColor(Fog.accent.opacity(0.85))
             }
             Text(emptyTitle).font(Fog.display(19, weight: .medium)).foregroundColor(Fog.ink)
             Text(emptySubtitle).font(.callout).foregroundColor(Fog.inkDim)
+                .multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity)
-        .padding(.top, 80)
+        .padding(.top, 90)
     }
 
+    // "Your library is empty" wins over any filter-specific copy: showing
+    // "everything's installed" / "nothing installed" when you simply aren't signed
+    // in is nonsense, so key off that first.
+    private var libraryEmpty: Bool { !sourceHasGames }
+
+    private var emptyIcon: String {
+        if libraryEmpty { return needsSignIn ? "person.crop.circle.badge.plus" : "tray" }
+        switch filter {
+        case .installed: return "arrow.down.circle"
+        case .shared: return "person.2"
+        case .notInstalled: return "checkmark.circle"
+        case .all: return "tray"
+        }
+    }
     private var emptyTitle: String {
+        if libraryEmpty { return needsSignIn ? "Sign in to see your games" : "No games in \(sourceLabel) library yet" }
         switch filter {
         case .installed: return "Nothing installed yet"
         case .shared: return "No family-shared games"
@@ -3590,11 +3619,16 @@ struct GameGridView: View {
         }
     }
     private var emptySubtitle: String {
+        if libraryEmpty {
+            return needsSignIn
+                ? "Connect \(sourceLabel) account in Settings to load your library."
+                : "Games you own will appear here."
+        }
         switch filter {
         case .installed: return "Install a game to see it here."
         case .shared: return "Games shared into your Steam Family will appear here."
         case .notInstalled: return "Nice — your whole library is downloaded."
-        case .all: return "Sign in to Steam or Epic to load your library."
+        case .all: return "No games match."
         }
     }
 }
@@ -5769,6 +5803,37 @@ struct ContentView: View {
         return games
     }
 
+    // filteredGames narrowed to just the sidebar source (no chip/search filter) —
+    // whether this is empty is what actually means "your library is empty", as
+    // opposed to "this filter/search matched nothing". Conflating the two is what
+    // produced the "everything is installed" / "nothing is installed" nonsense
+    // when signed out.
+    private var sourceGames: [Game] {
+        switch sidebarSelection {
+        case "steam": return library.games.filter { $0.source == .steam }
+        case "epic": return library.games.filter { $0.source == .epic }
+        default: return library.games
+        }
+    }
+
+    private var sourceLabel: String {
+        switch sidebarSelection {
+        case "steam": return "Steam"
+        case "epic": return "Epic"
+        default: return "your"
+        }
+    }
+
+    // Only worth prompting sign-in when the relevant account(s) for the current
+    // view actually aren't connected — not just whenever the grid is empty.
+    private var sourceNeedsSignIn: Bool {
+        switch sidebarSelection {
+        case "steam": return !steamAuth.isLoggedIn
+        case "epic": return !processManager.epicLoggedIn
+        default: return !steamAuth.isLoggedIn && !processManager.epicLoggedIn
+        }
+    }
+
     // Chips to offer for the current source: "Family Shared" only makes sense where
     // Steam games are present (Epic has no family sharing).
     private var availableFilters: [LibraryFilter] {
@@ -5936,6 +6001,9 @@ struct ContentView: View {
                                     ? displayedGames[focusedGameIndex].id : nil,
                                 filter: $libraryFilter,
                                 availableFilters: availableFilters,
+                                sourceHasGames: !sourceGames.isEmpty,
+                                needsSignIn: sourceNeedsSignIn,
+                                sourceLabel: sourceLabel,
                                 onGridWidthChange: { width in
                                     // Matches SwiftUI's .adaptive(minimum:maximum:) column
                                     // count: as many 160pt (+14pt spacing) columns as fit.
