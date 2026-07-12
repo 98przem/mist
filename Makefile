@@ -6,7 +6,7 @@
 # from the git tag (see .github/workflows/release.yml) so releases get a clean
 # number; this default only labels local dev builds, hence the "-preview" suffix.
 # Bump it to the next target release when starting work toward one.
-VERSION ?= 0.5.0-preview
+VERSION ?= 0.6.0-preview
 
 PREFIX ?= $(HOME)/Library/Application Support/Mist
 CEF_DIR = $(PREFIX)/drive_c/Program Files (x86)/Steam/bin/cef/cef.win64

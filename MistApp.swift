@@ -4,6 +4,7 @@ import Foundation
 import CryptoKit
 import CoreImage.CIFilterBuiltins
 import GameController
+import UniformTypeIdentifiers
 
 // MARK: - Foglight design tokens
 //
@@ -23,6 +24,7 @@ enum Fog {
     static let inkFaint = Color(red: 0x5b/255, green: 0x62/255, blue: 0x74/255)
     static let steam = Color(red: 0x6f/255, green: 0x9b/255, blue: 1.0)
     static let epic = Color(red: 0xb9/255, green: 0x8a/255, blue: 0xf0/255)
+    static let custom = Color(red: 0x9a/255, green: 0xa4/255, blue: 0xb2/255)  // steel — a custom app isn't from a storefront
     static let good = Color(red: 0x6b/255, green: 0xcf/255, blue: 0x9a/255)
     static let warn = Color(red: 0xe6/255, green: 0xb3/255, blue: 0x58/255)
     static let display = Font.system(.title3, design: .serif)
@@ -36,6 +38,7 @@ enum Fog {
 enum GameSource: String, Codable {
     case steam = "Steam"
     case epic = "Epic"
+    case custom = "My Apps"   // a .exe the user pointed Mist at directly — not from a store
 }
 
 enum AntiCheatStatus: String {
@@ -60,6 +63,7 @@ struct Game: Identifiable, Hashable {
     var playtimeMinutes: Int = 0     // total, from IPlayerService (0 if unknown)
     var lastPlayed: Date? = nil      // last time this account launched it
     var addedAt: Date? = nil         // when it first appeared in Mist's library (for the "New" ribbon)
+    var customExePath: String? = nil // source == .custom: the exact .exe to launch (installDir is just its parent folder)
 
     var sizeFormatted: String {
         if sizeBytes > 1_073_741_824 {
@@ -541,12 +545,32 @@ class GameLibrary: ObservableObject {
                 detectAntiCheat(game: &found[i])
             }
 
+            // Custom apps: local JSON, no network/anti-cheat detection needed.
+            found.append(contentsOf: CustomAppsManifest.asGames(supportDir: supportDir))
+
             DispatchQueue.main.async {
                 self.scannedGames = found
                 self.recomputeGames()
                 self.isScanning = false
             }
         }
+    }
+
+    // MARK: - Custom apps (Phase 2: install/point-at any .exe)
+
+    func addCustomApp(name: String, exePath: String) {
+        CustomAppsManifest.add(name: name, exePath: exePath, supportDir: supportDir)
+        scan()
+    }
+
+    func removeCustomApp(id: String) {
+        CustomAppsManifest.remove(id: id, supportDir: supportDir)
+        scan()
+    }
+
+    func relocateCustomApp(id: String, newExePath: String) {
+        CustomAppsManifest.relocate(id: id, newExePath: newExePath, supportDir: supportDir)
+        scan()
     }
 
     private func recomputeGames() {
@@ -1845,6 +1869,90 @@ enum MistManifest {
     }
 }
 
+// A .exe the user pointed Mist at directly — software Mist didn't install and
+// doesn't own. exePath is a real macOS path (never copied into the Wine prefix;
+// Wine addresses host paths directly, so nothing gets duplicated).
+struct CustomApp: Codable, Identifiable, Equatable {
+    let id: String          // UUID string, stable across renames/moves
+    var name: String
+    var exePath: String
+    var addedAt: Double     // unix seconds
+    var lastPlayed: Double = 0
+}
+
+// Separate from MistManifest (which is Steam/depot-specific) since custom apps
+// aren't tied to a Steam appid or any store at all.
+enum CustomAppsManifest {
+    static func fileURL(supportDir: URL) -> URL {
+        supportDir.appendingPathComponent("custom_apps.json")
+    }
+
+    static func load(supportDir: URL) -> [CustomApp] {
+        guard let data = try? Data(contentsOf: fileURL(supportDir: supportDir)),
+              let list = try? JSONDecoder().decode([CustomApp].self, from: data) else { return [] }
+        return list
+    }
+
+    private static func save(_ list: [CustomApp], supportDir: URL) {
+        guard let data = try? JSONEncoder().encode(list) else { return }
+        try? FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
+        try? data.write(to: fileURL(supportDir: supportDir))
+    }
+
+    // Adding the same exe path twice updates the existing entry (keeps its id,
+    // playtime, etc.) instead of creating a duplicate — the user re-picking a file
+    // they already added shouldn't split it into two cards.
+    @discardableResult
+    static func add(name: String, exePath: String, supportDir: URL) -> [CustomApp] {
+        var list = load(supportDir: supportDir)
+        if let idx = list.firstIndex(where: { $0.exePath == exePath }) {
+            list[idx].name = name
+        } else {
+            list.append(CustomApp(id: UUID().uuidString, name: name, exePath: exePath,
+                                  addedAt: Date().timeIntervalSince1970))
+        }
+        save(list, supportDir: supportDir)
+        return list
+    }
+
+    @discardableResult
+    static func remove(id: String, supportDir: URL) -> [CustomApp] {
+        var list = load(supportDir: supportDir)
+        list.removeAll { $0.id == id }
+        save(list, supportDir: supportDir)
+        return list
+    }
+
+    // Re-point an entry at a new file location after the original moved/was
+    // deleted ("Locate…" in the UI) — keeps the same id and history.
+    @discardableResult
+    static func relocate(id: String, newExePath: String, supportDir: URL) -> [CustomApp] {
+        var list = load(supportDir: supportDir)
+        if let idx = list.firstIndex(where: { $0.id == id }) { list[idx].exePath = newExePath }
+        save(list, supportDir: supportDir)
+        return list
+    }
+
+    static func recordLastPlayed(id: String, supportDir: URL) {
+        var list = load(supportDir: supportDir)
+        if let idx = list.firstIndex(where: { $0.id == id }) { list[idx].lastPlayed = Date().timeIntervalSince1970 }
+        save(list, supportDir: supportDir)
+    }
+
+    static func asGames(supportDir: URL) -> [Game] {
+        let fm = FileManager.default
+        return load(supportDir: supportDir).map { app in
+            let exists = fm.fileExists(atPath: app.exePath)
+            return Game(id: app.id, name: app.name, source: .custom,
+                       installDir: URL(fileURLWithPath: app.exePath).deletingLastPathComponent().path,
+                       sizeBytes: 0, isInstalled: exists,
+                       lastPlayed: app.lastPlayed > 0 ? Date(timeIntervalSince1970: app.lastPlayed) : nil,
+                       addedAt: Date(timeIntervalSince1970: app.addedAt),
+                       customExePath: app.exePath)
+        }
+    }
+}
+
 struct WorkshopItem: Identifiable {
     let id: String  // pubfile ID (the folder name DepotDownloader creates)
     let sizeBytes: Int64
@@ -2352,11 +2460,12 @@ class ProcessManager: ObservableObject {
         outputLog = "Launching \(game.name) [\(mode.rawValue)]...\n"
 
         switch game.source {
-        case .steam:
-            // Steam games always run their .exe directly under Wine — Mist never runs
-            // the actual Steam client under Wine (login and downloads are both native;
-            // see SteamAuthManager / SteamDownloadManager), so "normal" and "no EAC"
-            // are the same thing for Steam games.
+        case .steam, .custom:
+            // Steam games (and custom apps) always run their .exe directly under
+            // Wine — Mist never runs the actual Steam client under Wine (login and
+            // downloads are both native; see SteamAuthManager / SteamDownloadManager),
+            // so "normal" and "no EAC" are the same thing here. Custom apps have no
+            // anti-cheat/legendary concept either, so they follow the same path.
             switch mode {
             case .gptk:
                 launchGameGPTK(game)
@@ -2399,10 +2508,21 @@ class ProcessManager: ObservableObject {
     // Offline/singleplayer: run the game's main exe directly under the bundled Wine
     // with the null EOS anti-cheat client (no anti-cheat — offline only).
     private func launchGameDirect(_ game: Game) {
-        guard FileManager.default.fileExists(atPath: game.installDir),
-              let exe = findMainExe(in: game.installDir) else {
-            outputLog += "ERROR: couldn't find the game's executable in \(game.installDir)\n"
-            return
+        let exe: String
+        if game.source == .custom {
+            guard let customExe = game.customExePath, FileManager.default.fileExists(atPath: customExe) else {
+                outputLog += "ERROR: \(game.name)'s app is missing — it may have been moved or deleted. Use \"Locate…\" to point Mist at it again.\n"
+                return
+            }
+            exe = customExe
+            CustomAppsManifest.recordLastPlayed(id: game.id, supportDir: MistEnv.supportDir)
+        } else {
+            guard FileManager.default.fileExists(atPath: game.installDir),
+                  let found = findMainExe(in: game.installDir) else {
+                outputLog += "ERROR: couldn't find the game's executable in \(game.installDir)\n"
+                return
+            }
+            exe = found
         }
         outputLog += "Exe: \(exe)\n\n"
         var env = MistEnv.baseEnvironment()
@@ -2920,6 +3040,7 @@ struct GameCardView: View {
     var onLaunchOptions: () -> Void = {}
     var onInstallWorkshopItem: () -> Void = {}
     var onSelect: () -> Void = {}
+    var onLocate: () -> Void = {}   // .custom source, file missing: re-point at a new location
     var isFocused: Bool = false
 
     @State private var isHovering = false
@@ -2956,6 +3077,18 @@ struct GameCardView: View {
                     primaryActionButton
                     overflowMenu
                 }
+            } else if game.source == .custom {
+                // Not "not installed" — the file Mist was pointed at is missing
+                // (moved/deleted). "Install" makes no sense here; re-point instead.
+                Button(action: onLocate) {
+                    HStack {
+                        Image(systemName: "questionmark.folder")
+                        Text("Locate…")
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .tint(Fog.custom)
             } else {
                 Button(action: onInstall) {
                     HStack {
@@ -2999,7 +3132,7 @@ struct GameCardView: View {
                 }
                 Divider()
                 Button(role: .destructive, action: onUninstall) {
-                    Label("Uninstall", systemImage: "trash")
+                    Label(game.source == .custom ? "Remove from Mist" : "Uninstall", systemImage: "trash")
                 }
             }
         }
@@ -3105,7 +3238,9 @@ struct GameCardView: View {
                 Button(action: onInstallWorkshopItem) { Label("Install Workshop Item…", systemImage: "shippingbox") }
             }
             Divider()
-            Button(role: .destructive, action: onUninstall) { Label("Uninstall", systemImage: "trash") }
+            Button(role: .destructive, action: onUninstall) {
+                Label(game.source == .custom ? "Remove from Mist" : "Uninstall", systemImage: "trash")
+            }
         } label: {
             Image(systemName: "ellipsis").frame(width: 8)
         }
@@ -3565,6 +3700,7 @@ struct SidebarView: View {
     @Binding var selection: String?
     let steamCount: Int
     let epicCount: Int
+    let customCount: Int
     let epicLoggedIn: Bool
     let steamLoggedIn: Bool
     var focusedRow: String? = nil
@@ -3606,6 +3742,9 @@ struct SidebarView: View {
                 SidebarRow(title: "Epic", systemImage: "bolt.fill", tint: Fog.epic, count: epicCount,
                           needsAttention: !epicLoggedIn, isSelected: selection == "epic",
                           action: { selection = "epic" }, isFocused: focusedRow == "epic")
+                SidebarRow(title: "My Apps", systemImage: "app.badge.checkmark", tint: Fog.custom, count: customCount,
+                          isSelected: selection == "custom", action: { selection = "custom" },
+                          isFocused: focusedRow == "custom")
             }
             .padding(.horizontal, 8)
 
@@ -3665,6 +3804,7 @@ struct GameGridView: View {
     var onLaunchOptions: (Game) -> Void = { _ in }
     var onInstallWorkshopItem: (Game) -> Void = { _ in }
     var onSelect: (Game) -> Void = { _ in }
+    var onLocate: (Game) -> Void = { _ in }
     var focusedGameID: Game.ID? = nil
     @Binding var filter: LibraryFilter
     var availableFilters: [LibraryFilter] = LibraryFilter.allCases
@@ -3675,6 +3815,8 @@ struct GameGridView: View {
     var sourceHasGames: Bool = true
     var needsSignIn: Bool = false
     var sourceLabel: String = "your"
+    var isCustomSource: Bool = false   // "My Apps" — no account, empty state offers Add instead of sign-in
+    var onAddCustomApp: () -> Void = {}
     // Reported up so gamepad up/down navigation (owned by ContentView, which
     // doesn't know the grid's actual rendered width) can move by a full row
     // instead of a single card. See onGridWidthChange below for how it's measured.
@@ -3794,6 +3936,13 @@ struct GameGridView: View {
                 .buttonStyle(.plain)
             }
             Spacer()
+            if isCustomSource {
+                Button(action: onAddCustomApp) {
+                    Label("Add App…", systemImage: "plus")
+                        .font(.system(size: 12, weight: .medium))
+                }
+                .buttonStyle(.bordered).tint(Fog.custom)
+            }
         }
     }
 
@@ -3823,6 +3972,7 @@ struct GameGridView: View {
                         onLaunchOptions: { onLaunchOptions(g) },
                         onInstallWorkshopItem: { onInstallWorkshopItem(g) },
                         onSelect: { onSelect(g) },
+                        onLocate: { onLocate(g) },
                         isFocused: focusedGameID == g.id
                     )
                     .id(g.id)
@@ -3848,6 +3998,13 @@ struct GameGridView: View {
             Text(emptyTitle).font(Fog.display(19, weight: .medium)).foregroundColor(Fog.ink)
             Text(emptySubtitle).font(.callout).foregroundColor(Fog.inkDim)
                 .multilineTextAlignment(.center)
+            if isCustomSource && libraryEmpty {
+                Button(action: onAddCustomApp) {
+                    Label("Add App…", systemImage: "plus")
+                }
+                .buttonStyle(.borderedProminent).tint(Fog.custom).controlSize(.large)
+                .padding(.top, 4)
+            }
         }
         .frame(maxWidth: .infinity)
         .padding(.top, 90)
@@ -3859,6 +4016,7 @@ struct GameGridView: View {
     private var libraryEmpty: Bool { !sourceHasGames }
 
     private var emptyIcon: String {
+        if isCustomSource && libraryEmpty { return "app.badge.checkmark" }
         if libraryEmpty { return needsSignIn ? "person.crop.circle.badge.plus" : "tray" }
         switch filter {
         case .installed: return "arrow.down.circle"
@@ -3868,6 +4026,7 @@ struct GameGridView: View {
         }
     }
     private var emptyTitle: String {
+        if isCustomSource && libraryEmpty { return "No apps added yet" }
         if libraryEmpty { return needsSignIn ? "Sign in to see your games" : "No games in \(sourceLabel) library yet" }
         switch filter {
         case .installed: return "Nothing installed yet"
@@ -3877,6 +4036,7 @@ struct GameGridView: View {
         }
     }
     private var emptySubtitle: String {
+        if isCustomSource && libraryEmpty { return "Point Mist at any .exe to add it to your library." }
         if libraryEmpty {
             return needsSignIn
                 ? "Connect \(sourceLabel) account in Settings to load your library."
@@ -4159,6 +4319,7 @@ struct GameDetailView: View {
     var onInstallWorkshopItem: () -> Void = {}
     var onInstallWorkshopID: (String) -> Void = { _ in }
     var onOpenSettings: () -> Void = {}
+    var onLocate: () -> Void = {}
 
     @Environment(\.dismiss) private var dismiss
     @State private var details: SteamAppDetails?
@@ -4393,9 +4554,15 @@ struct GameDetailView: View {
                 .fixedSize()
 
                 Spacer()
-                Button("Uninstall", role: .destructive, action: onUninstall)
+                Button(game.source == .custom ? "Remove from Mist" : "Uninstall", role: .destructive, action: onUninstall)
                     .buttonStyle(.bordered)
             }
+        } else if game.source == .custom {
+            Button(action: onLocate) {
+                Label("Locate…", systemImage: "questionmark.folder")
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(Fog.custom)
         } else {
             Button(action: onInstall) {
                 Label("Install", systemImage: "arrow.down.circle.fill")
@@ -4574,13 +4741,15 @@ struct GameDetailView: View {
     }
 
     private func loadAll() async {
+        // Custom apps have no Steam app-page or Workshop to fetch.
+        guard game.source == .steam else { return }
         workshopItems = MistWorkshop.installedItems(appid: game.id, steamAppsDir: steamAppsDir)
 
         if let d = try? await SteamLibraryService.fetchAppDetails(appid: game.id) {
             details = d
         }
 
-        guard game.source == .steam, steamAuth.isLoggedIn else { return }
+        guard steamAuth.isLoggedIn else { return }
         isLoadingAchievements = true
         do {
             var list = try await SteamLibraryService.fetchAchievements(
@@ -5266,6 +5435,130 @@ struct QuickInstallButton: View {
     }
 }
 
+// Tuples aren't Identifiable (needed for .sheet(item:)) — this just wraps one.
+struct PendingCustomAppPick: Identifiable {
+    let id = UUID()
+    let exePath: String
+    let suggestedName: String
+    let relocatingID: String?
+    init(_ t: (exePath: String, suggestedName: String, relocatingID: String?)) {
+        exePath = t.exePath; suggestedName = t.suggestedName; relocatingID = t.relocatingID
+    }
+}
+
+// Every flow that mutates the library from outside the grid/detail views —
+// the Uninstall/Remove confirmation alert, plus the confirm-name step after
+// picking a .exe (for either adding a new custom app or relocating one whose
+// file moved) — isolated into one ViewModifier. Folding this much
+// Binding(get:set:)/switch logic directly into ContentView.body pushed
+// SwiftUI's type-checker over its time limit ("unable to type-check this
+// expression in reasonable time"); as a single struct it type-checks fine.
+struct LibraryMutationModifiers: ViewModifier {
+    @Binding var pendingUninstall: Game?
+    @Binding var showingAddCustomApp: Bool
+    @Binding var relocatingCustomAppID: String?
+    @Binding var pendingCustomAppPick: (exePath: String, suggestedName: String, relocatingID: String?)?
+    var onUninstallSteam: (Game) -> Void
+    var onUninstallEpic: (Game) -> Void
+    var onRemoveCustom: (Game) -> Void
+    var onAddCustomApp: (String, String) -> Void       // (name, exePath)
+    var onRelocateCustomApp: (String, String) -> Void  // (id, newExePath)
+
+    func body(content: Content) -> some View {
+        content
+            .alert(pendingUninstall?.source == .custom
+                   ? "Remove \(pendingUninstall?.name ?? "") from Mist?"
+                   : "Uninstall \(pendingUninstall?.name ?? "")?",
+                   isPresented: Binding(
+                get: { pendingUninstall != nil },
+                set: { if !$0 { pendingUninstall = nil } }
+            )) {
+                Button(pendingUninstall?.source == .custom ? "Remove" : "Uninstall", role: .destructive) {
+                    guard let game = pendingUninstall else { return }
+                    switch game.source {
+                    case .steam: onUninstallSteam(game)
+                    case .epic: onUninstallEpic(game)
+                    case .custom: onRemoveCustom(game)
+                    }
+                    pendingUninstall = nil
+                }
+                Button("Cancel", role: .cancel) { pendingUninstall = nil }
+            } message: {
+                Text(pendingUninstall?.source == .custom
+                     ? "Mist will forget this app. Its file on disk is never touched."
+                     : "This deletes the game's installed files from disk. You can reinstall it later.")
+            }
+            .fileImporter(isPresented: $showingAddCustomApp,
+                          allowedContentTypes: [UTType(filenameExtension: "exe") ?? .item]) { result in
+                guard let url = try? result.get() else { return }
+                let name = url.deletingPathExtension().lastPathComponent
+                pendingCustomAppPick = (exePath: url.path, suggestedName: name, relocatingID: nil)
+            }
+            .fileImporter(isPresented: Binding(
+                get: { relocatingCustomAppID != nil },
+                set: { if !$0 { relocatingCustomAppID = nil } }
+            ), allowedContentTypes: [UTType(filenameExtension: "exe") ?? .item]) { result in
+                guard let url = try? result.get(), let id = relocatingCustomAppID else { return }
+                let name = url.deletingPathExtension().lastPathComponent
+                pendingCustomAppPick = (exePath: url.path, suggestedName: name, relocatingID: id)
+                relocatingCustomAppID = nil
+            }
+            .sheet(item: Binding(
+                get: { pendingCustomAppPick.map { PendingCustomAppPick($0) } },
+                set: { if $0 == nil { pendingCustomAppPick = nil } }
+            )) { pick in
+                AddCustomAppView(suggestedName: pick.suggestedName) { finalName in
+                    if let rid = pick.relocatingID { onRelocateCustomApp(rid, pick.exePath) }
+                    else { onAddCustomApp(finalName, pick.exePath) }
+                    pendingCustomAppPick = nil
+                } onCancel: {
+                    pendingCustomAppPick = nil
+                }
+            }
+    }
+}
+
+struct AddCustomAppView: View {
+    let suggestedName: String
+    var onSave: (String) -> Void
+    var onCancel: () -> Void
+    @State private var name: String
+    @Environment(\.dismiss) private var dismiss
+
+    init(suggestedName: String, onSave: @escaping (String) -> Void, onCancel: @escaping () -> Void) {
+        self.suggestedName = suggestedName
+        self.onSave = onSave
+        self.onCancel = onCancel
+        _name = State(initialValue: suggestedName)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 10) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 9, style: .continuous).fill(Fog.custom.opacity(0.18))
+                        .frame(width: 34, height: 34)
+                    Image(systemName: "app.badge.checkmark").foregroundColor(Fog.custom)
+                }
+                Text("Add to Mist").font(Fog.display(17, weight: .medium)).foregroundColor(Fog.ink)
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Name").font(.caption).foregroundColor(Fog.inkFaint)
+                TextField("App name", text: $name).textFieldStyle(.roundedBorder)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel") { onCancel(); dismiss() }.buttonStyle(.bordered)
+                Button("Add") { onSave(name.isEmpty ? suggestedName : name); dismiss() }
+                    .buttonStyle(.borderedProminent).tint(Fog.custom)
+                    .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+        .padding(22)
+        .frame(width: 340)
+    }
+}
+
 struct LaunchOptionsView: View {
     let game: Game
     let onShowInFinder: () -> Void
@@ -5694,7 +5987,7 @@ struct UpdatesSettingsView: View {
     }
 }
 
-let sidebarNavOrder = ["all", "steam", "epic", "epicfree", "store", "settings"]
+let sidebarNavOrder = ["all", "steam", "epic", "custom", "epicfree", "store", "settings"]
 
 // MARK: - Gamepad navigation
 //
@@ -5954,6 +6247,11 @@ struct ContentView: View {
     @State private var gameForLaunchOptions: Game?
     @State private var gameForWorkshopInstall: Game?
     @State private var gameForDetail: Game?
+    @State private var showingAddCustomApp = false
+    @State private var relocatingCustomAppID: String?   // non-nil while a "Locate…" file pick is in flight
+    // A file was just picked (either adding new or relocating) — opens the naming
+    // confirmation sheet. relocatingID nil = adding a new entry.
+    @State private var pendingCustomAppPick: (exePath: String, suggestedName: String, relocatingID: String?)?
     @State private var focusedGameIndex = 0
     @State private var libraryFilter: LibraryFilter = .all
     @State private var gridColumns = 1
@@ -6049,6 +6347,7 @@ struct ContentView: View {
         switch sidebarSelection {
         case "steam": games = games.filter { $0.source == .steam }
         case "epic": games = games.filter { $0.source == .epic }
+        case "custom": games = games.filter { $0.source == .custom }
         default: break
         }
 
@@ -6077,6 +6376,7 @@ struct ContentView: View {
         switch sidebarSelection {
         case "steam": return library.games.filter { $0.source == .steam }
         case "epic": return library.games.filter { $0.source == .epic }
+        case "custom": return library.games.filter { $0.source == .custom }
         default: return library.games
         }
     }
@@ -6085,25 +6385,28 @@ struct ContentView: View {
         switch sidebarSelection {
         case "steam": return "Steam"
         case "epic": return "Epic"
+        case "custom": return "My Apps"
         default: return "your"
         }
     }
 
     // Only worth prompting sign-in when the relevant account(s) for the current
-    // view actually aren't connected — not just whenever the grid is empty.
+    // view actually aren't connected — not just whenever the grid is empty. Custom
+    // apps have no account at all, so they're never gated on sign-in.
     private var sourceNeedsSignIn: Bool {
         switch sidebarSelection {
         case "steam": return !steamAuth.isLoggedIn
         case "epic": return !processManager.epicLoggedIn
+        case "custom": return false
         default: return !steamAuth.isLoggedIn && !processManager.epicLoggedIn
         }
     }
 
     // Chips to offer for the current source: "Family Shared" only makes sense where
-    // Steam games are present (Epic has no family sharing).
+    // Steam games are present (Epic and custom apps have no family sharing).
     private var availableFilters: [LibraryFilter] {
         let hasShared = library.games.contains { $0.isFamilyShared &&
-            (sidebarSelection != "epic") }
+            (sidebarSelection != "epic" && sidebarSelection != "custom") }
         return LibraryFilter.allCases.filter { $0 != .shared || hasShared }
     }
 
@@ -6146,7 +6449,12 @@ struct ContentView: View {
         }
     }
 
-    var body: some View {
+    // Split out from `body` below: this is the pre-existing view tree (setup gate,
+    // NavigationSplitView, running-state overlay) that already compiled fine on its
+    // own. Adding the library-mutation modifiers directly onto this chain pushed
+    // SwiftUI's type-checker over its time limit, so `body` now applies them on top
+    // of this separately-type-checked piece instead.
+    private var mainContent: some View {
         Group {
             if setup.isWorking || !setup.isComplete
                 || (!onboardingDismissed && !steamAuth.isLoggedIn && !processManager.epicLoggedIn) {
@@ -6160,6 +6468,7 @@ struct ContentView: View {
                         selection: $sidebarSelection,
                         steamCount: library.games.filter { $0.source == .steam }.count,
                         epicCount: library.games.filter { $0.source == .epic }.count,
+                        customCount: library.games.filter { $0.source == .custom }.count,
                         epicLoggedIn: processManager.epicLoggedIn,
                         steamLoggedIn: steamAuth.isLoggedIn
                     )
@@ -6266,6 +6575,7 @@ struct ContentView: View {
                                 onLaunchOptions: { game in gameForLaunchOptions = game },
                                 onInstallWorkshopItem: { game in gameForWorkshopInstall = game },
                                 onSelect: { game in gameForDetail = game },
+                                onLocate: { game in relocatingCustomAppID = game.id },
                                 focusedGameID: (gamepad.isConnected && displayedGames.indices.contains(focusedGameIndex))
                                     ? displayedGames[focusedGameIndex].id : nil,
                                 filter: $libraryFilter,
@@ -6273,6 +6583,8 @@ struct ContentView: View {
                                 sourceHasGames: !sourceGames.isEmpty,
                                 needsSignIn: sourceNeedsSignIn,
                                 sourceLabel: sourceLabel,
+                                isCustomSource: sidebarSelection == "custom",
+                                onAddCustomApp: { showingAddCustomApp = true },
                                 onGridWidthChange: { width in
                                     // Matches SwiftUI's .adaptive(minimum:maximum:) column
                                     // count: as many 160pt (+14pt spacing) columns as fit.
@@ -6389,23 +6701,25 @@ struct ContentView: View {
         .onChange(of: steamAuth.isLoggedIn) { _ in
             refreshOwnedSteamGames()
         }
-        .alert("Uninstall \(pendingUninstall?.name ?? "")?", isPresented: Binding(
-            get: { pendingUninstall != nil },
-            set: { if !$0 { pendingUninstall = nil } }
-        )) {
-            Button("Uninstall", role: .destructive) {
-                guard let game = pendingUninstall else { return }
-                if game.source == .steam {
-                    library.uninstallSteamGame(game)
-                } else {
-                    processManager.epicUninstall(appName: game.id)
-                }
-                pendingUninstall = nil
-            }
-            Button("Cancel", role: .cancel) { pendingUninstall = nil }
-        } message: {
-            Text("This deletes the game's installed files from disk. You can reinstall it later.")
-        }
+    }
+
+    var body: some View {
+        mainContent
+        // Uninstall/Remove confirmation + Add App/Locate… pulled into their own
+        // ViewModifier — folding this much Binding(get:set:)/switch logic directly
+        // into this already-large body pushed SwiftUI's type-checker over its time
+        // limit ("unable to type-check in reasonable time").
+        .modifier(LibraryMutationModifiers(
+            pendingUninstall: $pendingUninstall,
+            showingAddCustomApp: $showingAddCustomApp,
+            relocatingCustomAppID: $relocatingCustomAppID,
+            pendingCustomAppPick: $pendingCustomAppPick,
+            onUninstallSteam: { library.uninstallSteamGame($0) },
+            onUninstallEpic: { processManager.epicUninstall(appName: $0.id) },
+            onRemoveCustom: { library.removeCustomApp(id: $0.id) },
+            onAddCustomApp: { name, path in library.addCustomApp(name: name, exePath: path) },
+            onRelocateCustomApp: { id, path in library.relocateCustomApp(id: id, newExePath: path) }
+        ))
         .sheet(item: $gameForLaunchOptions) { game in
             LaunchOptionsView(game: game, onShowInFinder: {
                 NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: game.installDir)])
@@ -6440,7 +6754,8 @@ struct ContentView: View {
                 onOpenSettings: {
                     gameForDetail = nil
                     sidebarSelection = "settings"
-                }
+                },
+                onLocate: { relocatingCustomAppID = game.id }
             )
         }
         .focusedSceneValue(\.rescanAction, { library.scan() })

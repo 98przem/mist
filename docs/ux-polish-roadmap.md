@@ -6,6 +6,8 @@ Shipped already (pre-dates this file): Phase 0 (data foundations: playtime/last-
 
 **Phase 1 — shipped.** Guided Engine → Sign in → Play rail, Steam (QR) and Epic (browser) as independent tiles, skip-and-remember.
 
+**Phase 2 — shipped.** Custom apps: "My Apps" sidebar row, Add/Locate via native file picker, non-destructive "Remove from Mist", broken-file state, dedup, no achievements section on custom entries.
+
 ## Graphics stack — DONE, not backlog
 
 Both arms are implemented and verified (see memory `mist-graphics-stack`): D3DMetal via GPTK/CrossOver when present, bundled DXVK-macOS otherwise. No phase needed. Only optional follow-up: spot-test the bundled DXVK path on a couple more games beyond Easy Delivery Co, opportunistically, not as scheduled work.
@@ -29,7 +31,7 @@ Guided **Engine → Accounts → Play** flow with a progress rail, resume-where-
 - One-login explainer (what one Steam scan actually powers: library, downloads, achievements).
 - Honest engine-download progress + a plain-language line on what's downloading.
 
-## Phase 2 — Custom apps (new)
+## Phase 2 — Custom apps (new) — shipped
 
 Let the user add any `.exe` as a library entry — Wine-launchable software Mist didn't install and doesn't own.
 
