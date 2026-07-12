@@ -15,6 +15,10 @@ Both arms are implemented and verified (see memory `mist-graphics-stack`): D3DMe
 1. **Epic sign-in doesn't work out of the box.** `LegendaryLocator` only *searches* a fixed list of paths (Homebrew, pip user-installs, etc.) for a `legendary` binary already on the system — Mist never bundles or auto-downloads it, unlike DepotDownloader/AchievementRelay/gbe_fork, which all fetch themselves via `tools/build-tools.sh`. Real fix: bundle `legendary` the same way (it publishes prebuilt single-file macOS binaries on GitHub releases) so Epic sign-in works with zero manual setup, consistent with the rest of the app's self-contained design. Until fixed, the onboarding Epic tile correctly reports "legendary isn't installed" rather than failing silently — that part is working as intended.
 2. **The Steam QR code doesn't refresh when it expires.** `SteamAuthManager.pollUntilConfirmed` throws `"QR code expired. Try again."` once the challenge's server-side TTL passes, but nothing catches that and calls `startQRLogin()` again — the UI is left showing a dead QR that Steam's mobile app then rejects ("failed to load QR info"), with no visible error or auto-recovery. Real fix: on expiry, either auto-restart the QR challenge (preferred — matches how Steam's own QR login UIs behave) or at minimum show a "Code expired — tap to refresh" state instead of a QR that silently stopped working.
 
+## Small UX asks for later (not bugs, filed 2026-07-13)
+
+3. **A "My Library" (or similar) filter chip**, sitting between "Not Installed" and "Family Shared" in the library filter bar. Right now there's no way to see just what you actually own, excluding Family-shared titles — "All" mixes both, and "Family Shared" only isolates the borrowed side. Add the inverse chip so both halves of the library are independently filterable.
+
 ---
 
 ## Phase 1 — First run (corrected)
