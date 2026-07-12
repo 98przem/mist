@@ -3773,54 +3773,74 @@ struct GameDetailView: View {
     private var detailContent: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
-                banner
+                hero
                 VStack(alignment: .leading, spacing: 18) {
-                    header
+                    metaStrip
                     if let desc = details?.short_description, !desc.isEmpty {
                         Text(desc)
                             .font(.callout)
-                            .foregroundColor(.secondary)
+                            .foregroundColor(Fog.inkDim)
                             .fixedSize(horizontal: false, vertical: true)
                     }
-                    if let genres = details?.genres, !genres.isEmpty {
-                        tagRow(genres.map(\.description))
+                    if !(details?.genreNames ?? []).isEmpty {
+                        tagRow(details!.genreNames)
                     }
                     actionRow
-                    Divider()
+                    Divider().overlay(Fog.hairline)
                     if game.source == .steam {
                         achievementsSection
-                        Divider()
+                        if !(details?.screenshotURLs ?? []).isEmpty {
+                            Divider().overlay(Fog.hairline)
+                            screenshotStrip
+                        }
+                        Divider().overlay(Fog.hairline)
                         workshopSection
                     }
                 }
                 .padding(20)
             }
         }
+        .background(Fog.bg)
     }
 
-    private var banner: some View {
-        AsyncImage(url: URL(string: SteamLibraryService.heroURL(forAppID: game.id))) { phase in
-            switch phase {
-            case .success(let image):
-                image.resizable().scaledToFill()
-            default:
-                LinearGradient(colors: [(game.source == .steam ? Color.blue : .purple).opacity(0.35), .clear],
-                              startPoint: .top, endPoint: .bottom)
+    // Full-bleed hero: the game's own artwork, blurred + scrimmed, serif title over it.
+    private var hero: some View {
+        ZStack(alignment: .bottomLeading) {
+            AsyncImage(url: URL(string: SteamLibraryService.heroURL(forAppID: game.id))) { phase in
+                switch phase {
+                case .success(let image):
+                    image.resizable().scaledToFill()
+                default:
+                    LinearGradient(colors: [Fog.haze, Fog.bg], startPoint: .top, endPoint: .bottom)
+                }
             }
+            .frame(height: 210)
+            .frame(maxWidth: .infinity)
+            .clipped()
+            .overlay(
+                LinearGradient(colors: [.clear, .clear, Fog.bg.opacity(0.65), Fog.bg],
+                               startPoint: .top, endPoint: .bottom)
+            )
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(game.name)
+                    .font(Fog.display(28, weight: .semibold))
+                    .foregroundColor(.white)
+                    .shadow(color: .black.opacity(0.5), radius: 8, y: 2)
+                    .lineLimit(2)
+                subtitleLine
+            }
+            .padding(20)
         }
-        .frame(height: 200)
-        .frame(maxWidth: .infinity)
+        .frame(height: 210)
         .clipped()
-        .overlay(LinearGradient(colors: [.clear, .black.opacity(0.5)], startPoint: .top, endPoint: .bottom))
         .overlay(alignment: .topTrailing) {
-            Button {
-                dismiss()
-            } label: {
+            Button { dismiss() } label: {
                 Image(systemName: "xmark")
                     .font(.system(size: 12, weight: .bold))
                     .foregroundColor(.white)
                     .padding(8)
-                    .background(.black.opacity(0.5), in: Circle())
+                    .background(.black.opacity(0.45), in: Circle())
             }
             .buttonStyle(.plain)
             .keyboardShortcut(.cancelAction)
@@ -3828,26 +3848,82 @@ struct GameDetailView: View {
         }
     }
 
-    private var header: some View {
-        HStack(alignment: .top) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(game.name)
-                    .font(.system(size: 22, weight: .bold))
+    private var subtitleLine: some View {
+        HStack(spacing: 6) {
+            Image(systemName: game.source == .steam ? "cloud.fill" : "bolt.fill").font(.system(size: 10))
+            Text(game.source.rawValue)
+            if let dev = details?.developerName { Text("· \(dev)") }
+            if let year = details?.releaseYear { Text("· \(year)") }
+        }
+        .font(.system(size: 12))
+        .foregroundColor(.white.opacity(0.82))
+        .shadow(color: .black.opacity(0.4), radius: 4)
+    }
+
+    // Status chips under the hero: install state/size, the "how this runs" chip,
+    // and a quiet playtime/last-played history line.
+    private var metaStrip: some View {
+        HStack(spacing: 8) {
+            if game.isInstalled {
+                pill(game.sizeBytes > 0 ? game.sizeFormatted : "Installed", icon: "internaldrive", tint: Fog.good)
+            } else {
+                pill(game.isFamilyShared ? "Family shared" : "Not installed",
+                     icon: game.isFamilyShared ? "person.2.fill" : "icloud", tint: game.isFamilyShared ? Fog.accent : Fog.inkFaint)
+            }
+            runChip
+            Spacer()
+            if game.playtimeFormatted != nil || game.lastPlayedFormatted != nil {
                 HStack(spacing: 5) {
-                    Image(systemName: game.source == .steam ? "cloud.fill" : "bolt.fill")
-                        .font(.system(size: 11))
-                    Text(game.source.rawValue)
-                    if game.isInstalled && game.sizeBytes > 0 {
-                        Text("· \(game.sizeFormatted)")
-                    }
-                    if !game.isInstalled {
-                        Text("· Not installed")
+                    if let pt = game.playtimeFormatted { Text(pt) }
+                    if game.playtimeFormatted != nil, game.lastPlayedFormatted != nil { Text("·").foregroundColor(Fog.inkFaint) }
+                    if let lp = game.lastPlayedFormatted { Text(lp) }
+                }
+                .font(.system(size: 11.5)).foregroundColor(Fog.inkFaint)
+            }
+        }
+    }
+
+    private func pill(_ text: String, icon: String, tint: Color) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: icon).font(.system(size: 10))
+            Text(text)
+        }
+        .font(.system(size: 11.5, weight: .medium))
+        .padding(.horizontal, 9).padding(.vertical, 5)
+        .background(tint.opacity(0.14), in: Capsule())
+        .foregroundColor(tint)
+    }
+
+    // Plain-language "how this game will run" — no jargon dropdowns.
+    @ViewBuilder private var runChip: some View {
+        let provider = D3DMetalProvider.detect()
+        if game.source == .epic {
+            pill("Epic runtime", icon: "bolt.fill", tint: Fog.epic)
+        } else if let provider {
+            pill("D3DMetal · \(provider.name)", icon: "cpu", tint: Fog.good)
+        } else if DXVKManager.isBundled {
+            pill("DXVK · bundled", icon: "cpu", tint: Fog.good)
+        } else {
+            pill("Basic renderer", icon: "cpu", tint: Fog.warn)
+        }
+    }
+
+    private var screenshotStrip: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Screenshots").font(.system(size: 13, weight: .semibold)).foregroundColor(Fog.ink)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(Array((details?.screenshotURLs ?? []).prefix(8)), id: \.self) { url in
+                        AsyncImage(url: URL(string: url)) { phase in
+                            if case .success(let image) = phase { image.resizable().scaledToFill() }
+                            else { Fog.haze }
+                        }
+                        .frame(width: 208, height: 117)
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Fog.hairline))
                     }
                 }
-                .font(.system(size: 12.5))
-                .foregroundColor(.secondary)
             }
-            Spacer()
         }
     }
 
@@ -3857,9 +3933,10 @@ struct GameDetailView: View {
                 ForEach(tags.prefix(8), id: \.self) { tag in
                     Text(tag)
                         .font(.system(size: 11, weight: .medium))
-                        .padding(.horizontal, 8)
+                        .foregroundColor(Fog.inkDim)
+                        .padding(.horizontal, 9)
                         .padding(.vertical, 4)
-                        .background(Color.primary.opacity(0.07), in: Capsule())
+                        .background(Fog.haze, in: Capsule())
                 }
             }
         }
@@ -3907,19 +3984,46 @@ struct GameDetailView: View {
     }
 
     @ViewBuilder
+    // A progress ring + count, so completion reads at a glance (idea 18).
+    private var achievementSummary: some View {
+        let unlocked = achievements.filter { $0.achieved == 1 }.count
+        let total = max(achievements.count, 1)
+        let frac = Double(unlocked) / Double(total)
+        return HStack(spacing: 14) {
+            ZStack {
+                Circle().stroke(Fog.haze, lineWidth: 6)
+                Circle().trim(from: 0, to: frac)
+                    .stroke(Fog.accent, style: StrokeStyle(lineWidth: 6, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+                Text("\(unlocked)").font(Fog.display(17, weight: .medium)).foregroundColor(Fog.ink)
+            }
+            .frame(width: 58, height: 58)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("\(unlocked) of \(achievements.count) unlocked")
+                    .font(.system(size: 13, weight: .medium)).foregroundColor(Fog.ink)
+                Text("\(Int(frac * 100))% complete")
+                    .font(.system(size: 11.5)).foregroundColor(Fog.inkFaint)
+                RoundedRectangle(cornerRadius: 3).fill(Fog.haze).frame(height: 5).frame(maxWidth: 220)
+                    .overlay(alignment: .leading) {
+                        RoundedRectangle(cornerRadius: 3).fill(Fog.accent)
+                            .frame(width: 220 * frac, height: 5)
+                    }
+            }
+            Spacer()
+        }
+        .padding(.bottom, 2)
+    }
+
     private var achievementsSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Label("Achievements", systemImage: "trophy.fill")
                     .font(.system(size: 13, weight: .semibold))
-                if !achievements.isEmpty {
-                    let unlocked = achievements.filter { $0.achieved == 1 }.count
-                    Text("\(unlocked)/\(achievements.count)")
-                        .font(.system(size: 12))
-                        .foregroundColor(.secondary)
-                }
+                    .foregroundColor(Fog.ink)
                 Spacer()
             }
+
+            if !achievements.isEmpty { achievementSummary }
 
             if isLoadingAchievements {
                 ProgressView().controlSize(.small)
