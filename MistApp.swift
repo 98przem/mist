@@ -57,16 +57,46 @@ struct Game: Identifiable, Hashable {
     var hasLinuxEAC: Bool = false
     var imageURL: String = ""  // cover art URL
     var isFamilyShared: Bool = false  // available via Steam Family library sharing, not owned outright
+    var playtimeMinutes: Int = 0     // total, from IPlayerService (0 if unknown)
+    var lastPlayed: Date? = nil      // last time this account launched it
+    var addedAt: Date? = nil         // when it first appeared in Mist's library (for the "New" ribbon)
 
     var sizeFormatted: String {
         if sizeBytes > 1_073_741_824 {
-            return "\(sizeBytes / 1_073_741_824) GB"
+            return String(format: "%.1f GB", Double(sizeBytes) / 1_073_741_824)
         } else if sizeBytes > 1_048_576 {
             return "\(sizeBytes / 1_048_576) MB"
         } else if sizeBytes > 0 {
             return "\(sizeBytes / 1024) KB"
         }
         return "—"
+    }
+
+    // "6h 40m" / "42m" / nil when never played.
+    var playtimeFormatted: String? {
+        guard playtimeMinutes > 0 else { return nil }
+        let h = playtimeMinutes / 60, m = playtimeMinutes % 60
+        return h > 0 ? "\(h)h \(m)m" : "\(m)m"
+    }
+
+    // "Yesterday" / "3 days ago" / "Jul 8" — a quiet recency line.
+    var lastPlayedFormatted: String? {
+        guard let lastPlayed else { return nil }
+        let days = Calendar.current.dateComponents([.day], from: lastPlayed, to: Date()).day ?? 0
+        switch days {
+        case 0: return "Today"
+        case 1: return "Yesterday"
+        case 2...6: return "\(days) days ago"
+        default:
+            let f = DateFormatter(); f.dateFormat = "MMM d"
+            return f.string(from: lastPlayed)
+        }
+    }
+
+    // Freshly added to the library within the last day → gets a "New" ribbon.
+    var isNew: Bool {
+        guard let addedAt else { return false }
+        return Date().timeIntervalSince(addedAt) < 24 * 3600
     }
 
     func hash(into hasher: inout Hasher) {
@@ -520,6 +550,19 @@ class GameLibrary: ObservableObject {
     }
 
     private func recomputeGames() {
+        // Playtime / last-played come from the owned-games fetch (IPlayerService),
+        // keyed by appid — overlay them onto every matching game, installed or not.
+        let statsByID: [String: (playtime: Int, last: Int)] = Dictionary(
+            ownedSteamGames.map { ($0.id, ($0.playtimeForever, $0.lastPlayed)) },
+            uniquingKeysWith: { a, _ in a })
+        func withStats(_ g: Game) -> Game {
+            guard g.source == .steam, let s = statsByID[g.id] else { return g }
+            var g = g
+            g.playtimeMinutes = s.playtime
+            g.lastPlayed = s.last > 0 ? Date(timeIntervalSince1970: TimeInterval(s.last)) : nil
+            return g
+        }
+
         let existingIDs = Set(scannedGames.filter { $0.source == .steam }.map(\.id))
         let placeholders = ownedSteamGames.filter { !existingIDs.contains($0.id) }.map { og in
             Game(id: og.id, name: og.name, source: .steam, installDir: "",
@@ -543,7 +586,9 @@ class GameLibrary: ObservableObject {
                     sizeBytes: 0, isInstalled: false,
                     imageURL: SteamLibraryService.coverURL(forAppID: fg.id), isFamilyShared: true)
             }
-        games = (scannedGames + placeholders + familyPlaceholders).sorted { $0.name.lowercased() < $1.name.lowercased() }
+        games = (scannedGames + placeholders + familyPlaceholders)
+            .map(withStats)
+            .sorted { $0.name.lowercased() < $1.name.lowercased() }
     }
 
     private func scanSteamGames() -> [Game] {
@@ -1035,6 +1080,7 @@ struct OwnedGame: Identifiable, Hashable {
     let name: String
     let playtimeForever: Int
     let coverURL: String
+    var lastPlayed: Int = 0   // unix seconds, 0 if never
 }
 
 enum SteamLibraryService {
@@ -1245,8 +1291,24 @@ struct SteamAchievement: Identifiable, Decodable {
 
 struct SteamAppDetails: Decodable {
     struct Genre: Decodable { let description: String }
+    struct Screenshot: Decodable { let id: Int; let path_full: String? }
+    struct Release: Decodable { let date: String? }
     let short_description: String?
     let genres: [Genre]?
+    let developers: [String]?
+    let publishers: [String]?
+    let screenshots: [Screenshot]?
+    let release_date: Release?
+
+    var genreNames: [String] { (genres ?? []).map(\.description) }
+    var developerName: String? { developers?.first ?? publishers?.first }
+    // Steam returns "8 Jun, 2021" etc.; pull a year if present.
+    var releaseYear: String? {
+        guard let d = release_date?.date else { return nil }
+        if let m = d.range(of: #"\d{4}"#, options: .regularExpression) { return String(d[m]) }
+        return nil
+    }
+    var screenshotURLs: [String] { (screenshots ?? []).compactMap(\.path_full) }
 }
 
 // One result from the public storesearch API — the wider Steam catalog, not
@@ -1436,6 +1498,8 @@ struct FamilySharedGame: Decodable {
 struct RelayOwnedGame: Decodable {
     let appid: Int
     let name: String
+    var playtimeForever: Int = 0   // minutes
+    var lastPlayed: Int = 0        // unix seconds, 0 if never
     var id: String { String(appid) }
 }
 
@@ -5269,8 +5333,9 @@ struct ContentView: View {
             do {
                 let owned: [OwnedGame]
                 if let relayOwned = try? await RelayManager.ownedLibrary(), !relayOwned.isEmpty {
-                    owned = relayOwned.map { OwnedGame(id: $0.id, name: $0.name, playtimeForever: 0,
-                                                       coverURL: SteamLibraryService.coverURL(forAppID: $0.id)) }
+                    owned = relayOwned.map { OwnedGame(id: $0.id, name: $0.name, playtimeForever: $0.playtimeForever,
+                                                       coverURL: SteamLibraryService.coverURL(forAppID: $0.id),
+                                                       lastPlayed: $0.lastPlayed) }
                 } else {
                     let token = try await steamAuth.mintAccessToken()
                     owned = try await SteamLibraryService.fetchOwnedGames(accessToken: token, steamID: steamAuth.steamID)
