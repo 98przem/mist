@@ -3159,71 +3159,329 @@ struct GameCardView: View {
     }
 }
 
+// The first-run flow: Engine -> Accounts -> Play, on a progress rail. Which step
+// shows is derived from persisted state (wineInstalled, each service's login),
+// never from transient wizard state — so quitting mid-download or mid-login and
+// reopening Mist resumes exactly where you left off instead of restarting.
+enum OnboardingStep: Int, CaseIterable {
+    case engine, accounts, play
+
+    var title: String {
+        switch self {
+        case .engine: return "Engine ready"
+        case .accounts: return "Sign in"
+        case .play: return "Pick a game"
+        }
+    }
+    var subtitle: String {
+        switch self {
+        case .engine: return "Downloaded once · ~200 MB"
+        case .accounts: return "Connect Steam and/or Epic"
+        case .play: return "Install & play"
+        }
+    }
+}
+
 struct SetupView: View {
+    @ObservedObject var setup: SetupManager
+    @ObservedObject var steamAuth: SteamAuthManager
+    @ObservedObject var processManager: ProcessManager
+    var onFinishOnboarding: () -> Void
+
+    private var currentStep: OnboardingStep {
+        if !setup.isComplete { return .engine }
+        if !steamAuth.isLoggedIn && !processManager.epicLoggedIn { return .accounts }
+        return .play
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            OnboardingRail(current: currentStep)
+                .frame(width: 220)
+                .padding(.vertical, 40)
+                .padding(.leading, 36)
+
+            Divider().background(Fog.hairline).padding(.vertical, 40)
+
+            Group {
+                switch currentStep {
+                case .engine: EngineStepView(setup: setup)
+                case .accounts, .play:
+                    AccountsStepView(steamAuth: steamAuth, processManager: processManager,
+                                     onContinue: onFinishOnboarding)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(40)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Fog.bg)
+    }
+}
+
+private struct OnboardingRail: View {
+    let current: OnboardingStep
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 9) {
+                ZStack {
+                    Circle()
+                        .fill(RadialGradient(colors: [Color(red: 0x9d/255, green: 0xb8/255, blue: 1),
+                                                       Fog.accent, Color(red: 0x47/255, green: 0x63/255, blue: 0xc2/255)],
+                                             center: .init(x: 0.3, y: 0.25), startRadius: 0, endRadius: 20))
+                        .frame(width: 30, height: 30)
+                        .shadow(color: Fog.accent.opacity(0.5), radius: 10)
+                    Image(systemName: "cloud.fog.fill")
+                        .font(.system(size: 13, weight: .semibold)).foregroundColor(.white)
+                }
+                Text("Mist").font(Fog.display(19)).foregroundColor(Fog.ink)
+            }
+            .padding(.bottom, 22)
+
+            ForEach(OnboardingStep.allCases, id: \.self) { step in
+                OnboardingRailRow(step: step, state: state(for: step),
+                                  isLast: step == OnboardingStep.allCases.last)
+            }
+        }
+    }
+
+    private func state(for step: OnboardingStep) -> OnboardingRailRow.RowState {
+        if step.rawValue < current.rawValue { return .done }
+        if step == current { return .now }
+        return .next
+    }
+}
+
+private struct OnboardingRailRow: View {
+    enum RowState { case done, now, next }
+    let step: OnboardingStep
+    let state: RowState
+    let isLast: Bool
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 11) {
+            ZStack {
+                if !isLast {
+                    Rectangle()
+                        .fill(state == .done ? Fog.good : Fog.hairline)
+                        .frame(width: 1.5)
+                        .offset(y: 22)
+                        .frame(height: 44)
+                }
+                Circle()
+                    .fill(state == .done ? Fog.good : state == .now ? Fog.accent : Fog.haze)
+                    .frame(width: 22, height: 22)
+                    .overlay(
+                        Group {
+                            if state == .done {
+                                Image(systemName: "checkmark").font(.system(size: 10, weight: .bold)).foregroundColor(Color(nsColor: .black))
+                            } else {
+                                Text("\(step.rawValue + 1)").font(.system(size: 11, weight: .bold))
+                                    .foregroundColor(state == .now ? Color(nsColor: .black) : Fog.inkFaint)
+                            }
+                        }
+                    )
+                    .shadow(color: state == .now ? Fog.accent.opacity(0.6) : .clear, radius: 6)
+            }
+            .frame(width: 22)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(step.title).font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(state == .next ? Fog.inkFaint : Fog.ink)
+                Text(step.subtitle).font(.system(size: 11)).foregroundColor(Fog.inkFaint)
+            }
+            .padding(.bottom, 18)
+        }
+    }
+}
+
+private struct EngineStepView: View {
     @ObservedObject var setup: SetupManager
 
     var body: some View {
-        VStack(spacing: 22) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 20, style: .continuous)
-                    .fill(LinearGradient(colors: [.purple, .blue], startPoint: .topLeading, endPoint: .bottomTrailing))
-                    .frame(width: 72, height: 72)
-                Image(systemName: "cloud.fog.fill")
-                    .font(.system(size: 32, weight: .medium))
-                    .foregroundColor(.white)
-            }
-            .shadow(color: .purple.opacity(0.3), radius: 16, y: 6)
-
-            VStack(spacing: 6) {
-                Text("Welcome to Mist")
-                    .font(.system(size: 26, weight: .bold))
-                Text("Mist needs to download the Wine engine and its runtime libraries.\nThis is a one-time setup (~200 MB).")
-                    .multilineTextAlignment(.center)
-                    .foregroundColor(.secondary)
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Setting up Mist").font(Fog.display(26, weight: .medium)).foregroundColor(Fog.ink)
+                Text("A one-time download of the Wine compatibility layer Mist runs Windows games through — a translation layer, not a virtual machine. About 200 MB.")
+                    .foregroundColor(Fog.inkDim).frame(maxWidth: 420, alignment: .leading)
             }
 
-            VStack(spacing: 14) {
+            VStack(alignment: .leading, spacing: 14) {
                 Label("Wine engine (CrossOver 24)",
                       systemImage: setup.wineInstalled ? "checkmark.circle.fill" : "circle")
-                    .foregroundColor(setup.wineInstalled ? .green : .secondary)
+                    .foregroundColor(setup.wineInstalled ? Fog.good : Fog.inkDim)
                     .font(.callout)
 
                 if setup.isWorking {
-                    VStack(spacing: 8) {
+                    VStack(alignment: .leading, spacing: 8) {
                         if let progress = setup.downloadProgress {
-                            ProgressView(value: progress)
-                                .progressViewStyle(.linear)
+                            ProgressView(value: progress).progressViewStyle(.linear).tint(Fog.accent)
                         } else {
-                            ProgressView()
-                                .progressViewStyle(.linear)
+                            ProgressView().progressViewStyle(.linear).tint(Fog.accent)
                         }
-                        Text(setup.statusText)
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+                        Text(setup.statusText).font(.caption).foregroundColor(Fog.inkFaint)
                     }
                     .frame(width: 320)
                 } else {
                     if let err = setup.errorText {
                         Label(err, systemImage: "exclamationmark.triangle.fill")
-                            .font(.caption)
-                            .foregroundColor(.red)
-                            .multilineTextAlignment(.center)
-                            .frame(maxWidth: 360)
+                            .font(.caption).foregroundColor(.orange)
+                            .frame(maxWidth: 360, alignment: .leading)
                     }
                     Button(setup.errorText == nil ? "Download & Install" : "Try Again") {
                         setup.runFullSetup()
                     }
-                    .buttonStyle(.borderedProminent)
-                    .tint(Fog.epic)
-                    .controlSize(.large)
+                    .buttonStyle(.borderedProminent).tint(Fog.accent).controlSize(.large)
                 }
             }
             .padding(20)
-            .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(.regularMaterial))
-            .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Color.primary.opacity(0.06)))
+            .background(Fog.bgElevated, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Fog.hairline))
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(40)
+    }
+}
+
+// Both services shown as independently-connectable — Steam's QR and Epic's
+// browser login are shaped nothing alike, so this deliberately doesn't force
+// them into one generic "sign in" step. Connect either or both, or skip.
+private struct AccountsStepView: View {
+    @ObservedObject var steamAuth: SteamAuthManager
+    @ObservedObject var processManager: ProcessManager
+    var onContinue: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Sign in").font(Fog.display(26, weight: .medium)).foregroundColor(Fog.ink)
+                Text("One Steam scan covers your whole library, downloads, and achievements — no separate logins. Connect Epic too if you play there.")
+                    .foregroundColor(Fog.inkDim).frame(maxWidth: 460, alignment: .leading)
+            }
+
+            HStack(alignment: .top, spacing: 14) {
+                OnboardingSteamTile(auth: steamAuth)
+                OnboardingEpicTile(processManager: processManager)
+            }
+
+            HStack {
+                Button(steamAuth.isLoggedIn || processManager.epicLoggedIn ? "Continue" : "Skip for now") {
+                    onContinue()
+                }
+                .buttonStyle(.borderedProminent).tint(Fog.accent).controlSize(.large)
+                if !steamAuth.isLoggedIn && !processManager.epicLoggedIn {
+                    Text("You can always sign in later from Settings.")
+                        .font(.caption).foregroundColor(Fog.inkFaint)
+                }
+            }
+        }
+    }
+}
+
+private struct OnboardingSteamTile: View {
+    @ObservedObject var auth: SteamAuthManager
+
+    var body: some View {
+        VStack(spacing: 12) {
+            HStack {
+                Image(systemName: "cloud.fill").foregroundColor(Fog.steam)
+                Text("Steam").font(.system(size: 14, weight: .semibold)).foregroundColor(Fog.ink)
+                Spacer()
+                if auth.isLoggedIn {
+                    Label("Connected", systemImage: "checkmark.circle.fill")
+                        .font(.caption).foregroundColor(Fog.good).labelStyle(.titleAndIcon)
+                }
+            }
+            if auth.isLoggedIn {
+                VStack(spacing: 4) {
+                    Image(systemName: "checkmark.circle.fill").font(.system(size: 30)).foregroundColor(Fog.good)
+                    Text(auth.accountName).font(.callout).foregroundColor(Fog.ink)
+                }
+                .frame(maxWidth: .infinity, minHeight: 130)
+            } else if let url = auth.qrChallengeURL {
+                ZStack {
+                    SteamQRCodeView(urlString: url)
+                        .frame(width: 116, height: 116)
+                        .padding(9)
+                        .background(Color.white, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .strokeBorder(Fog.accent.opacity(0.6), lineWidth: 2)
+                        .frame(width: 134, height: 134)
+                }
+                Text(auth.isPolling ? "Waiting for your phone…" : auth.qrStatusText)
+                    .font(.caption2).foregroundColor(Fog.inkFaint)
+            } else {
+                ProgressView().frame(maxWidth: .infinity, minHeight: 130)
+            }
+            if let err = auth.errorText {
+                Text(err).font(.caption2).foregroundColor(.orange)
+                Button("Try Again") { auth.startQRLogin() }.font(.caption).buttonStyle(.bordered)
+            }
+        }
+        .padding(16)
+        .frame(width: 200)
+        .background(Fog.bgElevated, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Fog.hairline))
+        .onAppear { if auth.qrChallengeURL == nil && !auth.isPolling && !auth.isLoggedIn { auth.startQRLogin() } }
+        .onDisappear { auth.stopPolling() }
+    }
+}
+
+private struct OnboardingEpicTile: View {
+    @ObservedObject var processManager: ProcessManager
+    @State private var showPaste = false
+    @State private var code = ""
+
+    var body: some View {
+        VStack(spacing: 12) {
+            HStack {
+                Image(systemName: "bolt.fill").foregroundColor(Fog.epic)
+                Text("Epic").font(.system(size: 14, weight: .semibold)).foregroundColor(Fog.ink)
+                Spacer()
+                if processManager.epicLoggedIn {
+                    Label("Connected", systemImage: "checkmark.circle.fill")
+                        .font(.caption).foregroundColor(Fog.good).labelStyle(.titleAndIcon)
+                }
+            }
+            if processManager.epicLoggedIn {
+                VStack(spacing: 4) {
+                    Image(systemName: "checkmark.circle.fill").font(.system(size: 30)).foregroundColor(Fog.good)
+                    Text(processManager.epicUsername).font(.callout).foregroundColor(Fog.ink)
+                }
+                .frame(maxWidth: .infinity, minHeight: 130)
+            } else if showPaste {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Paste the JSON from the browser tab that opened:")
+                        .font(.caption2).foregroundColor(Fog.inkFaint)
+                    TextField("Paste here", text: $code)
+                        .textFieldStyle(.roundedBorder).font(.system(.caption, design: .monospaced))
+                    HStack {
+                        Button("Log In") { processManager.epicLoginWithCode(code); showPaste = false; code = "" }
+                            .buttonStyle(.borderedProminent).tint(Fog.epic).controlSize(.small)
+                            .disabled(code.isEmpty)
+                        Button("Cancel") { showPaste = false; code = "" }.buttonStyle(.bordered).controlSize(.small)
+                    }
+                }
+                .frame(maxWidth: .infinity, minHeight: 130, alignment: .top)
+            } else if processManager.epicLoginInProgress {
+                ProgressView().frame(maxWidth: .infinity, minHeight: 130)
+            } else {
+                VStack(spacing: 10) {
+                    Image(systemName: "safari").font(.system(size: 26)).foregroundColor(Fog.inkFaint)
+                    Text("Sign in via your browser").font(.caption).foregroundColor(Fog.inkDim)
+                        .multilineTextAlignment(.center)
+                    Button("Log In") { showPaste = true; processManager.epicOpenLoginPage() }
+                        .buttonStyle(.bordered).tint(Fog.epic)
+                }
+                .frame(maxWidth: .infinity, minHeight: 130)
+            }
+            if !processManager.epicLoginError.isEmpty {
+                Text(processManager.epicLoginError).font(.caption2).foregroundColor(.orange)
+            }
+        }
+        .padding(16)
+        .frame(width: 200)
+        .background(Fog.bgElevated, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Fog.hairline))
     }
 }
 
@@ -5699,6 +5957,11 @@ struct ContentView: View {
     @State private var focusedGameIndex = 0
     @State private var libraryFilter: LibraryFilter = .all
     @State private var gridColumns = 1
+    // Persisted so a user who skips account sign-in during first run isn't shown
+    // the onboarding accounts step again on every launch — connecting an account
+    // later (e.g. from Settings) also permanently satisfies this via the isLoggedIn
+    // checks in the gate itself, this flag only covers the explicit-skip path.
+    @State private var onboardingDismissed = UserDefaults.standard.bool(forKey: "onboardingAccountsDismissed")
     // Sections that actually contain a game grid — gamepad shoulder buttons only
     // cycle among these, so they never land on Store/Free Games/Settings and go
     // dead (no focusable grid there).
@@ -5883,8 +6146,12 @@ struct ContentView: View {
 
     var body: some View {
         Group {
-            if setup.isWorking || !setup.isComplete {
-                SetupView(setup: setup)
+            if setup.isWorking || !setup.isComplete
+                || (!onboardingDismissed && !steamAuth.isLoggedIn && !processManager.epicLoggedIn) {
+                SetupView(setup: setup, steamAuth: steamAuth, processManager: processManager) {
+                    onboardingDismissed = true
+                    UserDefaults.standard.set(true, forKey: "onboardingAccountsDismissed")
+                }
             } else {
                 NavigationSplitView {
                     SidebarView(
