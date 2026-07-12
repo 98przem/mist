@@ -8,6 +8,8 @@ Shipped already (pre-dates this file): Phase 0 (data foundations: playtime/last-
 
 **Phase 2 — shipped.** Custom apps: "My Apps" sidebar row, Add/Locate via native file picker, non-destructive "Remove from Mist", broken-file state, dedup, no achievements section on custom entries.
 
+**Phase 3 — shipped.** Real download queue (sequential, with speed/ETA sampled from on-disk growth, pause/resume/cancel/reorder), cover-art fill-as-it-installs on the grid card, a sidebar download meter opening the full queue sheet, and a "Play" toast when a Steam install finishes.
+
 ## Graphics stack — DONE, not backlog
 
 Both arms are implemented and verified (see memory `mist-graphics-stack`): D3DMetal via GPTK/CrossOver when present, bundled DXVK-macOS otherwise. No phase needed. Only optional follow-up: spot-test the bundled DXVK path on a couple more games beyond Easy Delivery Co, opportunistically, not as scheduled work.
@@ -46,7 +48,7 @@ Let the user add any `.exe` as a library entry — Wine-launchable software Mist
 - **Dedup**: adding the same path twice updates the existing entry rather than creating a duplicate.
 - **Cover art**: no store art exists. Default is a Foglight-styled placeholder card (monogram + tint); extracting the real .exe icon (PE resource parsing) is a nice-to-have, not required for v1 — flagged as a stretch goal within the phase, cut first if time-constrained.
 
-## Phase 3 — Downloads
+## Phase 3 — Downloads — shipped
 
 Real queue view (speed/ETA/pause/resume/reorder), cover-art fill-as-it-installs, sidebar download meter, Play button on the install-finished toast.
 

@@ -2049,27 +2049,52 @@ enum GameSettingsStore {
     }
 }
 
-final class SteamDownloadManager: ObservableObject {
-    @Published var isDownloading = false
-    @Published var downloadingAppID: String?
-    @Published var downloadingName: String?
-    @Published var downloadStatusText = ""
-    @Published var downloadProgress: Double?
-    // This DepotDownloader version never prints a plain QR URL line — only the
-    // terminal ASCII-art rendering — so downloadQRURL stays unused for now but is
-    // kept in case a future version adds one (SteamQRCodeView would generate a
-    // clean image from it directly, no rasterization needed).
-    @Published var downloadQRURL: String?
-    // Rasterized from the raw terminal ASCII-art QR — see renderTerminalQR(lines:).
-    // Deliberately NOT rendered as text: SwiftUI's monospace font can't guarantee
-    // perfectly square character cells, and the block pattern's leading whitespace
-    // varies per row (part of the encoded data), so naive text display corrupts the
-    // grid alignment enough that it doesn't scan at all.
-    @Published var downloadQRImage: NSImage?
-    @Published var downloadError: String?
+enum DownloadState: Equatable {
+    case queued
+    case downloading
+    case paused
+    case failed(String)
+    case done
+}
 
-    private var isCapturingQRArt = false
-    private var qrArtBuffer: [String] = []
+// A single entry in the download queue — a Steam app or one of its Workshop
+// items. `id` disambiguates the two: a plain appid for the base game, or
+// "appid:pubfileID" for a workshop item, so a game and its own workshop
+// content can queue independently without colliding.
+struct DownloadQueueItem: Identifiable, Equatable {
+    let id: String
+    let appid: String
+    var name: String
+    let pubfileID: String?
+    let coverURL: URL?
+    var state: DownloadState = .queued
+    var progress: Double? = nil
+    var statusText: String = ""
+    var bytesPerSecond: Double? = nil
+    var etaSeconds: Double? = nil
+
+    var speedFormatted: String? {
+        guard let bps = bytesPerSecond, bps > 1024 else { return nil }
+        return ByteCountFormatter.string(fromByteCount: Int64(bps), countStyle: .file) + "/s"
+    }
+
+    var etaFormatted: String? {
+        guard let s = etaSeconds, s.isFinite, s > 0 else { return nil }
+        let mins = Int(s) / 60
+        if mins < 1 { return "< 1 min left" }
+        if mins < 60 { return "\(mins) min left" }
+        return "\(mins / 60)h \(mins % 60)m left"
+    }
+}
+
+final class SteamDownloadManager: ObservableObject {
+    @Published var queue: [DownloadQueueItem] = []
+
+    private var process: Process?
+    private var activeID: String?
+    private var onCompleteHandlers: [String: () -> Void] = [:]
+    private var steamAccountName: String = ""
+    private let steamAppsDir: URL
 
     // downloadStatusText only ever shows the latest line, which is useless for
     // diagnosing a failure (the real error scrolls past before anyone can read it).
@@ -2089,76 +2114,31 @@ final class SteamDownloadManager: ObservableObject {
         "Unable to get steam3 credentials", "Timeout connecting to Steam3",
     ]
 
-    private var process: Process?
-    private let steamAppsDir: URL
+    // Set right before intentionally terminating a process (pause/cancel) so its
+    // terminationHandler can tell "we did this on purpose" apart from a real
+    // failure and skip the retry/failed-state logic entirely.
+    private var intentionalStop: Set<String> = []
 
-    // DepotDownloader caches its own Steam session (separate from Mist's native
-    // login) in an isolated-storage account.config file after a successful -qr
-    // scan, and reuses it automatically when invoked with -username instead of
-    // -qr — confirmed by finding that file still present and recent after a real
-    // install. Once we've seen ONE successful run for an account, later installs
-    // try -username first so the user isn't asked to scan again every time.
-    private static let reusableAccountsKey = "DepotDownloaderReusableAccounts"
-    private var reuseWatchdog: Timer?
-    private var sawMeaningfulOutputThisRun = false
-
-    private static func canReuseSession(for account: String) -> Bool {
-        let accounts = UserDefaults.standard.stringArray(forKey: reusableAccountsKey) ?? []
-        return accounts.contains(account.lowercased())
-    }
-
-    private static func markSessionReusable(for account: String) {
-        var accounts = Set(UserDefaults.standard.stringArray(forKey: reusableAccountsKey) ?? [])
-        accounts.insert(account.lowercased())
-        UserDefaults.standard.set(Array(accounts), forKey: reusableAccountsKey)
-    }
-
-    private static func forgetReusableSession(for account: String) {
-        var accounts = Set(UserDefaults.standard.stringArray(forKey: reusableAccountsKey) ?? [])
-        accounts.remove(account.lowercased())
-        UserDefaults.standard.set(Array(accounts), forKey: reusableAccountsKey)
-    }
+    private var speedTimer: Timer?
+    private var speedTrackingID: String?
+    private var speedSample: (bytes: Int64, at: Date)?
 
     init(steamAppsDir: URL) {
         self.steamAppsDir = steamAppsDir
     }
 
-    func install(appid: String, name: String, steamAccountName: String, onComplete: @escaping () -> Void) {
-        guard !isDownloading else { return }
-        isDownloading = true
-        downloadingAppID = appid
-        downloadingName = name
-        downloadError = nil
-        downloadQRURL = nil
-        downloadQRImage = nil
-        downloadProgress = nil
-        downloadStatusText = "Preparing…"
-        connectionRetryCount = 0
-
-        Task {
-            do {
-                try await DepotDownloaderManager.ensureInstalled { [weak self] status in
-                    Task { @MainActor in self?.downloadStatusText = status }
-                }
-                await MainActor.run {
-                    self.runDepotDownloader(appid: appid, name: name, steamAccountName: steamAccountName,
-                                            onComplete: onComplete)
-                }
-            } catch {
-                await MainActor.run {
-                    self.isDownloading = false
-                    self.downloadingAppID = nil
-                    self.downloadingName = nil
-                    self.downloadError = error.localizedDescription
-                }
-            }
-        }
+    func enqueue(appid: String, name: String, steamAccountName: String, coverURL: URL? = nil,
+                 onComplete: @escaping () -> Void) {
+        self.steamAccountName = steamAccountName
+        guard !queue.contains(where: { $0.id == appid }) else { return }
+        queue.append(DownloadQueueItem(id: appid, appid: appid, name: name, pubfileID: nil, coverURL: coverURL))
+        onCompleteHandlers[appid] = onComplete
+        processQueueIfIdle()
     }
 
-    // Workshop items download through the exact same DepotDownloader session
-    // (QR/reuse/watchdog logic all shared via runDepotDownloader below) — the only
-    // difference is the "-pubfile" flag instead of a plain app download, and a
-    // workshop-shaped destination folder instead of steamapps/common.
+    // Workshop items share the exact same queue/retry machinery as base games —
+    // the only difference is the "-pubfile" flag and a workshop-shaped destination
+    // folder instead of steamapps/common.
     //
     // Caveat: this places files where Steam's own client would (steamapps/workshop/
     // content/<appid>/<pubfileid>/), but whether a given game actually reads mods
@@ -2166,51 +2146,59 @@ final class SteamDownloadManager: ObservableObject {
     // runtime instead of scanning the folder directly, and Mist doesn't (and can't,
     // without running a real Steam client) implement that API. Works for games that
     // load workshop content straight off disk; does nothing for ones that don't.
-    func installWorkshopItem(appid: String, pubfileID: String, gameName: String,
-                              steamAccountName: String, onComplete: @escaping () -> Void) {
-        guard !isDownloading else { return }
-        isDownloading = true
-        downloadingAppID = appid
-        downloadingName = "\(gameName) — Workshop Item \(pubfileID)"
-        downloadError = nil
-        downloadQRURL = nil
-        downloadQRImage = nil
-        downloadProgress = nil
-        downloadStatusText = "Preparing…"
+    func enqueueWorkshopItem(appid: String, pubfileID: String, gameName: String, steamAccountName: String,
+                              onComplete: @escaping () -> Void) {
+        self.steamAccountName = steamAccountName
+        let id = "\(appid):\(pubfileID)"
+        guard !queue.contains(where: { $0.id == id }) else { return }
+        let name = "\(gameName) — Workshop Item \(pubfileID)"
+        queue.append(DownloadQueueItem(id: id, appid: appid, name: name, pubfileID: pubfileID, coverURL: nil))
+        onCompleteHandlers[id] = onComplete
+        processQueueIfIdle()
+    }
+
+    private func processQueueIfIdle() {
+        guard activeID == nil, let next = queue.first(where: { $0.state == .queued }) else { return }
+        start(id: next.id)
+    }
+
+    private func start(id: String) {
+        guard let idx = queue.firstIndex(where: { $0.id == id }) else { return }
+        queue[idx].state = .downloading
+        queue[idx].statusText = "Preparing…"
+        queue[idx].progress = nil
+        queue[idx].bytesPerSecond = nil
+        queue[idx].etaSeconds = nil
+        activeID = id
         connectionRetryCount = 0
+        recentOutputLines = []
 
         Task {
             do {
                 try await DepotDownloaderManager.ensureInstalled { [weak self] status in
-                    Task { @MainActor in self?.downloadStatusText = status }
+                    Task { @MainActor in
+                        guard let self, let idx = self.queue.firstIndex(where: { $0.id == id }) else { return }
+                        self.queue[idx].statusText = status
+                    }
                 }
-                await MainActor.run {
-                    self.runDepotDownloader(appid: appid, name: downloadingName ?? gameName,
-                                            steamAccountName: steamAccountName, pubfileID: pubfileID,
-                                            onComplete: onComplete)
-                }
+                await MainActor.run { self.runDepotDownloader(id: id) }
             } catch {
-                await MainActor.run {
-                    self.isDownloading = false
-                    self.downloadingAppID = nil
-                    self.downloadingName = nil
-                    self.downloadError = error.localizedDescription
-                }
+                await MainActor.run { self.finishWithFailure(id: id, message: error.localizedDescription) }
             }
         }
     }
 
-    private func runDepotDownloader(appid: String, name: String, steamAccountName: String,
-                                    pubfileID: String? = nil,
-                                    onComplete: @escaping () -> Void) {
+    private func runDepotDownloader(id: String) {
+        guard let idx = queue.firstIndex(where: { $0.id == id }) else { return }
+        let item = queue[idx]
         let tool = DepotDownloaderManager.installPath.path
-        downloadStatusText = "Signing in with your Steam login…"
+        queue[idx].statusText = "Signing in with your Steam login…"
 
         let installDir: URL
-        if let pubfileID {
-            installDir = steamAppsDir.appendingPathComponent("workshop/content/\(appid)/\(pubfileID)")
+        if let pubfileID = item.pubfileID {
+            installDir = steamAppsDir.appendingPathComponent("workshop/content/\(item.appid)/\(pubfileID)")
         } else {
-            let safeName = wineSafeDirName(name)
+            let safeName = wineSafeDirName(item.name)
             installDir = steamAppsDir.appendingPathComponent("common").appendingPathComponent(safeName)
         }
         try? FileManager.default.createDirectory(at: installDir, withIntermediateDirectories: true)
@@ -2219,9 +2207,9 @@ final class SteamDownloadManager: ObservableObject {
         // session token (passed via MIST_REFRESH_TOKEN) into its login store, so
         // "-username <account> -remember-password" logs in non-interactively with
         // Mist's one QR sign-in — no separate DepotDownloader QR scan, ever.
-        var args = ["-app", appid, "-os", "windows", "-dir", installDir.path,
+        var args = ["-app", item.appid, "-os", "windows", "-dir", installDir.path,
                     "-username", steamAccountName, "-remember-password"]
-        if let pubfileID { args += ["-pubfile", pubfileID] }
+        if let pubfileID = item.pubfileID { args += ["-pubfile", pubfileID] }
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: tool)
@@ -2237,7 +2225,6 @@ final class SteamDownloadManager: ObservableObject {
         // DepotDownloader prints "NN.NN% path/to/file" per chunk — the only line
         // type treated as real, user-facing progress.
         let progressRegex = try? NSRegularExpression(pattern: "^(\\d+\\.\\d+)%")
-        recentOutputLines = []
 
         outPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
@@ -2252,13 +2239,14 @@ final class SteamDownloadManager: ObservableObject {
                     if self.recentOutputLines.count > self.maxRecentLines {
                         self.recentOutputLines.removeFirst()
                     }
+                    guard let idx = self.queue.firstIndex(where: { $0.id == id }) else { continue }
                     if let regex = progressRegex,
                        let m = regex.firstMatch(in: l, range: NSRange(l.startIndex..., in: l)),
                        let r = Range(m.range(at: 1), in: l), let pct = Double(l[r]) {
-                        self.downloadProgress = pct / 100
-                        self.downloadStatusText = "Downloading \(name)…"
+                        self.queue[idx].progress = pct / 100
+                        self.queue[idx].statusText = "Downloading \(item.name)…"
                     } else {
-                        self.downloadStatusText = l
+                        self.queue[idx].statusText = l
                     }
                 }
             }
@@ -2268,19 +2256,33 @@ final class SteamDownloadManager: ObservableObject {
             outPipe.fileHandleForReading.readabilityHandler = nil
             DispatchQueue.main.async {
                 guard let self else { return }
+                let wasIntentional = self.intentionalStop.remove(id) != nil
+                // Guard every piece of "this was the active download" cleanup on
+                // identity/id checks — by the time this fires, a pause() may have
+                // already moved the queue on to a different active item, and
+                // blindly clearing shared state here would stomp on it.
+                if self.activeID == id { self.activeID = nil }
+                if self.process === p { self.process = nil }
+                self.stopSpeedTracking(for: id)
+
+                if wasIntentional {
+                    // pause()/cancel() already updated queue state (or removed
+                    // the item) — nothing left to do.
+                    return
+                }
+
                 if p.terminationStatus == 0 {
-                    self.isDownloading = false
-                    self.downloadingAppID = nil
-                    self.downloadingName = nil
-                    self.downloadProgress = nil
                     self.connectionRetryCount = 0
-                    self.downloadStatusText = "Done!"
-                    if pubfileID == nil {
+                    if item.pubfileID == nil {
                         let size = Self.directorySize(installDir)
-                        MistManifest.add(MistInstalledGame(appid: appid, name: name, installDir: installDir.path, sizeBytes: size),
+                        MistManifest.add(MistInstalledGame(appid: item.appid, name: item.name,
+                                                           installDir: installDir.path, sizeBytes: size),
                                          steamAppsDir: self.steamAppsDir)
                     }
-                    onComplete()
+                    self.queue.removeAll { $0.id == id }
+                    let onComplete = self.onCompleteHandlers.removeValue(forKey: id)
+                    onComplete?()
+                    self.processQueueIfIdle()
                     return
                 }
 
@@ -2289,20 +2291,20 @@ final class SteamDownloadManager: ObservableObject {
                 }
                 if looksLikeConnectionHiccup && self.connectionRetryCount < self.maxConnectionRetries {
                     self.connectionRetryCount += 1
-                    self.downloadStatusText = "Steam connection hiccup — retrying (\(self.connectionRetryCount)/\(self.maxConnectionRetries))…"
-                    self.downloadProgress = nil
+                    if let idx = self.queue.firstIndex(where: { $0.id == id }) {
+                        self.queue[idx].statusText = "Steam connection hiccup — retrying (\(self.connectionRetryCount)/\(self.maxConnectionRetries))…"
+                        self.queue[idx].progress = nil
+                    }
                     DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-                        self.runDepotDownloader(appid: appid, name: name, steamAccountName: steamAccountName,
-                                                pubfileID: pubfileID, onComplete: onComplete)
+                        guard let idx = self.queue.firstIndex(where: { $0.id == id }), self.queue[idx].state == .downloading,
+                              self.activeID == nil else { return }
+                        self.activeID = id
+                        self.runDepotDownloader(id: id)
                     }
                 } else {
-                    self.isDownloading = false
-                    self.downloadingAppID = nil
-                    self.downloadingName = nil
-                    self.downloadProgress = nil
                     self.connectionRetryCount = 0
                     let tail = self.recentOutputLines.suffix(6).joined(separator: "\n")
-                    self.downloadError = "Download failed (exit \(p.terminationStatus)).\n\(tail)"
+                    self.finishWithFailure(id: id, message: "Download failed (exit \(p.terminationStatus)).\n\(tail)")
                 }
             }
         }
@@ -2310,12 +2312,117 @@ final class SteamDownloadManager: ObservableObject {
         do {
             try proc.run()
             process = proc
+            startSpeedTracking(id: id, installDir: installDir)
         } catch {
-            isDownloading = false
-            downloadingAppID = nil
-            downloadingName = nil
-            downloadError = "Couldn't start DepotDownloader: \(error.localizedDescription)"
+            finishWithFailure(id: id, message: "Couldn't start DepotDownloader: \(error.localizedDescription)")
         }
+    }
+
+    private func finishWithFailure(id: String, message: String) {
+        guard let idx = queue.firstIndex(where: { $0.id == id }) else { return }
+        queue[idx].state = .failed(message)
+        queue[idx].progress = nil
+        if activeID == id { activeID = nil }
+        processQueueIfIdle()
+    }
+
+    /// Cancels the active download but leaves its partial files on disk and
+    /// keeps it in the queue as `.paused` — DepotDownloader validates existing
+    /// chunks by checksum on the next run, so resuming just means re-invoking it
+    /// with the same args, not any byte-range logic of our own.
+    func pause(id: String) {
+        guard let idx = queue.firstIndex(where: { $0.id == id }), queue[idx].state == .downloading else { return }
+        intentionalStop.insert(id)
+        process?.terminate()
+        queue[idx].state = .paused
+        queue[idx].statusText = "Paused"
+        stopSpeedTracking(for: id)
+        if activeID == id { activeID = nil }
+        processQueueIfIdle()
+    }
+
+    /// Jumps the item to the front of the queue and starts it immediately if
+    /// nothing else is downloading. Also used to retry a failed item.
+    func resume(id: String) {
+        guard let idx = queue.firstIndex(where: { $0.id == id }), isResumable(queue[idx]) else { return }
+        var item = queue.remove(at: idx)
+        item.state = .queued
+        item.statusText = ""
+        queue.insert(item, at: 0)
+        processQueueIfIdle()
+    }
+
+    func retry(id: String) { resume(id: id) }
+
+    func cancel(id: String) {
+        if activeID == id {
+            intentionalStop.insert(id)
+            process?.terminate()
+            stopSpeedTracking(for: id)
+            activeID = nil
+        }
+        queue.removeAll { $0.id == id }
+        onCompleteHandlers.removeValue(forKey: id)
+    }
+
+    func moveUp(id: String) {
+        guard let idx = queue.firstIndex(where: { $0.id == id }), idx > 0 else { return }
+        queue.swapAt(idx, idx - 1)
+    }
+
+    func moveDown(id: String) {
+        guard let idx = queue.firstIndex(where: { $0.id == id }), idx < queue.count - 1 else { return }
+        queue.swapAt(idx, idx + 1)
+    }
+
+    private func isResumable(_ item: DownloadQueueItem) -> Bool {
+        if item.state == .paused { return true }
+        if case .failed = item.state { return true }
+        return false
+    }
+
+    // Samples the install directory's on-disk size every 2s (off the main thread —
+    // a recursive enumerator over a large install shouldn't block UI) to derive a
+    // real speed and, from the current percentage, a rough ETA. DepotDownloader
+    // only ever prints a percentage, never a byte count, so this is the only way
+    // to get either without reimplementing its manifest parsing. Guarded by
+    // speedTrackingID throughout so a stale timer from an already-superseded
+    // download can't clobber whatever item is actually active now.
+    private func startSpeedTracking(id: String, installDir: URL) {
+        speedTrackingID = id
+        speedSample = nil
+        speedTimer?.invalidate()
+        speedTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            guard let self, self.speedTrackingID == id else { return }
+            DispatchQueue.global(qos: .utility).async {
+                let bytes = Self.directorySize(installDir)
+                let now = Date()
+                DispatchQueue.main.async {
+                    guard self.speedTrackingID == id,
+                          let idx = self.queue.firstIndex(where: { $0.id == id }) else { return }
+                    defer { self.speedSample = (bytes, now) }
+                    guard let prev = self.speedSample else { return }
+                    let dt = now.timeIntervalSince(prev.at)
+                    guard dt > 0.5 else { return }
+                    let bps = max(0, Double(bytes - prev.bytes) / dt)
+                    self.queue[idx].bytesPerSecond = bps
+                    if let progress = self.queue[idx].progress, progress > 0.02, bps > 0 {
+                        let estTotal = Double(bytes) / progress
+                        self.queue[idx].etaSeconds = max(0, estTotal - Double(bytes)) / bps
+                    } else {
+                        self.queue[idx].etaSeconds = nil
+                    }
+                }
+            }
+        }
+    }
+
+    private func stopSpeedTracking(for id: String) {
+        guard speedTrackingID == id else { return }
+        speedTimer?.invalidate()
+        speedTimer = nil
+        speedSample = nil
+        speedTrackingID = nil
     }
 
     // Mist's own persistent refresh token, read from the session file — passed to
@@ -2328,10 +2435,6 @@ final class SteamDownloadManager: ObservableObject {
         return tok
     }
 
-    func cancel() {
-        process?.terminate()
-    }
-
     private static func directorySize(_ url: URL) -> Int64 {
         guard let en = FileManager.default.enumerator(at: url, includingPropertiesForKeys: [.fileSizeKey]) else { return 0 }
         var total: Int64 = 0
@@ -2339,43 +2442,6 @@ final class SteamDownloadManager: ObservableObject {
             total += Int64((try? fileURL.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
         }
         return total
-    }
-
-    // DepotDownloader's terminal QR uses 2 characters per module (a dark module is
-    // "██", a light one is two spaces) and one line per module row — confirmed by
-    // counting a finder-pattern corner (14 "█" characters = 7 modules, matching the
-    // standard QR finder pattern size exactly). Rasterizing directly from the raw
-    // character grid guarantees square modules and exact alignment, unlike
-    // rendering the text itself.
-    private static func renderTerminalQR(lines: [String], moduleSize: CGFloat = 8) -> NSImage? {
-        let charLines = lines.map(Array.init)
-        let maxWidth = charLines.map(\.count).max() ?? 0
-        guard maxWidth >= 4, charLines.count >= 4 else { return nil }
-
-        let moduleCols = maxWidth / 2
-        let moduleRows = charLines.count
-        let width = CGFloat(moduleCols) * moduleSize
-        let height = CGFloat(moduleRows) * moduleSize
-        guard width > 0, height > 0 else { return nil }
-
-        let image = NSImage(size: NSSize(width: width, height: height))
-        image.lockFocus()
-        NSColor.white.setFill()
-        NSRect(x: 0, y: 0, width: width, height: height).fill()
-        NSColor.black.setFill()
-        for (row, chars) in charLines.enumerated() {
-            for col in 0..<moduleCols {
-                let i = col * 2
-                let c1 = i < chars.count ? chars[i] : " "
-                let c2 = i + 1 < chars.count ? chars[i + 1] : " "
-                guard c1 != " " || c2 != " " else { continue }
-                let x = CGFloat(col) * moduleSize
-                let y = height - CGFloat(row + 1) * moduleSize  // NSImage origin is bottom-left
-                NSRect(x: x, y: y, width: moduleSize, height: moduleSize).fill()
-            }
-        }
-        image.unlockFocus()
-        return image
     }
 }
 
@@ -3041,6 +3107,11 @@ struct GameCardView: View {
     var onInstallWorkshopItem: () -> Void = {}
     var onSelect: () -> Void = {}
     var onLocate: () -> Void = {}   // .custom source, file missing: re-point at a new location
+    var downloadItem: DownloadQueueItem? = nil   // non-nil while this game is queued/downloading
+    var onPauseDownload: () -> Void = {}
+    var onResumeDownload: () -> Void = {}
+    var onCancelDownload: () -> Void = {}
+    var onRetryDownload: () -> Void = {}
     var isFocused: Bool = false
 
     @State private var isHovering = false
@@ -3049,12 +3120,22 @@ struct GameCardView: View {
 
     // A single status dot encodes state at a glance (idea 10).
     private var statusColor: Color {
+        if downloadItem != nil { return Fog.accent }
         if game.isInstalled { return Fog.good }
         if game.isFamilyShared { return Fog.accent }
         return Color.white.opacity(0.35)
     }
     // The primary metadata line: playtime if you've played it, else size, else state.
     private var metaPrimary: String {
+        if let di = downloadItem {
+            switch di.state {
+            case .downloading: return di.progress.map { "Installing… \(Int($0 * 100))%" } ?? "Installing…"
+            case .queued: return "Queued to install"
+            case .paused: return "Install paused"
+            case .failed: return "Install failed"
+            case .done: break
+            }
+        }
         if game.isInstalled {
             if let pt = game.playtimeFormatted { return pt }
             return game.sizeBytes > 0 ? game.sizeFormatted : "Installed"
@@ -3072,7 +3153,10 @@ struct GameCardView: View {
             // the old CEF/websocket rendering trouble was about), so there's no "launch
             // through Steam" option for them. Epic games still launch via legendary
             // (onLaunch), which works fine since that's a lightweight native CLI.
-            if game.isInstalled {
+            if let di = downloadItem {
+                DownloadStatusView(item: di, onPause: onPauseDownload, onResume: onResumeDownload,
+                                   onCancel: onCancelDownload, onRetry: onRetryDownload)
+            } else if game.isInstalled {
                 HStack(spacing: 6) {
                     primaryActionButton
                     overflowMenu
@@ -3154,6 +3238,17 @@ struct GameCardView: View {
                 coverImage
                     .frame(width: geo.size.width, height: geo.size.height)
                     .clipped()
+
+                // Cover-art fill-as-it-installs: a bottom-up wash that rises with
+                // progress, so a glance at the grid shows install state without
+                // reading the caption underneath.
+                if let di = downloadItem, di.state == .downloading || di.state == .queued {
+                    Rectangle()
+                        .fill(Fog.accent.opacity(0.24))
+                        .frame(width: geo.size.width, height: geo.size.height * CGFloat(di.progress ?? 0.03))
+                        .frame(width: geo.size.width, height: geo.size.height, alignment: .bottom)
+                        .animation(.easeOut(duration: 0.4), value: di.progress)
+                }
 
                 LinearGradient(
                     colors: [.clear, .clear, .black.opacity(0.55), .black.opacity(0.92)],
@@ -3704,6 +3799,9 @@ struct SidebarView: View {
     let epicLoggedIn: Bool
     let steamLoggedIn: Bool
     var focusedRow: String? = nil
+    var downloadQueueCount: Int = 0
+    var activeDownloadProgress: Double? = nil   // nil while nothing is actively downloading
+    var onOpenDownloads: () -> Void = {}
 
     private let navOrder = sidebarNavOrder
 
@@ -3760,6 +3858,11 @@ struct SidebarView: View {
             .padding(.horizontal, 8)
 
             Spacer()
+            if downloadQueueCount > 0 {
+                downloadMeter
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 6)
+            }
             Divider().background(Fog.hairline)
             VStack(spacing: 2) {
                 SidebarRow(title: "Settings", systemImage: "gearshape.fill", tint: Fog.inkFaint,
@@ -3771,6 +3874,33 @@ struct SidebarView: View {
             .padding(.vertical, 8)
         }
         .background(LinearGradient(colors: [Fog.bgElevated, Fog.bg], startPoint: .top, endPoint: .bottom))
+    }
+
+    private var downloadMeter: some View {
+        Button(action: onOpenDownloads) {
+            HStack(spacing: 9) {
+                ZStack {
+                    Circle().stroke(Fog.hairline, lineWidth: 2.5).frame(width: 20, height: 20)
+                    Circle()
+                        .trim(from: 0, to: activeDownloadProgress ?? 0.12)
+                        .stroke(Fog.accent, style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
+                        .frame(width: 20, height: 20)
+                        .rotationEffect(.degrees(-90))
+                }
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(activeDownloadProgress != nil ? "Downloading…" : "Queued")
+                        .font(.caption.bold()).foregroundColor(Fog.ink)
+                    Text("\(downloadQueueCount) item\(downloadQueueCount == 1 ? "" : "s")")
+                        .font(.caption2).foregroundColor(Fog.inkFaint)
+                }
+                Spacer()
+                Image(systemName: "chevron.right").font(.caption2).foregroundColor(Fog.inkFaint)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(Fog.haze, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -3817,6 +3947,11 @@ struct GameGridView: View {
     var sourceLabel: String = "your"
     var isCustomSource: Bool = false   // "My Apps" — no account, empty state offers Add instead of sign-in
     var onAddCustomApp: () -> Void = {}
+    var downloadStates: [String: DownloadQueueItem] = [:]   // keyed by appid
+    var onPauseDownload: (String) -> Void = { _ in }
+    var onResumeDownload: (String) -> Void = { _ in }
+    var onCancelDownload: (String) -> Void = { _ in }
+    var onRetryDownload: (String) -> Void = { _ in }
     // Reported up so gamepad up/down navigation (owned by ContentView, which
     // doesn't know the grid's actual rendered width) can move by a full row
     // instead of a single card. See onGridWidthChange below for how it's measured.
@@ -3973,6 +4108,11 @@ struct GameGridView: View {
                         onInstallWorkshopItem: { onInstallWorkshopItem(g) },
                         onSelect: { onSelect(g) },
                         onLocate: { onLocate(g) },
+                        downloadItem: downloadStates[g.id],
+                        onPauseDownload: { onPauseDownload(g.id) },
+                        onResumeDownload: { onResumeDownload(g.id) },
+                        onCancelDownload: { onCancelDownload(g.id) },
+                        onRetryDownload: { onRetryDownload(g.id) },
                         isFocused: focusedGameID == g.id
                     )
                     .id(g.id)
@@ -4320,6 +4460,11 @@ struct GameDetailView: View {
     var onInstallWorkshopID: (String) -> Void = { _ in }
     var onOpenSettings: () -> Void = {}
     var onLocate: () -> Void = {}
+    var downloadItem: DownloadQueueItem? = nil
+    var onPauseDownload: () -> Void = {}
+    var onResumeDownload: () -> Void = {}
+    var onCancelDownload: () -> Void = {}
+    var onRetryDownload: () -> Void = {}
 
     @Environment(\.dismiss) private var dismiss
     @State private var details: SteamAppDetails?
@@ -4531,7 +4676,10 @@ struct GameDetailView: View {
 
     @ViewBuilder
     private var actionRow: some View {
-        if game.isInstalled {
+        if let di = downloadItem {
+            DownloadStatusView(item: di, onPause: onPauseDownload, onResume: onResumeDownload,
+                               onCancel: onCancelDownload, onRetry: onRetryDownload)
+        } else if game.isInstalled {
             HStack(spacing: 8) {
                 Button { GameActions.bestPlay(for: game, d3dMetalAvailable: d3dMetalAvailable)(actionsBundle) } label: {
                     Label(game.antiCheat != .none ? "Play Offline" : "Play", systemImage: "play.fill")
@@ -5518,6 +5666,49 @@ struct LibraryMutationModifiers: ViewModifier {
     }
 }
 
+// The downloads queue sheet + the install-finished toast — pulled out for the
+// same reason as LibraryMutationModifiers above: keeping ContentView.body's
+// modifier chain short enough for SwiftUI's type-checker.
+struct DownloadsUIModifiers: ViewModifier {
+    @ObservedObject var downloadManager: SteamDownloadManager
+    @Binding var showingDownloadsQueue: Bool
+    @Binding var installToast: Game?
+    var onPlay: (Game) -> Void
+
+    func body(content: Content) -> some View {
+        content
+            .sheet(isPresented: $showingDownloadsQueue) {
+                DownloadsQueueView(
+                    downloadManager: downloadManager,
+                    onPause: { downloadManager.pause(id: $0) },
+                    onResume: { downloadManager.resume(id: $0) },
+                    onCancel: { downloadManager.cancel(id: $0) },
+                    onRetry: { downloadManager.retry(id: $0) },
+                    onMoveUp: { downloadManager.moveUp(id: $0) },
+                    onMoveDown: { downloadManager.moveDown(id: $0) }
+                )
+            }
+            .overlay(alignment: .bottomTrailing) {
+                if let g = installToast {
+                    InstallFinishedToast(
+                        game: g,
+                        onPlay: { onPlay(g); installToast = nil },
+                        onDismiss: { installToast = nil }
+                    )
+                    .padding(20)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .onAppear {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
+                            if installToast?.id == g.id {
+                                withAnimation { installToast = nil }
+                            }
+                        }
+                    }
+                }
+            }
+    }
+}
+
 struct AddCustomAppView: View {
     let suggestedName: String
     var onSave: (String) -> Void
@@ -5556,6 +5747,184 @@ struct AddCustomAppView: View {
         }
         .padding(22)
         .frame(width: 340)
+    }
+}
+
+// Renders one download's state (queued/downloading/paused/failed) with the
+// controls appropriate to it — shared by the game card, the detail page, and
+// the queue sheet so all three stay visually and behaviorally in sync.
+struct DownloadStatusView: View {
+    let item: DownloadQueueItem
+    var onPause: () -> Void = {}
+    var onResume: () -> Void = {}
+    var onCancel: () -> Void = {}
+    var onRetry: () -> Void = {}
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            switch item.state {
+            case .queued:
+                HStack(spacing: 6) {
+                    Image(systemName: "clock").font(.caption2).foregroundColor(Fog.inkFaint)
+                    Text("Queued").font(.caption).foregroundColor(Fog.inkDim)
+                    Spacer()
+                    cancelButton
+                }
+            case .downloading:
+                ProgressView(value: item.progress ?? 0).tint(Fog.accent)
+                HStack(spacing: 6) {
+                    Text(item.progress.map { "\(Int($0 * 100))%" } ?? "…")
+                        .font(.caption2).foregroundColor(Fog.inkDim)
+                    if let s = item.speedFormatted {
+                        Text("· \(s)").font(.caption2).foregroundColor(Fog.inkFaint)
+                    }
+                    if let e = item.etaFormatted {
+                        Text("· \(e)").font(.caption2).foregroundColor(Fog.inkFaint)
+                    }
+                    Spacer()
+                    pauseButton
+                    cancelButton
+                }
+            case .paused:
+                HStack(spacing: 6) {
+                    Text("Paused").font(.caption).foregroundColor(Fog.inkDim)
+                    Spacer()
+                    resumeButton
+                    cancelButton
+                }
+            case .failed(let message):
+                HStack(alignment: .top, spacing: 6) {
+                    Text(message).font(.caption2).foregroundColor(.red).lineLimit(2)
+                    Spacer()
+                    retryButton
+                    cancelButton
+                }
+            case .done:
+                EmptyView()
+            }
+        }
+    }
+
+    private var pauseButton: some View {
+        Button(action: onPause) { Image(systemName: "pause.fill") }
+            .buttonStyle(.plain).foregroundColor(Fog.inkDim)
+    }
+    private var resumeButton: some View {
+        Button(action: onResume) { Image(systemName: "play.fill") }
+            .buttonStyle(.plain).foregroundColor(Fog.accent)
+    }
+    private var retryButton: some View {
+        Button(action: onRetry) { Image(systemName: "arrow.clockwise") }
+            .buttonStyle(.plain).foregroundColor(Fog.accent)
+    }
+    private var cancelButton: some View {
+        Button(action: onCancel) { Image(systemName: "xmark.circle.fill") }
+            .buttonStyle(.plain).foregroundColor(Fog.inkFaint)
+    }
+}
+
+// The full download queue — every base-game and workshop-item entry, in
+// queue order, with per-item speed/ETA and pause/resume/cancel/retry, plus
+// up/down reordering of the still-pending items.
+struct DownloadsQueueView: View {
+    @ObservedObject var downloadManager: SteamDownloadManager
+    var onPause: (String) -> Void
+    var onResume: (String) -> Void
+    var onCancel: (String) -> Void
+    var onRetry: (String) -> Void
+    var onMoveUp: (String) -> Void
+    var onMoveDown: (String) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Downloads").font(Fog.display(18, weight: .medium)).foregroundColor(Fog.ink)
+                Spacer()
+                Button("Done") { dismiss() }.buttonStyle(.bordered)
+            }
+            .padding(16)
+            Divider().overlay(Fog.hairline)
+            if downloadManager.queue.isEmpty {
+                VStack(spacing: 10) {
+                    Image(systemName: "arrow.down.circle").font(.system(size: 34)).foregroundColor(Fog.inkFaint)
+                    Text("Nothing downloading").foregroundColor(Fog.inkDim)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    VStack(spacing: 10) {
+                        ForEach(Array(downloadManager.queue.enumerated()), id: \.element.id) { index, item in
+                            queueRow(item, index: index)
+                        }
+                    }
+                    .padding(16)
+                }
+            }
+        }
+        .frame(width: 420, height: 460)
+        .background(Fog.bg)
+    }
+
+    private func queueRow(_ item: DownloadQueueItem, index: Int) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Fog.haze)
+                Image(systemName: item.pubfileID != nil ? "shippingbox" : "square.stack.3d.up")
+                    .foregroundColor(Fog.inkFaint)
+            }
+            .frame(width: 42, height: 56)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(item.name).font(.callout.bold()).foregroundColor(Fog.ink).lineLimit(1)
+                DownloadStatusView(
+                    item: item,
+                    onPause: { onPause(item.id) },
+                    onResume: { onResume(item.id) },
+                    onCancel: { onCancel(item.id) },
+                    onRetry: { onRetry(item.id) }
+                )
+            }
+
+            VStack(spacing: 2) {
+                Button(action: { onMoveUp(item.id) }) { Image(systemName: "chevron.up") }
+                    .buttonStyle(.plain).foregroundColor(Fog.inkFaint)
+                    .disabled(index == 0)
+                Button(action: { onMoveDown(item.id) }) { Image(systemName: "chevron.down") }
+                    .buttonStyle(.plain).foregroundColor(Fog.inkFaint)
+                    .disabled(index == downloadManager.queue.count - 1)
+            }
+            .font(.caption)
+        }
+        .padding(10)
+        .background(Fog.bgElevated, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+}
+
+// A transient banner offering a direct "Play" action right after a Steam
+// install finishes — shown by ContentView, auto-dismissed a few seconds later.
+struct InstallFinishedToast: View {
+    let game: Game
+    var onPlay: () -> Void
+    var onDismiss: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "checkmark.circle.fill").foregroundColor(Fog.good).font(.system(size: 20))
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(game.name) installed").font(.callout.bold()).foregroundColor(Fog.ink)
+                Text("Ready to play").font(.caption).foregroundColor(Fog.inkDim)
+            }
+            Button(action: onPlay) { Label("Play", systemImage: "play.fill") }
+                .buttonStyle(.borderedProminent).tint(Fog.accent)
+            Button(action: onDismiss) { Image(systemName: "xmark") }
+                .buttonStyle(.plain).foregroundColor(Fog.inkFaint)
+        }
+        .padding(14)
+        .background(Fog.bgElevated, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Fog.hairline))
+        .shadow(color: .black.opacity(0.4), radius: 20, y: 8)
+        .frame(maxWidth: 340)
     }
 }
 
@@ -6255,6 +6624,10 @@ struct ContentView: View {
     @State private var focusedGameIndex = 0
     @State private var libraryFilter: LibraryFilter = .all
     @State private var gridColumns = 1
+    @State private var showingDownloadsQueue = false
+    // The game that just finished installing — drives a transient "Play" toast,
+    // auto-dismissed a few seconds after it appears (see the toast's .onAppear).
+    @State private var installToast: Game?
     // Persisted so a user who skips account sign-in during first run isn't shown
     // the onboarding accounts step again on every launch — connecting an account
     // later (e.g. from Settings) also permanently satisfies this via the isLoggedIn
@@ -6329,15 +6702,45 @@ struct ContentView: View {
         if game.source == .epic {
             processManager.epicInstall(appName: game.id)
         } else if game.source == .steam {
-            downloadManager.install(appid: game.id, name: game.name,
-                                    steamAccountName: steamAuth.accountName) {
+            downloadManager.enqueue(appid: game.id, name: game.name,
+                                    steamAccountName: steamAuth.accountName,
+                                    coverURL: URL(string: SteamLibraryService.coverURL(forAppID: game.id))) {
                 library.scan()
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) { installToast = game }
             }
         }
     }
 
     private func handleShowInFinder(_ game: Game) {
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: game.installDir)])
+    }
+
+    // Maps appid -> its queue entry (base-game downloads only, never a workshop
+    // item) so cards/detail pages can show install progress without each one
+    // observing the whole download manager.
+    var downloadStates: [String: DownloadQueueItem] {
+        Dictionary(downloadManager.queue.filter { $0.pubfileID == nil }.map { ($0.appid, $0) },
+                   uniquingKeysWith: { a, _ in a })
+    }
+
+    private var downloadBarTitle: String {
+        if let active = downloadManager.queue.first(where: { $0.state == .downloading }) {
+            return "Installing \(active.name)…"
+        } else if downloadManager.queue.contains(where: { if case .failed = $0.state { return true }; return false }) {
+            return "A download needs attention"
+        } else if downloadManager.queue.contains(where: { $0.state == .paused }) {
+            return "Downloads paused"
+        }
+        return "Preparing…"
+    }
+
+    private var downloadBarSubtitle: String {
+        let remaining = downloadManager.queue.count
+        if let active = downloadManager.queue.first(where: { $0.state == .downloading }) {
+            let base = active.statusText.isEmpty ? "" : active.statusText
+            return remaining > 1 ? "\(base) · \(remaining) in queue" : base
+        }
+        return remaining > 1 ? "\(remaining) items in queue" : ""
     }
 
     var filteredGames: [Game] {
@@ -6470,7 +6873,10 @@ struct ContentView: View {
                         epicCount: library.games.filter { $0.source == .epic }.count,
                         customCount: library.games.filter { $0.source == .custom }.count,
                         epicLoggedIn: processManager.epicLoggedIn,
-                        steamLoggedIn: steamAuth.isLoggedIn
+                        steamLoggedIn: steamAuth.isLoggedIn,
+                        downloadQueueCount: downloadManager.queue.count,
+                        activeDownloadProgress: downloadManager.queue.first(where: { $0.state == .downloading })?.progress,
+                        onOpenDownloads: { showingDownloadsQueue = true }
                     )
                     .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 280)
                 } detail: {
@@ -6585,6 +6991,11 @@ struct ContentView: View {
                                 sourceLabel: sourceLabel,
                                 isCustomSource: sidebarSelection == "custom",
                                 onAddCustomApp: { showingAddCustomApp = true },
+                                downloadStates: downloadStates,
+                                onPauseDownload: { id in downloadManager.pause(id: id) },
+                                onResumeDownload: { id in downloadManager.resume(id: id) },
+                                onCancelDownload: { id in downloadManager.cancel(id: id) },
+                                onRetryDownload: { id in downloadManager.retry(id: id) },
                                 onGridWidthChange: { width in
                                     // Matches SwiftUI's .adaptive(minimum:maximum:) column
                                     // count: as many 160pt (+14pt spacing) columns as fit.
@@ -6611,74 +7022,24 @@ struct ContentView: View {
                             }
                             .padding(12)
                             .background(.bar)
-                        } else if downloadManager.isDownloading, let qrImage = downloadManager.downloadQRImage {
-                            // DepotDownloader (this version) only emits a terminal
-                            // ASCII-art QR, no plain URL to re-render via CoreImage —
-                            // rasterized into a real pixel image (renderTerminalQR)
-                            // instead of shown as text, since text rendering can't
-                            // guarantee the exact square alignment a QR needs to scan.
-                            VStack(spacing: 8) {
-                                Text("Installing \(downloadManager.downloadingName ?? "…") — scan with the Steam Mobile app")
-                                    .font(.callout.bold())
-                                Image(nsImage: qrImage)
-                                    .interpolation(.none)
-                                    .resizable()
-                                    .aspectRatio(contentMode: .fit)
-                                    .frame(maxWidth: 260, maxHeight: 260)
-                                    .padding(8)
-                                    .background(Color.white)
-                                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                                Text(downloadManager.downloadStatusText)
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                                Button("Cancel") { downloadManager.cancel() }
-                                    .buttonStyle(.bordered)
-                            }
-                            .padding(12)
-                            .frame(maxWidth: .infinity)
-                            .background(.bar)
-                        } else if downloadManager.isDownloading {
+                        } else if !downloadManager.queue.isEmpty {
+                            let active = downloadManager.queue.first(where: { $0.state == .downloading })
                             HStack(spacing: 12) {
-                                if let qr = downloadManager.downloadQRURL {
-                                    SteamQRCodeView(urlString: qr)
-                                        .frame(width: 60, height: 60)
-                                        .background(Color.white)
-                                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                                if let p = active?.progress {
+                                    ProgressView(value: p).progressViewStyle(.circular).controlSize(.small)
                                 } else {
-                                    ProgressView()
-                                        .controlSize(.small)
+                                    ProgressView().controlSize(.small)
                                 }
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text("Installing \(downloadManager.downloadingName ?? "…")")
+                                    Text(downloadBarTitle)
                                         .font(.callout.bold())
-                                    Text(downloadManager.downloadStatusText)
+                                    Text(downloadBarSubtitle)
                                         .font(.caption)
                                         .foregroundColor(.secondary)
-                                        .lineLimit(2)
-                                    if let progress = downloadManager.downloadProgress {
-                                        ProgressView(value: progress)
-                                            .progressViewStyle(.linear)
-                                            .frame(maxWidth: 240)
-                                    }
+                                        .lineLimit(1)
                                 }
                                 Spacer()
-                                Button("Cancel") { downloadManager.cancel() }
-                                    .buttonStyle(.bordered)
-                            }
-                            .padding(12)
-                            .background(.bar)
-                        } else if let err = downloadManager.downloadError {
-                            HStack(alignment: .top, spacing: 12) {
-                                Image(systemName: "exclamationmark.triangle.fill")
-                                    .foregroundColor(.red)
-                                ScrollView {
-                                    Text(err)
-                                        .font(.system(.caption, design: .monospaced))
-                                        .textSelection(.enabled)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                }
-                                .frame(maxHeight: 120)
-                                Button("Dismiss") { downloadManager.downloadError = nil }
+                                Button("View Queue") { showingDownloadsQueue = true }
                                     .buttonStyle(.bordered)
                             }
                             .padding(12)
@@ -6720,6 +7081,12 @@ struct ContentView: View {
             onAddCustomApp: { name, path in library.addCustomApp(name: name, exePath: path) },
             onRelocateCustomApp: { id, path in library.relocateCustomApp(id: id, newExePath: path) }
         ))
+        .modifier(DownloadsUIModifiers(
+            downloadManager: downloadManager,
+            showingDownloadsQueue: $showingDownloadsQueue,
+            installToast: $installToast,
+            onPlay: { game in handleLaunch(game) }
+        ))
         .sheet(item: $gameForLaunchOptions) { game in
             LaunchOptionsView(game: game, onShowInFinder: {
                 NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: game.installDir)])
@@ -6727,7 +7094,7 @@ struct ContentView: View {
         }
         .sheet(item: $gameForWorkshopInstall) { game in
             WorkshopInstallView(game: game) { pubfileID in
-                downloadManager.installWorkshopItem(appid: game.id, pubfileID: pubfileID, gameName: game.name,
+                downloadManager.enqueueWorkshopItem(appid: game.id, pubfileID: pubfileID, gameName: game.name,
                                                     steamAccountName: steamAuth.accountName) {
                     library.scan()
                 }
@@ -6745,7 +7112,7 @@ struct ContentView: View {
                 onLaunchOptions: { gameForLaunchOptions = game },
                 onInstallWorkshopItem: { gameForWorkshopInstall = game },
                 onInstallWorkshopID: { pubfileID in
-                    downloadManager.installWorkshopItem(appid: game.id, pubfileID: pubfileID,
+                    downloadManager.enqueueWorkshopItem(appid: game.id, pubfileID: pubfileID,
                                                         gameName: game.name,
                                                         steamAccountName: steamAuth.accountName) {
                         library.scan()
@@ -6755,7 +7122,12 @@ struct ContentView: View {
                     gameForDetail = nil
                     sidebarSelection = "settings"
                 },
-                onLocate: { relocatingCustomAppID = game.id }
+                onLocate: { relocatingCustomAppID = game.id },
+                downloadItem: downloadStates[game.id],
+                onPauseDownload: { downloadManager.pause(id: game.id) },
+                onResumeDownload: { downloadManager.resume(id: game.id) },
+                onCancelDownload: { downloadManager.cancel(id: game.id) },
+                onRetryDownload: { downloadManager.retry(id: game.id) }
             )
         }
         .focusedSceneValue(\.rescanAction, { library.scan() })
