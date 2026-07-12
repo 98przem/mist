@@ -5976,10 +5976,14 @@ struct ContentView: View {
 
     private func refreshOwnedSteamGames() {
         guard steamAuth.isLoggedIn else { return }
-        // Owned games over the client protocol (relay), so this doesn't depend on a
-        // separately-minted Steam Web API token. Filtering the Family-shared list
-        // against this is what keeps games you actually own from being mislabelled
-        // "Shared". Falls back to the Web API only if the relay path fails.
+        // Both fetches go over the relay's client-protocol session (owned games this
+        // way so it doesn't depend on a separately-minted Steam Web API token;
+        // family-shared to filter out what you already own). Each relay call opens
+        // its own CM connection with the SAME refresh token — firing them as two
+        // concurrent Tasks made Steam kick the second connection ("A task was
+        // canceled"), silently swallowed by the family fetch's best-effort `try?`,
+        // which is why Family Shared games would randomly go missing. Run them one
+        // after another instead of concurrently.
         Task {
             do {
                 let owned: [OwnedGame]
@@ -6000,10 +6004,8 @@ struct ContentView: View {
                     library.lastError = "Couldn't fetch your Steam library: \(error.localizedDescription)"
                 }
             }
-        }
-        // Best-effort: most accounts aren't in a Steam Family, so an empty/failed
-        // result here just means "no shared games" — never surfaced as an error.
-        Task {
+            // Best-effort: most accounts aren't in a Steam Family, so an empty/failed
+            // result here just means "no shared games" — never surfaced as an error.
             if let shared = try? await RelayManager.familyLibrary() {
                 await MainActor.run { library.applyFamilyLibraryGames(shared) }
             }
