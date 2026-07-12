@@ -57,16 +57,46 @@ struct Game: Identifiable, Hashable {
     var hasLinuxEAC: Bool = false
     var imageURL: String = ""  // cover art URL
     var isFamilyShared: Bool = false  // available via Steam Family library sharing, not owned outright
+    var playtimeMinutes: Int = 0     // total, from IPlayerService (0 if unknown)
+    var lastPlayed: Date? = nil      // last time this account launched it
+    var addedAt: Date? = nil         // when it first appeared in Mist's library (for the "New" ribbon)
 
     var sizeFormatted: String {
         if sizeBytes > 1_073_741_824 {
-            return "\(sizeBytes / 1_073_741_824) GB"
+            return String(format: "%.1f GB", Double(sizeBytes) / 1_073_741_824)
         } else if sizeBytes > 1_048_576 {
             return "\(sizeBytes / 1_048_576) MB"
         } else if sizeBytes > 0 {
             return "\(sizeBytes / 1024) KB"
         }
         return "—"
+    }
+
+    // "6h 40m" / "42m" / nil when never played.
+    var playtimeFormatted: String? {
+        guard playtimeMinutes > 0 else { return nil }
+        let h = playtimeMinutes / 60, m = playtimeMinutes % 60
+        return h > 0 ? "\(h)h \(m)m" : "\(m)m"
+    }
+
+    // "Yesterday" / "3 days ago" / "Jul 8" — a quiet recency line.
+    var lastPlayedFormatted: String? {
+        guard let lastPlayed else { return nil }
+        let days = Calendar.current.dateComponents([.day], from: lastPlayed, to: Date()).day ?? 0
+        switch days {
+        case 0: return "Today"
+        case 1: return "Yesterday"
+        case 2...6: return "\(days) days ago"
+        default:
+            let f = DateFormatter(); f.dateFormat = "MMM d"
+            return f.string(from: lastPlayed)
+        }
+    }
+
+    // Freshly added to the library within the last day → gets a "New" ribbon.
+    var isNew: Bool {
+        guard let addedAt else { return false }
+        return Date().timeIntervalSince(addedAt) < 24 * 3600
     }
 
     func hash(into hasher: inout Hasher) {
@@ -520,6 +550,19 @@ class GameLibrary: ObservableObject {
     }
 
     private func recomputeGames() {
+        // Playtime / last-played come from the owned-games fetch (IPlayerService),
+        // keyed by appid — overlay them onto every matching game, installed or not.
+        let statsByID: [String: (playtime: Int, last: Int)] = Dictionary(
+            ownedSteamGames.map { ($0.id, ($0.playtimeForever, $0.lastPlayed)) },
+            uniquingKeysWith: { a, _ in a })
+        func withStats(_ g: Game) -> Game {
+            guard g.source == .steam, let s = statsByID[g.id] else { return g }
+            var g = g
+            g.playtimeMinutes = s.playtime
+            g.lastPlayed = s.last > 0 ? Date(timeIntervalSince1970: TimeInterval(s.last)) : nil
+            return g
+        }
+
         let existingIDs = Set(scannedGames.filter { $0.source == .steam }.map(\.id))
         let placeholders = ownedSteamGames.filter { !existingIDs.contains($0.id) }.map { og in
             Game(id: og.id, name: og.name, source: .steam, installDir: "",
@@ -543,7 +586,29 @@ class GameLibrary: ObservableObject {
                     sizeBytes: 0, isInstalled: false,
                     imageURL: SteamLibraryService.coverURL(forAppID: fg.id), isFamilyShared: true)
             }
-        games = (scannedGames + placeholders + familyPlaceholders).sorted { $0.name.lowercased() < $1.name.lowercased() }
+        let merged = (scannedGames + placeholders + familyPlaceholders).map(withStats)
+        games = stampFirstSeen(merged).sorted { $0.name.lowercased() < $1.name.lowercased() }
+    }
+
+    // Records when each game first appeared so the "New" ribbon only marks genuinely
+    // new arrivals — not the whole library on first run (that batch is backfilled as
+    // "already seen"). Stored in UserDefaults as [gameKey: unix-seconds].
+    private func stampFirstSeen(_ list: [Game]) -> [Game] {
+        let key = "libraryFirstSeen"
+        var seen = (UserDefaults.standard.dictionary(forKey: key) as? [String: Double]) ?? [:]
+        let firstRun = seen.isEmpty
+        let now = Date().timeIntervalSince1970
+        var changed = false
+        for g in list {
+            let k = "\(g.source.rawValue):\(g.id)"
+            if seen[k] == nil { seen[k] = firstRun ? 0 : now; changed = true }
+        }
+        if changed { UserDefaults.standard.set(seen, forKey: key) }
+        return list.map { g in
+            var g = g
+            if let t = seen["\(g.source.rawValue):\(g.id)"], t > 0 { g.addedAt = Date(timeIntervalSince1970: t) }
+            return g
+        }
     }
 
     private func scanSteamGames() -> [Game] {
@@ -1035,6 +1100,7 @@ struct OwnedGame: Identifiable, Hashable {
     let name: String
     let playtimeForever: Int
     let coverURL: String
+    var lastPlayed: Int = 0   // unix seconds, 0 if never
 }
 
 enum SteamLibraryService {
@@ -1245,8 +1311,24 @@ struct SteamAchievement: Identifiable, Decodable {
 
 struct SteamAppDetails: Decodable {
     struct Genre: Decodable { let description: String }
+    struct Screenshot: Decodable { let id: Int; let path_full: String? }
+    struct Release: Decodable { let date: String? }
     let short_description: String?
     let genres: [Genre]?
+    let developers: [String]?
+    let publishers: [String]?
+    let screenshots: [Screenshot]?
+    let release_date: Release?
+
+    var genreNames: [String] { (genres ?? []).map(\.description) }
+    var developerName: String? { developers?.first ?? publishers?.first }
+    // Steam returns "8 Jun, 2021" etc.; pull a year if present.
+    var releaseYear: String? {
+        guard let d = release_date?.date else { return nil }
+        if let m = d.range(of: #"\d{4}"#, options: .regularExpression) { return String(d[m]) }
+        return nil
+    }
+    var screenshotURLs: [String] { (screenshots ?? []).compactMap(\.path_full) }
 }
 
 // One result from the public storesearch API — the wider Steam catalog, not
@@ -1436,6 +1518,8 @@ struct FamilySharedGame: Decodable {
 struct RelayOwnedGame: Decodable {
     let appid: Int
     let name: String
+    var playtimeForever: Int = 0   // minutes
+    var lastPlayed: Int = 0        // unix seconds, 0 if never
     var id: String { String(appid) }
 }
 
@@ -2246,6 +2330,8 @@ class ProcessManager: ObservableObject {
     @Published var isRunning = false
     @Published var currentGame: Game?
     @Published var outputLog: String = ""
+    @Published var launchedAt: Date?      // when the current/last session started
+    @Published var endedAt: Date?         // when it ended (for the session summary)
 
     private var process: Process?
     private var dialogKillerTimer: Timer?
@@ -2511,6 +2597,8 @@ class ProcessManager: ObservableObject {
                             waitForWineserverAfter: Bool = false,
                             onExit: (() -> Void)? = nil) {
         isRunning = true
+        launchedAt = Date()
+        endedAt = nil
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: path)
@@ -2544,7 +2632,9 @@ class ProcessManager: ObservableObject {
                 DispatchQueue.main.async {
                     self?.outputLog += "\n[Process exited with code \(p.terminationStatus)]\n"
                     self?.isRunning = false
-                    self?.currentGame = nil
+                    self?.endedAt = Date()
+                    // currentGame is kept so the running view can show a session
+                    // summary; it's replaced on the next launch.
                     self?.dialogKillerTimer?.invalidate()
                     self?.dialogKillerTimer = nil
                     onExit?()
@@ -2836,6 +2926,21 @@ struct GameCardView: View {
 
     private var d3dMetalAvailable: Bool { D3DMetalProvider.detect() != nil }
 
+    // A single status dot encodes state at a glance (idea 10).
+    private var statusColor: Color {
+        if game.isInstalled { return Fog.good }
+        if game.isFamilyShared { return Fog.accent }
+        return Color.white.opacity(0.35)
+    }
+    // The primary metadata line: playtime if you've played it, else size, else state.
+    private var metaPrimary: String {
+        if game.isInstalled {
+            if let pt = game.playtimeFormatted { return pt }
+            return game.sizeBytes > 0 ? game.sizeFormatted : "Installed"
+        }
+        return game.isFamilyShared ? "Family shared" : "Not installed"
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             poster
@@ -2928,15 +3033,14 @@ struct GameCardView: View {
                         .foregroundColor(.white)
                         .lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
-                    HStack(spacing: 4) {
-                        Image(systemName: game.source == .steam ? "cloud.fill" : "bolt.fill")
-                            .font(.system(size: 8))
-                        Text(game.isInstalled
-                             ? (game.sizeBytes > 0 ? game.sizeFormatted : game.source.rawValue)
-                             : "Not installed")
-                            .font(.system(size: 11))
+                    HStack(spacing: 5) {
+                        Circle().fill(statusColor).frame(width: 6, height: 6)
+                        Text(metaPrimary).font(.system(size: 11))
+                        if isHovering, let lp = game.lastPlayedFormatted, game.isInstalled {
+                            Text("· \(lp)").font(.system(size: 10.5)).foregroundColor(.white.opacity(0.5))
+                        }
                     }
-                    .foregroundColor(.white.opacity(0.7))
+                    .foregroundColor(.white.opacity(0.72))
                 }
                 .padding(10)
                 .frame(width: geo.size.width, alignment: .leading)
@@ -2960,18 +3064,26 @@ struct GameCardView: View {
             }
         }
         .overlay(alignment: .topLeading) {
-            if game.isFamilyShared {
-                HStack(spacing: 3) {
-                    Image(systemName: "person.2.fill")
-                    Text("Shared")
+            VStack(alignment: .leading, spacing: 5) {
+                if game.isNew {
+                    Text("NEW")
+                        .font(.system(size: 9, weight: .heavy)).tracking(0.5)
+                        .padding(.horizontal, 6).padding(.vertical, 3)
+                        .background(Fog.accent, in: Capsule())
+                        .foregroundColor(Color(red: 0x0b/255, green: 0x10/255, blue: 0x20/255))
                 }
-                .font(.system(size: 9, weight: .semibold))
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
-                .background(.black.opacity(0.6), in: Capsule())
-                .foregroundColor(Fog.accent)
-                .padding(7)
+                if game.isFamilyShared {
+                    HStack(spacing: 3) {
+                        Image(systemName: "person.2.fill")
+                        Text("Shared")
+                    }
+                    .font(.system(size: 9, weight: .semibold))
+                    .padding(.horizontal, 6).padding(.vertical, 3)
+                    .background(.black.opacity(0.6), in: Capsule())
+                    .foregroundColor(Fog.accent)
+                }
             }
+            .padding(7)
         }
         .allowsHitTesting(false)
     }
@@ -3047,71 +3159,329 @@ struct GameCardView: View {
     }
 }
 
+// The first-run flow: Engine -> Accounts -> Play, on a progress rail. Which step
+// shows is derived from persisted state (wineInstalled, each service's login),
+// never from transient wizard state — so quitting mid-download or mid-login and
+// reopening Mist resumes exactly where you left off instead of restarting.
+enum OnboardingStep: Int, CaseIterable {
+    case engine, accounts, play
+
+    var title: String {
+        switch self {
+        case .engine: return "Engine ready"
+        case .accounts: return "Sign in"
+        case .play: return "Pick a game"
+        }
+    }
+    var subtitle: String {
+        switch self {
+        case .engine: return "Downloaded once · ~200 MB"
+        case .accounts: return "Connect Steam and/or Epic"
+        case .play: return "Install & play"
+        }
+    }
+}
+
 struct SetupView: View {
+    @ObservedObject var setup: SetupManager
+    @ObservedObject var steamAuth: SteamAuthManager
+    @ObservedObject var processManager: ProcessManager
+    var onFinishOnboarding: () -> Void
+
+    private var currentStep: OnboardingStep {
+        if !setup.isComplete { return .engine }
+        if !steamAuth.isLoggedIn && !processManager.epicLoggedIn { return .accounts }
+        return .play
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            OnboardingRail(current: currentStep)
+                .frame(width: 220)
+                .padding(.vertical, 40)
+                .padding(.leading, 36)
+
+            Divider().background(Fog.hairline).padding(.vertical, 40)
+
+            Group {
+                switch currentStep {
+                case .engine: EngineStepView(setup: setup)
+                case .accounts, .play:
+                    AccountsStepView(steamAuth: steamAuth, processManager: processManager,
+                                     onContinue: onFinishOnboarding)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(40)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Fog.bg)
+    }
+}
+
+private struct OnboardingRail: View {
+    let current: OnboardingStep
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 9) {
+                ZStack {
+                    Circle()
+                        .fill(RadialGradient(colors: [Color(red: 0x9d/255, green: 0xb8/255, blue: 1),
+                                                       Fog.accent, Color(red: 0x47/255, green: 0x63/255, blue: 0xc2/255)],
+                                             center: .init(x: 0.3, y: 0.25), startRadius: 0, endRadius: 20))
+                        .frame(width: 30, height: 30)
+                        .shadow(color: Fog.accent.opacity(0.5), radius: 10)
+                    Image(systemName: "cloud.fog.fill")
+                        .font(.system(size: 13, weight: .semibold)).foregroundColor(.white)
+                }
+                Text("Mist").font(Fog.display(19)).foregroundColor(Fog.ink)
+            }
+            .padding(.bottom, 22)
+
+            ForEach(OnboardingStep.allCases, id: \.self) { step in
+                OnboardingRailRow(step: step, state: state(for: step),
+                                  isLast: step == OnboardingStep.allCases.last)
+            }
+        }
+    }
+
+    private func state(for step: OnboardingStep) -> OnboardingRailRow.RowState {
+        if step.rawValue < current.rawValue { return .done }
+        if step == current { return .now }
+        return .next
+    }
+}
+
+private struct OnboardingRailRow: View {
+    enum RowState { case done, now, next }
+    let step: OnboardingStep
+    let state: RowState
+    let isLast: Bool
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 11) {
+            ZStack {
+                if !isLast {
+                    Rectangle()
+                        .fill(state == .done ? Fog.good : Fog.hairline)
+                        .frame(width: 1.5)
+                        .offset(y: 22)
+                        .frame(height: 44)
+                }
+                Circle()
+                    .fill(state == .done ? Fog.good : state == .now ? Fog.accent : Fog.haze)
+                    .frame(width: 22, height: 22)
+                    .overlay(
+                        Group {
+                            if state == .done {
+                                Image(systemName: "checkmark").font(.system(size: 10, weight: .bold)).foregroundColor(Color(nsColor: .black))
+                            } else {
+                                Text("\(step.rawValue + 1)").font(.system(size: 11, weight: .bold))
+                                    .foregroundColor(state == .now ? Color(nsColor: .black) : Fog.inkFaint)
+                            }
+                        }
+                    )
+                    .shadow(color: state == .now ? Fog.accent.opacity(0.6) : .clear, radius: 6)
+            }
+            .frame(width: 22)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(step.title).font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(state == .next ? Fog.inkFaint : Fog.ink)
+                Text(step.subtitle).font(.system(size: 11)).foregroundColor(Fog.inkFaint)
+            }
+            .padding(.bottom, 18)
+        }
+    }
+}
+
+private struct EngineStepView: View {
     @ObservedObject var setup: SetupManager
 
     var body: some View {
-        VStack(spacing: 22) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 20, style: .continuous)
-                    .fill(LinearGradient(colors: [.purple, .blue], startPoint: .topLeading, endPoint: .bottomTrailing))
-                    .frame(width: 72, height: 72)
-                Image(systemName: "cloud.fog.fill")
-                    .font(.system(size: 32, weight: .medium))
-                    .foregroundColor(.white)
-            }
-            .shadow(color: .purple.opacity(0.3), radius: 16, y: 6)
-
-            VStack(spacing: 6) {
-                Text("Welcome to Mist")
-                    .font(.system(size: 26, weight: .bold))
-                Text("Mist needs to download the Wine engine and its runtime libraries.\nThis is a one-time setup (~200 MB).")
-                    .multilineTextAlignment(.center)
-                    .foregroundColor(.secondary)
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Setting up Mist").font(Fog.display(26, weight: .medium)).foregroundColor(Fog.ink)
+                Text("A one-time download of the Wine compatibility layer Mist runs Windows games through — a translation layer, not a virtual machine. About 200 MB.")
+                    .foregroundColor(Fog.inkDim).frame(maxWidth: 420, alignment: .leading)
             }
 
-            VStack(spacing: 14) {
+            VStack(alignment: .leading, spacing: 14) {
                 Label("Wine engine (CrossOver 24)",
                       systemImage: setup.wineInstalled ? "checkmark.circle.fill" : "circle")
-                    .foregroundColor(setup.wineInstalled ? .green : .secondary)
+                    .foregroundColor(setup.wineInstalled ? Fog.good : Fog.inkDim)
                     .font(.callout)
 
                 if setup.isWorking {
-                    VStack(spacing: 8) {
+                    VStack(alignment: .leading, spacing: 8) {
                         if let progress = setup.downloadProgress {
-                            ProgressView(value: progress)
-                                .progressViewStyle(.linear)
+                            ProgressView(value: progress).progressViewStyle(.linear).tint(Fog.accent)
                         } else {
-                            ProgressView()
-                                .progressViewStyle(.linear)
+                            ProgressView().progressViewStyle(.linear).tint(Fog.accent)
                         }
-                        Text(setup.statusText)
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+                        Text(setup.statusText).font(.caption).foregroundColor(Fog.inkFaint)
                     }
                     .frame(width: 320)
                 } else {
                     if let err = setup.errorText {
                         Label(err, systemImage: "exclamationmark.triangle.fill")
-                            .font(.caption)
-                            .foregroundColor(.red)
-                            .multilineTextAlignment(.center)
-                            .frame(maxWidth: 360)
+                            .font(.caption).foregroundColor(.orange)
+                            .frame(maxWidth: 360, alignment: .leading)
                     }
                     Button(setup.errorText == nil ? "Download & Install" : "Try Again") {
                         setup.runFullSetup()
                     }
-                    .buttonStyle(.borderedProminent)
-                    .tint(Fog.epic)
-                    .controlSize(.large)
+                    .buttonStyle(.borderedProminent).tint(Fog.accent).controlSize(.large)
                 }
             }
             .padding(20)
-            .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(.regularMaterial))
-            .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Color.primary.opacity(0.06)))
+            .background(Fog.bgElevated, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Fog.hairline))
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(40)
+    }
+}
+
+// Both services shown as independently-connectable — Steam's QR and Epic's
+// browser login are shaped nothing alike, so this deliberately doesn't force
+// them into one generic "sign in" step. Connect either or both, or skip.
+private struct AccountsStepView: View {
+    @ObservedObject var steamAuth: SteamAuthManager
+    @ObservedObject var processManager: ProcessManager
+    var onContinue: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Sign in").font(Fog.display(26, weight: .medium)).foregroundColor(Fog.ink)
+                Text("One Steam scan covers your whole library, downloads, and achievements — no separate logins. Connect Epic too if you play there.")
+                    .foregroundColor(Fog.inkDim).frame(maxWidth: 460, alignment: .leading)
+            }
+
+            HStack(alignment: .top, spacing: 14) {
+                OnboardingSteamTile(auth: steamAuth)
+                OnboardingEpicTile(processManager: processManager)
+            }
+
+            HStack {
+                Button(steamAuth.isLoggedIn || processManager.epicLoggedIn ? "Continue" : "Skip for now") {
+                    onContinue()
+                }
+                .buttonStyle(.borderedProminent).tint(Fog.accent).controlSize(.large)
+                if !steamAuth.isLoggedIn && !processManager.epicLoggedIn {
+                    Text("You can always sign in later from Settings.")
+                        .font(.caption).foregroundColor(Fog.inkFaint)
+                }
+            }
+        }
+    }
+}
+
+private struct OnboardingSteamTile: View {
+    @ObservedObject var auth: SteamAuthManager
+
+    var body: some View {
+        VStack(spacing: 12) {
+            HStack {
+                Image(systemName: "cloud.fill").foregroundColor(Fog.steam)
+                Text("Steam").font(.system(size: 14, weight: .semibold)).foregroundColor(Fog.ink)
+                Spacer()
+                if auth.isLoggedIn {
+                    Label("Connected", systemImage: "checkmark.circle.fill")
+                        .font(.caption).foregroundColor(Fog.good).labelStyle(.titleAndIcon)
+                }
+            }
+            if auth.isLoggedIn {
+                VStack(spacing: 4) {
+                    Image(systemName: "checkmark.circle.fill").font(.system(size: 30)).foregroundColor(Fog.good)
+                    Text(auth.accountName).font(.callout).foregroundColor(Fog.ink)
+                }
+                .frame(maxWidth: .infinity, minHeight: 130)
+            } else if let url = auth.qrChallengeURL {
+                ZStack {
+                    SteamQRCodeView(urlString: url)
+                        .frame(width: 116, height: 116)
+                        .padding(9)
+                        .background(Color.white, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .strokeBorder(Fog.accent.opacity(0.6), lineWidth: 2)
+                        .frame(width: 134, height: 134)
+                }
+                Text(auth.isPolling ? "Waiting for your phone…" : auth.qrStatusText)
+                    .font(.caption2).foregroundColor(Fog.inkFaint)
+            } else {
+                ProgressView().frame(maxWidth: .infinity, minHeight: 130)
+            }
+            if let err = auth.errorText {
+                Text(err).font(.caption2).foregroundColor(.orange)
+                Button("Try Again") { auth.startQRLogin() }.font(.caption).buttonStyle(.bordered)
+            }
+        }
+        .padding(16)
+        .frame(width: 200)
+        .background(Fog.bgElevated, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Fog.hairline))
+        .onAppear { if auth.qrChallengeURL == nil && !auth.isPolling && !auth.isLoggedIn { auth.startQRLogin() } }
+        .onDisappear { auth.stopPolling() }
+    }
+}
+
+private struct OnboardingEpicTile: View {
+    @ObservedObject var processManager: ProcessManager
+    @State private var showPaste = false
+    @State private var code = ""
+
+    var body: some View {
+        VStack(spacing: 12) {
+            HStack {
+                Image(systemName: "bolt.fill").foregroundColor(Fog.epic)
+                Text("Epic").font(.system(size: 14, weight: .semibold)).foregroundColor(Fog.ink)
+                Spacer()
+                if processManager.epicLoggedIn {
+                    Label("Connected", systemImage: "checkmark.circle.fill")
+                        .font(.caption).foregroundColor(Fog.good).labelStyle(.titleAndIcon)
+                }
+            }
+            if processManager.epicLoggedIn {
+                VStack(spacing: 4) {
+                    Image(systemName: "checkmark.circle.fill").font(.system(size: 30)).foregroundColor(Fog.good)
+                    Text(processManager.epicUsername).font(.callout).foregroundColor(Fog.ink)
+                }
+                .frame(maxWidth: .infinity, minHeight: 130)
+            } else if showPaste {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Paste the JSON from the browser tab that opened:")
+                        .font(.caption2).foregroundColor(Fog.inkFaint)
+                    TextField("Paste here", text: $code)
+                        .textFieldStyle(.roundedBorder).font(.system(.caption, design: .monospaced))
+                    HStack {
+                        Button("Log In") { processManager.epicLoginWithCode(code); showPaste = false; code = "" }
+                            .buttonStyle(.borderedProminent).tint(Fog.epic).controlSize(.small)
+                            .disabled(code.isEmpty)
+                        Button("Cancel") { showPaste = false; code = "" }.buttonStyle(.bordered).controlSize(.small)
+                    }
+                }
+                .frame(maxWidth: .infinity, minHeight: 130, alignment: .top)
+            } else if processManager.epicLoginInProgress {
+                ProgressView().frame(maxWidth: .infinity, minHeight: 130)
+            } else {
+                VStack(spacing: 10) {
+                    Image(systemName: "safari").font(.system(size: 26)).foregroundColor(Fog.inkFaint)
+                    Text("Sign in via your browser").font(.caption).foregroundColor(Fog.inkDim)
+                        .multilineTextAlignment(.center)
+                    Button("Log In") { showPaste = true; processManager.epicOpenLoginPage() }
+                        .buttonStyle(.bordered).tint(Fog.epic)
+                }
+                .frame(maxWidth: .infinity, minHeight: 130)
+            }
+            if !processManager.epicLoginError.isEmpty {
+                Text(processManager.epicLoginError).font(.caption2).foregroundColor(.orange)
+            }
+        }
+        .padding(16)
+        .frame(width: 200)
+        .background(Fog.bgElevated, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Fog.hairline))
     }
 }
 
@@ -3298,6 +3668,13 @@ struct GameGridView: View {
     var focusedGameID: Game.ID? = nil
     @Binding var filter: LibraryFilter
     var availableFilters: [LibraryFilter] = LibraryFilter.allCases
+    // Whether the current source has ANY games before the chip filter is applied —
+    // so an empty grid can tell "you have games, this filter is empty" from "your
+    // library is empty (probably not signed in)". With the sign-in prompt + source
+    // label to word that case correctly.
+    var sourceHasGames: Bool = true
+    var needsSignIn: Bool = false
+    var sourceLabel: String = "your"
     // Reported up so gamepad up/down navigation (owned by ContentView, which
     // doesn't know the grid's actual rendered width) can move by a full row
     // instead of a single card. See onGridWidthChange below for how it's measured.
@@ -3318,7 +3695,53 @@ struct GameGridView: View {
     private var installed: [Game] { Self.ordered(games.filter(\.isInstalled)) }
     private var notInstalled: [Game] { Self.ordered(games.filter { !$0.isInstalled }) }
 
+    // The most-recently-played installed game, for the "Jump back in" hero (idea 6).
+    private var continueGame: Game? {
+        games.filter { $0.isInstalled && $0.lastPlayed != nil }
+            .max { ($0.lastPlayed ?? .distantPast) < ($1.lastPlayed ?? .distantPast) }
+    }
+
+    private func jumpBackIn(_ g: Game) -> some View {
+        Button { onSelect(g) } label: {
+            ZStack(alignment: .leading) {
+                AsyncImage(url: URL(string: SteamLibraryService.heroURL(forAppID: g.id))) { phase in
+                    if case .success(let image) = phase { image.resizable().scaledToFill() }
+                    else { LinearGradient(colors: [Fog.haze, Fog.bg], startPoint: .leading, endPoint: .trailing) }
+                }
+                .frame(height: 118).frame(maxWidth: .infinity).clipped()
+                LinearGradient(colors: [Fog.bg, Fog.bg.opacity(0.35), .clear], startPoint: .leading, endPoint: .trailing)
+                HStack(spacing: 16) {
+                    ZStack {
+                        Circle().fill(Fog.accent).frame(width: 46, height: 46)
+                        Image(systemName: "play.fill").font(.system(size: 17)).foregroundColor(Color(red: 0x0b/255, green: 0x10/255, blue: 0x20/255))
+                    }
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("JUMP BACK IN").font(.system(size: 10, weight: .heavy)).tracking(0.1).foregroundColor(Fog.accent)
+                        Text(g.name).font(Fog.display(20, weight: .medium)).foregroundColor(Fog.ink).lineLimit(1)
+                        if let pt = g.playtimeFormatted {
+                            Text("\(pt) played\(g.lastPlayedFormatted.map { " · \($0)" } ?? "")")
+                                .font(.system(size: 11.5)).foregroundColor(Fog.inkDim)
+                        }
+                    }
+                    Spacer()
+                }
+                .padding(.horizontal, 18)
+            }
+            .frame(height: 118)
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Fog.hairline))
+        }
+        .buttonStyle(.plain)
+    }
+
     var body: some View {
+        ZStack {
+            FogAtmosphere()
+            gridScroll
+        }
+    }
+
+    private var gridScroll: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
@@ -3329,6 +3752,9 @@ struct GameGridView: View {
                     if games.isEmpty {
                         emptyState
                     } else {
+                        if filter == .all, let cg = continueGame {
+                            jumpBackIn(cg).padding(.horizontal, 16)
+                        }
                         if !installed.isEmpty {
                             section(title: "Installed", count: installed.count, games: installed)
                         }
@@ -3407,20 +3833,42 @@ struct GameGridView: View {
     }
 
     private var emptyState: some View {
-        VStack(spacing: 14) {
+        VStack(spacing: 15) {
             ZStack {
-                Circle().fill(Fog.haze).frame(width: 84, height: 84)
-                Image(systemName: filter == .installed ? "arrow.down.circle" : "tray")
-                    .font(.system(size: 32)).foregroundColor(Fog.inkFaint)
+                // Soft accent bloom so the mark reads on the fog ground.
+                Circle().fill(Fog.accent).frame(width: 96, height: 96).blur(radius: 34).opacity(0.28)
+                Circle()
+                    .fill(LinearGradient(colors: [Fog.bgElevated, Fog.haze], startPoint: .top, endPoint: .bottom))
+                    .frame(width: 86, height: 86)
+                    .overlay(Circle().strokeBorder(Fog.hairline))
+                    .shadow(color: .black.opacity(0.35), radius: 12, y: 5)
+                Image(systemName: emptyIcon)
+                    .font(.system(size: 31, weight: .light)).foregroundColor(Fog.accent.opacity(0.85))
             }
             Text(emptyTitle).font(Fog.display(19, weight: .medium)).foregroundColor(Fog.ink)
             Text(emptySubtitle).font(.callout).foregroundColor(Fog.inkDim)
+                .multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity)
-        .padding(.top, 80)
+        .padding(.top, 90)
     }
 
+    // "Your library is empty" wins over any filter-specific copy: showing
+    // "everything's installed" / "nothing installed" when you simply aren't signed
+    // in is nonsense, so key off that first.
+    private var libraryEmpty: Bool { !sourceHasGames }
+
+    private var emptyIcon: String {
+        if libraryEmpty { return needsSignIn ? "person.crop.circle.badge.plus" : "tray" }
+        switch filter {
+        case .installed: return "arrow.down.circle"
+        case .shared: return "person.2"
+        case .notInstalled: return "checkmark.circle"
+        case .all: return "tray"
+        }
+    }
     private var emptyTitle: String {
+        if libraryEmpty { return needsSignIn ? "Sign in to see your games" : "No games in \(sourceLabel) library yet" }
         switch filter {
         case .installed: return "Nothing installed yet"
         case .shared: return "No family-shared games"
@@ -3429,11 +3877,16 @@ struct GameGridView: View {
         }
     }
     private var emptySubtitle: String {
+        if libraryEmpty {
+            return needsSignIn
+                ? "Connect \(sourceLabel) account in Settings to load your library."
+                : "Games you own will appear here."
+        }
         switch filter {
         case .installed: return "Install a game to see it here."
         case .shared: return "Games shared into your Steam Family will appear here."
         case .notInstalled: return "Nice — your whole library is downloaded."
-        case .all: return "Sign in to Steam or Epic to load your library."
+        case .all: return "No games match."
         }
     }
 }
@@ -3441,6 +3894,39 @@ struct GameGridView: View {
 private struct GridWidthKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
+}
+
+// A barely-moving periwinkle haze — the brand, alive but calm (idea 46). Honors
+// Reduce Motion by holding still. Cheap: three big blurred blobs on a timeline.
+struct FogAtmosphere: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    private let blobs: [(color: Color, size: CGFloat, x: CGFloat, y: CGFloat, sx: CGFloat, sy: CGFloat, period: Double)] = [
+        (Color(red: 0x7c/255, green: 0x9c/255, blue: 1.0), 520, 0.15, 0.10, 0.10, 0.06, 34),
+        (Color(red: 0x96/255, green: 0x78/255, blue: 0.94), 440, 0.85, 0.30, -0.09, -0.05, 44),
+        (Color(red: 0x46/255, green: 0x6e/255, blue: 0.86), 380, 0.55, 0.92, 0.06, -0.08, 52),
+    ]
+    var body: some View {
+        GeometryReader { geo in
+            TimelineView(.animation(minimumInterval: reduceMotion ? .infinity : 1/20)) { ctx in
+                let t = reduceMotion ? 0 : ctx.date.timeIntervalSinceReferenceDate
+                Canvas { c, size in
+                    for b in blobs {
+                        let phase = sin(t / b.period * .pi * 2)
+                        let cx = size.width * b.x + size.width * b.sx * phase
+                        let cy = size.height * b.y + size.height * b.sy * phase
+                        let rect = CGRect(x: cx - b.size/2, y: cy - b.size/2, width: b.size, height: b.size)
+                        c.fill(Circle().path(in: rect),
+                               with: .radialGradient(Gradient(colors: [b.color.opacity(0.34), .clear]),
+                                                     center: CGPoint(x: cx, y: cy), startRadius: 0, endRadius: b.size/2))
+                    }
+                }
+                .frame(width: geo.size.width, height: geo.size.height)
+                .blur(radius: 70)
+                .opacity(0.5)
+            }
+        }
+        .allowsHitTesting(false)
+    }
 }
 
 // Browse the wider Steam catalog — games you don't own yet. Mist can't buy
@@ -3709,54 +4195,74 @@ struct GameDetailView: View {
     private var detailContent: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
-                banner
+                hero
                 VStack(alignment: .leading, spacing: 18) {
-                    header
+                    metaStrip
                     if let desc = details?.short_description, !desc.isEmpty {
                         Text(desc)
                             .font(.callout)
-                            .foregroundColor(.secondary)
+                            .foregroundColor(Fog.inkDim)
                             .fixedSize(horizontal: false, vertical: true)
                     }
-                    if let genres = details?.genres, !genres.isEmpty {
-                        tagRow(genres.map(\.description))
+                    if !(details?.genreNames ?? []).isEmpty {
+                        tagRow(details!.genreNames)
                     }
                     actionRow
-                    Divider()
+                    Divider().overlay(Fog.hairline)
                     if game.source == .steam {
                         achievementsSection
-                        Divider()
+                        if !(details?.screenshotURLs ?? []).isEmpty {
+                            Divider().overlay(Fog.hairline)
+                            screenshotStrip
+                        }
+                        Divider().overlay(Fog.hairline)
                         workshopSection
                     }
                 }
                 .padding(20)
             }
         }
+        .background(Fog.bg)
     }
 
-    private var banner: some View {
-        AsyncImage(url: URL(string: SteamLibraryService.heroURL(forAppID: game.id))) { phase in
-            switch phase {
-            case .success(let image):
-                image.resizable().scaledToFill()
-            default:
-                LinearGradient(colors: [(game.source == .steam ? Color.blue : .purple).opacity(0.35), .clear],
-                              startPoint: .top, endPoint: .bottom)
+    // Full-bleed hero: the game's own artwork, blurred + scrimmed, serif title over it.
+    private var hero: some View {
+        ZStack(alignment: .bottomLeading) {
+            AsyncImage(url: URL(string: SteamLibraryService.heroURL(forAppID: game.id))) { phase in
+                switch phase {
+                case .success(let image):
+                    image.resizable().scaledToFill()
+                default:
+                    LinearGradient(colors: [Fog.haze, Fog.bg], startPoint: .top, endPoint: .bottom)
+                }
             }
+            .frame(height: 210)
+            .frame(maxWidth: .infinity)
+            .clipped()
+            .overlay(
+                LinearGradient(colors: [.clear, .clear, Fog.bg.opacity(0.65), Fog.bg],
+                               startPoint: .top, endPoint: .bottom)
+            )
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(game.name)
+                    .font(Fog.display(28, weight: .semibold))
+                    .foregroundColor(.white)
+                    .shadow(color: .black.opacity(0.5), radius: 8, y: 2)
+                    .lineLimit(2)
+                subtitleLine
+            }
+            .padding(20)
         }
-        .frame(height: 200)
-        .frame(maxWidth: .infinity)
+        .frame(height: 210)
         .clipped()
-        .overlay(LinearGradient(colors: [.clear, .black.opacity(0.5)], startPoint: .top, endPoint: .bottom))
         .overlay(alignment: .topTrailing) {
-            Button {
-                dismiss()
-            } label: {
+            Button { dismiss() } label: {
                 Image(systemName: "xmark")
                     .font(.system(size: 12, weight: .bold))
                     .foregroundColor(.white)
                     .padding(8)
-                    .background(.black.opacity(0.5), in: Circle())
+                    .background(.black.opacity(0.45), in: Circle())
             }
             .buttonStyle(.plain)
             .keyboardShortcut(.cancelAction)
@@ -3764,26 +4270,82 @@ struct GameDetailView: View {
         }
     }
 
-    private var header: some View {
-        HStack(alignment: .top) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(game.name)
-                    .font(.system(size: 22, weight: .bold))
+    private var subtitleLine: some View {
+        HStack(spacing: 6) {
+            Image(systemName: game.source == .steam ? "cloud.fill" : "bolt.fill").font(.system(size: 10))
+            Text(game.source.rawValue)
+            if let dev = details?.developerName { Text("· \(dev)") }
+            if let year = details?.releaseYear { Text("· \(year)") }
+        }
+        .font(.system(size: 12))
+        .foregroundColor(.white.opacity(0.82))
+        .shadow(color: .black.opacity(0.4), radius: 4)
+    }
+
+    // Status chips under the hero: install state/size, the "how this runs" chip,
+    // and a quiet playtime/last-played history line.
+    private var metaStrip: some View {
+        HStack(spacing: 8) {
+            if game.isInstalled {
+                pill(game.sizeBytes > 0 ? game.sizeFormatted : "Installed", icon: "internaldrive", tint: Fog.good)
+            } else {
+                pill(game.isFamilyShared ? "Family shared" : "Not installed",
+                     icon: game.isFamilyShared ? "person.2.fill" : "icloud", tint: game.isFamilyShared ? Fog.accent : Fog.inkFaint)
+            }
+            runChip
+            Spacer()
+            if game.playtimeFormatted != nil || game.lastPlayedFormatted != nil {
                 HStack(spacing: 5) {
-                    Image(systemName: game.source == .steam ? "cloud.fill" : "bolt.fill")
-                        .font(.system(size: 11))
-                    Text(game.source.rawValue)
-                    if game.isInstalled && game.sizeBytes > 0 {
-                        Text("· \(game.sizeFormatted)")
-                    }
-                    if !game.isInstalled {
-                        Text("· Not installed")
+                    if let pt = game.playtimeFormatted { Text(pt) }
+                    if game.playtimeFormatted != nil, game.lastPlayedFormatted != nil { Text("·").foregroundColor(Fog.inkFaint) }
+                    if let lp = game.lastPlayedFormatted { Text(lp) }
+                }
+                .font(.system(size: 11.5)).foregroundColor(Fog.inkFaint)
+            }
+        }
+    }
+
+    private func pill(_ text: String, icon: String, tint: Color) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: icon).font(.system(size: 10))
+            Text(text)
+        }
+        .font(.system(size: 11.5, weight: .medium))
+        .padding(.horizontal, 9).padding(.vertical, 5)
+        .background(tint.opacity(0.14), in: Capsule())
+        .foregroundColor(tint)
+    }
+
+    // Plain-language "how this game will run" — no jargon dropdowns.
+    @ViewBuilder private var runChip: some View {
+        let provider = D3DMetalProvider.detect()
+        if game.source == .epic {
+            pill("Epic runtime", icon: "bolt.fill", tint: Fog.epic)
+        } else if let provider {
+            pill("D3DMetal · \(provider.name)", icon: "cpu", tint: Fog.good)
+        } else if DXVKManager.isBundled {
+            pill("DXVK · bundled", icon: "cpu", tint: Fog.good)
+        } else {
+            pill("Basic renderer", icon: "cpu", tint: Fog.warn)
+        }
+    }
+
+    private var screenshotStrip: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Screenshots").font(.system(size: 13, weight: .semibold)).foregroundColor(Fog.ink)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(Array((details?.screenshotURLs ?? []).prefix(8)), id: \.self) { url in
+                        AsyncImage(url: URL(string: url)) { phase in
+                            if case .success(let image) = phase { image.resizable().scaledToFill() }
+                            else { Fog.haze }
+                        }
+                        .frame(width: 208, height: 117)
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Fog.hairline))
                     }
                 }
-                .font(.system(size: 12.5))
-                .foregroundColor(.secondary)
             }
-            Spacer()
         }
     }
 
@@ -3793,9 +4355,10 @@ struct GameDetailView: View {
                 ForEach(tags.prefix(8), id: \.self) { tag in
                     Text(tag)
                         .font(.system(size: 11, weight: .medium))
-                        .padding(.horizontal, 8)
+                        .foregroundColor(Fog.inkDim)
+                        .padding(.horizontal, 9)
                         .padding(.vertical, 4)
-                        .background(Color.primary.opacity(0.07), in: Capsule())
+                        .background(Fog.haze, in: Capsule())
                 }
             }
         }
@@ -3843,19 +4406,46 @@ struct GameDetailView: View {
     }
 
     @ViewBuilder
+    // A progress ring + count, so completion reads at a glance (idea 18).
+    private var achievementSummary: some View {
+        let unlocked = achievements.filter { $0.achieved == 1 }.count
+        let total = max(achievements.count, 1)
+        let frac = Double(unlocked) / Double(total)
+        return HStack(spacing: 14) {
+            ZStack {
+                Circle().stroke(Fog.haze, lineWidth: 6)
+                Circle().trim(from: 0, to: frac)
+                    .stroke(Fog.accent, style: StrokeStyle(lineWidth: 6, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+                Text("\(unlocked)").font(Fog.display(17, weight: .medium)).foregroundColor(Fog.ink)
+            }
+            .frame(width: 58, height: 58)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("\(unlocked) of \(achievements.count) unlocked")
+                    .font(.system(size: 13, weight: .medium)).foregroundColor(Fog.ink)
+                Text("\(Int(frac * 100))% complete")
+                    .font(.system(size: 11.5)).foregroundColor(Fog.inkFaint)
+                RoundedRectangle(cornerRadius: 3).fill(Fog.haze).frame(height: 5).frame(maxWidth: 220)
+                    .overlay(alignment: .leading) {
+                        RoundedRectangle(cornerRadius: 3).fill(Fog.accent)
+                            .frame(width: 220 * frac, height: 5)
+                    }
+            }
+            Spacer()
+        }
+        .padding(.bottom, 2)
+    }
+
     private var achievementsSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Label("Achievements", systemImage: "trophy.fill")
                     .font(.system(size: 13, weight: .semibold))
-                if !achievements.isEmpty {
-                    let unlocked = achievements.filter { $0.achieved == 1 }.count
-                    Text("\(unlocked)/\(achievements.count)")
-                        .font(.system(size: 12))
-                        .foregroundColor(.secondary)
-                }
+                    .foregroundColor(Fog.ink)
                 Spacer()
             }
+
+            if !achievements.isEmpty { achievementSummary }
 
             if isLoadingAchievements {
                 ProgressView().controlSize(.small)
@@ -4818,57 +5408,128 @@ struct RunningGameView: View {
     @ObservedObject var processManager: ProcessManager
     let onDismiss: () -> Void
 
+    @State private var showLog = false
+
+    // "Launching…" for the first couple of seconds, then "Running".
+    private var isEarly: Bool {
+        guard let s = processManager.launchedAt else { return true }
+        return Date().timeIntervalSince(s) < 2.5
+    }
+
+    // Count achievements the post-session sync pushed (logged as "  ✓ NAME").
+    private var syncedCount: Int {
+        processManager.outputLog.components(separatedBy: "\n").filter { $0.hasPrefix("  ✓ ") }.count
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            // Header bar
-            HStack {
-                if processManager.isRunning {
-                    ProgressView()
-                        .controlSize(.small)
-                    Text("Running: \(processManager.currentGame?.name ?? "Game")")
-                        .font(.headline)
-                } else {
-                    Image(systemName: "checkmark.circle")
-                        .foregroundColor(.secondary)
-                    Text("Process ended")
-                        .font(.headline)
-                }
+            Spacer()
+            if processManager.isRunning { runningCard } else { endedCard }
+            Spacer()
+            logDisclosure
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Fog.bg)
+    }
 
-                Spacer()
-
-                if processManager.isRunning {
-                    Button("Stop") {
-                        processManager.stop()
-                    }
-                    .buttonStyle(.bordered)
-                    .tint(.red)
-                } else {
-                    Button("Back to Library") {
-                        onDismiss()
-                    }
-                    .buttonStyle(.borderedProminent)
+    private var runningCard: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            let elapsed = processManager.launchedAt.map { context.date.timeIntervalSince($0) } ?? 0
+            VStack(spacing: 20) {
+                ZStack {
+                    Circle().fill(Fog.good.opacity(0.14)).frame(width: 62, height: 62)
+                    Circle().fill(Fog.good).frame(width: 12, height: 12)
+                        .overlay(Circle().stroke(Fog.good, lineWidth: 2).scaleEffect(1 + (elapsed.truncatingRemainder(dividingBy: 2)) * 0.6)
+                                    .opacity(1 - (elapsed.truncatingRemainder(dividingBy: 2)) / 2))
                 }
+                VStack(spacing: 5) {
+                    Text(processManager.currentGame?.name ?? "Game")
+                        .font(Fog.display(24, weight: .medium)).foregroundColor(Fog.ink)
+                    Text(isEarly ? "Launching…" : "Running")
+                        .font(.system(size: 13)).foregroundColor(Fog.inkDim)
+                }
+                Text(timeString(elapsed))
+                    .font(.system(size: 30, weight: .light, design: .monospaced).monospacedDigit())
+                    .foregroundColor(Fog.ink)
+                if let g = processManager.currentGame { runnerChip(for: g) }
+                Button { processManager.stop() } label: {
+                    Label("Stop", systemImage: "stop.fill").frame(width: 120)
+                }
+                .buttonStyle(.bordered).tint(.red).controlSize(.large)
             }
-            .padding(12)
-            .background(.bar)
+        }
+    }
 
-            Divider()
+    private var endedCard: some View {
+        let dur = (processManager.endedAt ?? Date()).timeIntervalSince(processManager.launchedAt ?? Date())
+        return VStack(spacing: 18) {
+            ZStack {
+                Circle().fill(Fog.accentSoft).frame(width: 62, height: 62)
+                Image(systemName: "checkmark").font(.system(size: 24, weight: .semibold)).foregroundColor(Fog.accent)
+            }
+            VStack(spacing: 5) {
+                Text(processManager.currentGame?.name ?? "Session ended")
+                    .font(Fog.display(22, weight: .medium)).foregroundColor(Fog.ink)
+                Text("Played \(timeString(dur))\(syncedCount > 0 ? " · \(syncedCount) achievement\(syncedCount == 1 ? "" : "s") synced" : "")")
+                    .font(.system(size: 13)).foregroundColor(Fog.inkDim)
+            }
+            Button { onDismiss() } label: {
+                Label("Back to Library", systemImage: "chevron.left").frame(width: 150)
+            }
+            .buttonStyle(.borderedProminent).tint(Fog.accent).controlSize(.large)
+        }
+    }
 
-            // Log output
-            ScrollViewReader { proxy in
-                ScrollView {
-                    Text(processManager.outputLog.isEmpty ? "Starting..." : processManager.outputLog)
-                        .font(.system(.caption, design: .monospaced))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                        .padding(12)
-                        .id("log-bottom")
+    @ViewBuilder private func runnerChip(for game: Game) -> some View {
+        let provider = D3DMetalProvider.detect()
+        let label: String = game.source == .epic ? "Epic runtime"
+            : provider != nil ? "D3DMetal · \(provider!.name)"
+            : DXVKManager.isBundled ? "DXVK · bundled" : "Basic renderer"
+        HStack(spacing: 6) {
+            Image(systemName: "cpu").font(.system(size: 10))
+            Text(label)
+        }
+        .font(.system(size: 11.5, weight: .medium))
+        .padding(.horizontal, 10).padding(.vertical, 5)
+        .background(Fog.haze, in: Capsule())
+        .foregroundColor(Fog.inkDim)
+    }
+
+    private var logDisclosure: some View {
+        VStack(spacing: 0) {
+            Divider().overlay(Fog.hairline)
+            Button { withAnimation(.easeInOut(duration: 0.2)) { showLog.toggle() } } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.right").font(.system(size: 10, weight: .bold))
+                        .rotationEffect(.degrees(showLog ? 90 : 0))
+                    Text("Details & log").font(.system(size: 12, weight: .medium))
+                    Spacer()
                 }
-                .onChange(of: processManager.outputLog) { _ in
-                    proxy.scrollTo("log-bottom", anchor: .bottom)
+                .foregroundColor(Fog.inkFaint)
+                .padding(.horizontal, 16).padding(.vertical, 10)
+            }
+            .buttonStyle(.plain)
+            if showLog {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        Text(processManager.outputLog.isEmpty ? "Starting…" : processManager.outputLog)
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundColor(Fog.inkDim)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                            .padding(12).id("log-bottom")
+                    }
+                    .frame(height: 220)
+                    .background(Color.black.opacity(0.25))
+                    .onChange(of: processManager.outputLog) { _ in proxy.scrollTo("log-bottom", anchor: .bottom) }
                 }
             }
         }
+    }
+
+    private func timeString(_ t: TimeInterval) -> String {
+        let s = max(0, Int(t)); let h = s / 3600, m = (s % 3600) / 60, sec = s % 60
+        return h > 0 ? String(format: "%d:%02d:%02d", h, m, sec) : String(format: "%d:%02d", m, sec)
     }
 }
 
@@ -4917,6 +5578,55 @@ struct SettingsInfoRow: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
         }
+    }
+}
+
+// Shows exactly which graphics backends Mist found, so how a game will render is
+// never a mystery — with a one-tap way to add what's missing (idea 42).
+struct GraphicsSettingsView: View {
+    private var provider: D3DMetalProvider? { D3DMetalProvider.detect() }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("How your games will render")
+                .font(.system(size: 12.5, weight: .medium)).foregroundColor(Fog.inkDim)
+                .padding(.bottom, 10)
+
+            row(name: "DXVK · bundled", detail: "Direct3D 10/11, self-contained",
+                on: DXVKManager.isBundled, status: "active")
+
+            row(name: provider != nil ? "D3DMetal · via \(provider!.name)" : "D3DMetal",
+                detail: "Best for Direct3D 12 titles",
+                on: provider != nil, status: provider != nil ? "detected" : nil,
+                fixURL: provider == nil ? "https://github.com/98przem/mist#compatibility" : nil,
+                fixLabel: "How to add")
+        }
+    }
+
+    @ViewBuilder
+    private func row(name: String, detail: String, on: Bool, status: String? = nil,
+                     fixURL: String? = nil, fixLabel: String = "Install") -> some View {
+        HStack(spacing: 11) {
+            ZStack {
+                Circle().fill(on ? Fog.good.opacity(0.16) : Fog.haze).frame(width: 20, height: 20)
+                if on {
+                    Image(systemName: "checkmark").font(.system(size: 9, weight: .bold)).foregroundColor(Fog.good)
+                }
+            }
+            VStack(alignment: .leading, spacing: 1) {
+                Text(name).font(.system(size: 13, weight: .semibold)).foregroundColor(Fog.ink)
+                Text(detail).font(.system(size: 11.5)).foregroundColor(Fog.inkFaint)
+            }
+            Spacer()
+            if on, let status {
+                Text(status).font(.system(size: 11, design: .monospaced)).foregroundColor(Fog.good)
+            } else if let fixURL, let url = URL(string: fixURL) {
+                Link(fixLabel, destination: url)
+                    .font(.system(size: 11, weight: .medium)).foregroundColor(Fog.accent)
+            }
+        }
+        .padding(.vertical, 9)
+        .overlay(alignment: .top) { Divider().overlay(Fog.hairline) }
     }
 }
 
@@ -5247,6 +5957,11 @@ struct ContentView: View {
     @State private var focusedGameIndex = 0
     @State private var libraryFilter: LibraryFilter = .all
     @State private var gridColumns = 1
+    // Persisted so a user who skips account sign-in during first run isn't shown
+    // the onboarding accounts step again on every launch — connecting an account
+    // later (e.g. from Settings) also permanently satisfies this via the isLoggedIn
+    // checks in the gate itself, this flag only covers the explicit-skip path.
+    @State private var onboardingDismissed = UserDefaults.standard.bool(forKey: "onboardingAccountsDismissed")
     // Sections that actually contain a game grid — gamepad shoulder buttons only
     // cycle among these, so they never land on Store/Free Games/Settings and go
     // dead (no focusable grid there).
@@ -5269,8 +5984,9 @@ struct ContentView: View {
             do {
                 let owned: [OwnedGame]
                 if let relayOwned = try? await RelayManager.ownedLibrary(), !relayOwned.isEmpty {
-                    owned = relayOwned.map { OwnedGame(id: $0.id, name: $0.name, playtimeForever: 0,
-                                                       coverURL: SteamLibraryService.coverURL(forAppID: $0.id)) }
+                    owned = relayOwned.map { OwnedGame(id: $0.id, name: $0.name, playtimeForever: $0.playtimeForever,
+                                                       coverURL: SteamLibraryService.coverURL(forAppID: $0.id),
+                                                       lastPlayed: $0.lastPlayed) }
                 } else {
                     let token = try await steamAuth.mintAccessToken()
                     owned = try await SteamLibraryService.fetchOwnedGames(accessToken: token, steamID: steamAuth.steamID)
@@ -5350,6 +6066,37 @@ struct ContentView: View {
         return games
     }
 
+    // filteredGames narrowed to just the sidebar source (no chip/search filter) —
+    // whether this is empty is what actually means "your library is empty", as
+    // opposed to "this filter/search matched nothing". Conflating the two is what
+    // produced the "everything is installed" / "nothing is installed" nonsense
+    // when signed out.
+    private var sourceGames: [Game] {
+        switch sidebarSelection {
+        case "steam": return library.games.filter { $0.source == .steam }
+        case "epic": return library.games.filter { $0.source == .epic }
+        default: return library.games
+        }
+    }
+
+    private var sourceLabel: String {
+        switch sidebarSelection {
+        case "steam": return "Steam"
+        case "epic": return "Epic"
+        default: return "your"
+        }
+    }
+
+    // Only worth prompting sign-in when the relevant account(s) for the current
+    // view actually aren't connected — not just whenever the grid is empty.
+    private var sourceNeedsSignIn: Bool {
+        switch sidebarSelection {
+        case "steam": return !steamAuth.isLoggedIn
+        case "epic": return !processManager.epicLoggedIn
+        default: return !steamAuth.isLoggedIn && !processManager.epicLoggedIn
+        }
+    }
+
     // Chips to offer for the current source: "Family Shared" only makes sense where
     // Steam games are present (Epic has no family sharing).
     private var availableFilters: [LibraryFilter] {
@@ -5399,8 +6146,12 @@ struct ContentView: View {
 
     var body: some View {
         Group {
-            if setup.isWorking || !setup.isComplete {
-                SetupView(setup: setup)
+            if setup.isWorking || !setup.isComplete
+                || (!onboardingDismissed && !steamAuth.isLoggedIn && !processManager.epicLoggedIn) {
+                SetupView(setup: setup, steamAuth: steamAuth, processManager: processManager) {
+                    onboardingDismissed = true
+                    UserDefaults.standard.set(true, forKey: "onboardingAccountsDismissed")
+                }
             } else {
                 NavigationSplitView {
                     SidebarView(
@@ -5454,6 +6205,10 @@ struct ContentView: View {
 
                                     SettingsCard(title: "Epic Account", systemImage: "bolt.fill", tint: .purple) {
                                         EpicStoreView(processManager: processManager)
+                                    }
+
+                                    SettingsCard(title: "Graphics", systemImage: "cpu", tint: Fog.accent) {
+                                        GraphicsSettingsView()
                                     }
 
                                     SettingsCard(title: "Updates", systemImage: "arrow.triangle.2.circlepath", tint: .green) {
@@ -5513,6 +6268,9 @@ struct ContentView: View {
                                     ? displayedGames[focusedGameIndex].id : nil,
                                 filter: $libraryFilter,
                                 availableFilters: availableFilters,
+                                sourceHasGames: !sourceGames.isEmpty,
+                                needsSignIn: sourceNeedsSignIn,
+                                sourceLabel: sourceLabel,
                                 onGridWidthChange: { width in
                                     // Matches SwiftUI's .adaptive(minimum:maximum:) column
                                     // count: as many 160pt (+14pt spacing) columns as fit.

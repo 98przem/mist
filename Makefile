@@ -3,9 +3,10 @@
 
 # Marketing version baked into Info.plist (CFBundleShortVersionString) and used by
 # the in-app updater to compare against the latest GitHub release. CI passes this
-# from the git tag (see .github/workflows/release.yml); bump the default for local
-# builds when cutting a new version.
-VERSION ?= 0.3.0
+# from the git tag (see .github/workflows/release.yml) so releases get a clean
+# number; this default only labels local dev builds, hence the "-preview" suffix.
+# Bump it to the next target release when starting work toward one.
+VERSION ?= 0.5.0-preview
 
 PREFIX ?= $(HOME)/Library/Application Support/Mist
 CEF_DIR = $(PREFIX)/drive_c/Program Files (x86)/Steam/bin/cef/cef.win64

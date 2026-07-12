@@ -1,5 +1,6 @@
-// Renders Mist's app icon (a purple→blue squircle with a white fog/cloud glyph,
-// matching the in-app brand) to a 1024px PNG, then builds Mist.icns via iconutil.
+// Renders Mist's app icon — a dark Foglight squircle lit by a periwinkle glow,
+// matching the in-app brand (same radial gradient as the sidebar mark) — to a
+// 1024px PNG, then builds Mist.icns via iconutil.
 // Run: swift tools/make_icon.swift   (writes Mist.icns in the repo root)
 import AppKit
 
@@ -9,25 +10,54 @@ let img = NSImage(size: size)
 img.lockFocus()
 let ctx = NSGraphicsContext.current!.cgContext
 
-// Squircle background with a diagonal purple→blue gradient.
 let inset: CGFloat = 84                          // macOS icon safe-area padding
 let rect = CGRect(x: inset, y: inset, width: CGFloat(px) - inset*2, height: CGFloat(px) - inset*2)
 let radius = rect.width * 0.235
 let path = CGPath(roundedRect: rect, cornerWidth: radius, cornerHeight: radius, transform: nil)
+
+// Outer halo — a real bloom that bleeds past the squircle's edges, visible as a
+// soft blue glow against any Dock background (light or dark), the way the app's
+// own accent color glows behind the sidebar mark and running-state pulse.
+ctx.saveGState()
+ctx.setShadow(offset: .zero, blur: 130, color: NSColor(calibratedRed: 0.49, green: 0.61, blue: 1.0, alpha: 0.7).cgColor)
+ctx.addPath(path)
+ctx.setFillColor(NSColor(calibratedRed: 0.03, green: 0.04, blue: 0.06, alpha: 1).cgColor)
+ctx.fillPath()
+ctx.restoreGState()
+
+// Squircle fill: dark Foglight ground (near the app's own bg/haze tones) — NOT
+// flooded with the bright accent, so it stays moody up close and lets the glow
+// (outer halo + inner bloom below) read as light against dark, not just "blue".
 ctx.saveGState()
 ctx.addPath(path)
 ctx.clip()
-let colors = [NSColor(calibratedRed: 0.55, green: 0.36, blue: 0.96, alpha: 1).cgColor,   // purple
-              NSColor(calibratedRed: 0.23, green: 0.51, blue: 0.96, alpha: 1).cgColor]   // blue
-let grad = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: colors as CFArray, locations: [0, 1])!
-ctx.drawLinearGradient(grad, start: CGPoint(x: rect.minX, y: rect.maxY),
+let ground = [
+    NSColor(calibratedRed: 0.08, green: 0.09, blue: 0.13, alpha: 1).cgColor,   // Fog.haze
+    NSColor(calibratedRed: 0.04, green: 0.05, blue: 0.07, alpha: 1).cgColor,   // Fog.bg
+]
+let groundGrad = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: ground as CFArray, locations: [0, 1])!
+ctx.drawLinearGradient(groundGrad, start: CGPoint(x: rect.minX, y: rect.maxY),
                        end: CGPoint(x: rect.maxX, y: rect.minY), options: [])
+
+// Inner bloom: a soft periwinkle light source behind the cloud, like the
+// sidebar mark's radial fill but as an accent glow ON the dark ground rather
+// than a flat fill covering it.
+let bloom = [
+    NSColor(calibratedRed: 0.55, green: 0.65, blue: 1.00, alpha: 0.95).cgColor,
+    NSColor(calibratedRed: 0.49, green: 0.61, blue: 1.00, alpha: 0.55).cgColor,
+    NSColor(calibratedRed: 0.49, green: 0.61, blue: 1.00, alpha: 0).cgColor,
+]
+let bloomGrad = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: bloom as CFArray,
+                           locations: [0, 0.45, 1])!
+let center = CGPoint(x: rect.midX, y: rect.midY + rect.height * 0.06)
+ctx.drawRadialGradient(bloomGrad, startCenter: center, startRadius: 0,
+                       endCenter: center, endRadius: rect.width * 0.62, options: [])
 ctx.restoreGState()
 
 // Subtle top highlight for depth.
 ctx.saveGState(); ctx.addPath(path); ctx.clip()
 let hl = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
-                    colors: [NSColor(white: 1, alpha: 0.18).cgColor, NSColor(white: 1, alpha: 0).cgColor] as CFArray,
+                    colors: [NSColor(white: 1, alpha: 0.10).cgColor, NSColor(white: 1, alpha: 0).cgColor] as CFArray,
                     locations: [0, 1])!
 ctx.drawLinearGradient(hl, start: CGPoint(x: rect.midX, y: rect.maxY),
                        end: CGPoint(x: rect.midX, y: rect.midY), options: [])
@@ -39,7 +69,9 @@ if let sym = NSImage(systemSymbolName: "cloud.fog.fill", accessibilityDescriptio
     .withSymbolConfiguration(cfg) {
     let s = sym.size
     let gx = rect.midX - s.width/2, gy = rect.midY - s.height/2
-    ctx.setShadow(offset: CGSize(width: 0, height: -10), blur: 24, color: NSColor(white: 0, alpha: 0.22).cgColor)
+    // A soft periwinkle glow under the glyph (not a black shadow, which would be
+    // invisible on the dark ground) so the cloud reads as lit from the bloom.
+    ctx.setShadow(offset: .zero, blur: 30, color: NSColor(calibratedRed: 0.55, green: 0.65, blue: 1.0, alpha: 0.6).cgColor)
     NSColor.white.set()
     let tinted = NSImage(size: s); tinted.lockFocus()
     sym.draw(at: .zero, from: CGRect(origin: .zero, size: s), operation: .sourceOver, fraction: 1)

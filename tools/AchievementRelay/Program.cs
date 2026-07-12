@@ -171,7 +171,9 @@ class Program
                 if (!first) sb.Append(','); first = false;
                 sb.Append('{')
                   .Append("\"appid\":").Append(g.appid).Append(',')
-                  .Append("\"name\":").Append(JStr(g.name ?? ""))
+                  .Append("\"name\":").Append(JStr(g.name ?? "")).Append(',')
+                  .Append("\"playtimeForever\":").Append(g.playtime_forever).Append(',')
+                  .Append("\"lastPlayed\":").Append(g.rtime_last_played)
                   .Append('}');
             }
             sb.Append(']');
