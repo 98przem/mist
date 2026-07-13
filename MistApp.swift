@@ -6407,196 +6407,101 @@ struct SteamLoginView: View {
 
 struct EpicStoreView: View {
     @ObservedObject var processManager: ProcessManager
-    @State private var installName: String = ""
     @State private var showLoginFlow = false
     @State private var loginCode: String = ""
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            // Login section
-                Group {
-                    VStack(alignment: .leading, spacing: 12) {
-                        HStack {
-                            Image(systemName: processManager.epicLoggedIn
-                                  ? "checkmark.circle.fill" : "person.circle")
-                                .font(.title2)
-                                .foregroundColor(processManager.epicLoggedIn ? .green : .secondary)
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Image(systemName: processManager.epicLoggedIn ? "checkmark.circle.fill" : "person.circle")
+                    .font(.title2)
+                    .foregroundColor(processManager.epicLoggedIn ? Fog.good : Fog.inkFaint)
 
-                            VStack(alignment: .leading) {
-                                if processManager.epicLoggedIn {
-                                    Text("Logged in as \(processManager.epicUsername)")
-                                        .font(.headline)
-                                } else {
-                                    Text("Not logged in")
-                                        .font(.headline)
-                                    Text("Log in to access your Epic Games library")
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
-                                }
-                            }
-
-                            Spacer()
-
-                            if processManager.epicLoginInProgress {
-                                ProgressView()
-                                    .controlSize(.small)
-                                Text("Logging in...")
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                            } else if !processManager.epicLoggedIn {
-                                Button("Log In") {
-                                    showLoginFlow = true
-                                    processManager.epicOpenLoginPage()
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .tint(Fog.epic)
-                            }
-                        }
-
-                        // Login flow: browser opens, user pastes the JSON back
-                        if showLoginFlow && !processManager.epicLoggedIn {
-                            Divider()
-                            VStack(alignment: .leading, spacing: 10) {
-                                HStack(spacing: 6) {
-                                    Image(systemName: "safari")
-                                        .foregroundColor(.blue)
-                                    Text("A login page opened in your browser.")
-                                        .font(.callout)
-                                }
-
-                                Text("After logging in, you'll see a page with JSON text. Select all the text on that page and paste it here:")
-                                    .font(.callout)
-                                    .foregroundColor(.secondary)
-
-                                HStack {
-                                    TextField("Paste the JSON from the browser here", text: $loginCode)
-                                        .textFieldStyle(.roundedBorder)
-                                        .font(.system(.caption, design: .monospaced))
-
-                                    Button("Log In") {
-                                        processManager.epicLoginWithCode(loginCode)
-                                        showLoginFlow = false
-                                        loginCode = ""
-                                    }
-                                    .buttonStyle(.borderedProminent)
-                                    .tint(Fog.epic)
-                                    .disabled(loginCode.isEmpty)
-
-                                    Button("Cancel") {
-                                        showLoginFlow = false
-                                        loginCode = ""
-                                    }
-                                    .buttonStyle(.bordered)
-                                }
-
-                                Button("Re-open login page") {
-                                    processManager.epicOpenLoginPage()
-                                }
-                                .font(.caption)
-                            }
-                            .padding(8)
-                            .background(Color.blue.opacity(0.05))
-                            .cornerRadius(8)
-                        }
-
-                        if !processManager.epicLoginError.isEmpty {
-                            Text(processManager.epicLoginError)
-                                .font(.caption)
-                                .foregroundColor(.red)
-                        }
+                VStack(alignment: .leading, spacing: 2) {
+                    if processManager.epicLoggedIn {
+                        Text("Logged in as \(processManager.epicUsername)")
+                            .font(.callout).foregroundColor(Fog.ink)
+                    } else {
+                        Text("Not logged in")
+                            .font(.callout).foregroundColor(Fog.ink)
+                        Text("Log in to access your Epic Games library")
+                            .font(.caption).foregroundColor(Fog.inkDim)
                     }
                 }
 
-                // Install game section
-                if processManager.epicLoggedIn {
-                    GroupBox {
-                        VStack(alignment: .leading, spacing: 12) {
-                            Text("Enter the Epic app name to install a game.")
-                                .font(.callout)
-                                .foregroundColor(.secondary)
+                Spacer()
 
-                            Text("Find names with: mist epic games")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-
-                            HStack {
-                                TextField("App name (e.g. Sugar for Rocket League)", text: $installName)
-                                    .textFieldStyle(.roundedBorder)
-
-                                Button("Install") {
-                                    guard !installName.isEmpty else { return }
-                                    processManager.epicInstall(appName: installName)
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .tint(Fog.epic)
-                                .disabled(installName.isEmpty || processManager.epicInstalling)
-                            }
-
-                            if processManager.epicInstalling {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    ProgressView()
-                                        .progressViewStyle(.linear)
-                                    Text(processManager.epicInstallProgress)
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
-                                        .lineLimit(2)
-                                }
-                            }
-                        }
-                        .padding(4)
-                    } label: {
-                        Label("Install Game", systemImage: "arrow.down.circle.fill")
+                if processManager.epicLoginInProgress {
+                    ProgressView().controlSize(.small)
+                    Text("Logging in…").font(.caption).foregroundColor(Fog.inkDim)
+                } else if !processManager.epicLoggedIn {
+                    Button("Log In") {
+                        showLoginFlow = true
+                        processManager.epicOpenLoginPage()
                     }
-
-                    // Quick install buttons for popular games
-                    GroupBox {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Popular Games")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-
-                            HStack(spacing: 8) {
-                                QuickInstallButton(name: "Rocket League", appName: "Sugar") {
-                                    installName = "Sugar"
-                                }
-                                QuickInstallButton(name: "Fortnite", appName: "Fortnite") {
-                                    installName = "Fortnite"
-                                }
-                                QuickInstallButton(name: "Fall Guys", appName: "Starter") {
-                                    installName = "Starter"
-                                }
-                            }
-                        }
-                        .padding(4)
-                    } label: {
-                        Label("Quick Install", systemImage: "star.fill")
-                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(Fog.epic)
                 }
             }
-        .padding(20)
+
+            // Login flow: browser opens, user pastes the JSON back
+            if showLoginFlow && !processManager.epicLoggedIn {
+                Divider()
+                VStack(alignment: .leading, spacing: 10) {
+                    Label("A login page opened in your browser.", systemImage: "safari")
+                        .font(.callout).foregroundColor(Fog.ink)
+
+                    Text("After logging in, you'll see a page with JSON text. Select all the text on that page and paste it here:")
+                        .font(.callout).foregroundColor(Fog.inkDim)
+
+                    HStack {
+                        TextField("Paste the JSON from the browser here", text: $loginCode)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(.caption, design: .monospaced))
+
+                        Button("Log In") {
+                            processManager.epicLoginWithCode(loginCode)
+                            showLoginFlow = false
+                            loginCode = ""
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(Fog.epic)
+                        .disabled(loginCode.isEmpty)
+
+                        Button("Cancel") {
+                            showLoginFlow = false
+                            loginCode = ""
+                        }
+                        .buttonStyle(.bordered)
+                    }
+
+                    Button("Re-open login page") { processManager.epicOpenLoginPage() }
+                        .font(.caption)
+                        .foregroundColor(Fog.epic)
+                }
+                .padding(10)
+                .background(Fog.haze, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
+
+            if !processManager.epicLoginError.isEmpty {
+                Label(processManager.epicLoginError, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption).foregroundColor(.red)
+            }
+
+            // Installing a game happens from the Epic library grid itself (any
+            // owned-but-not-installed title already shows a normal Install
+            // button there, using its real app_name — no need for a second,
+            // worse path here where you'd have to type that name by hand).
+            if processManager.epicLoggedIn {
+                Divider()
+                Label("Browse and install your Epic library from the Epic section in the sidebar.",
+                      systemImage: "bolt.fill")
+                    .font(.caption).foregroundColor(Fog.inkDim)
+            }
+        }
         .onAppear {
             processManager.checkEpicLogin()
         }
-    }
-}
-
-struct QuickInstallButton: View {
-    let name: String
-    let appName: String
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            VStack(spacing: 4) {
-                Image(systemName: "gamecontroller.fill")
-                    .font(.title3)
-                Text(name)
-                    .font(.caption)
-            }
-            .frame(width: 90, height: 60)
-        }
-        .buttonStyle(.bordered)
-        .tint(Fog.epic)
     }
 }
 
