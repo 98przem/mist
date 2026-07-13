@@ -17,6 +17,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # macos-latest runners ship with an Android SDK/NDK, several Xcode
+      # versions' worth of simulator runtimes, and a Haskell toolchain
+      # preinstalled — none needed here, but collectively large enough to leave
+      # too little free space for hdiutil to build a DMG ("No space left on
+      # device"), which has now hit release builds more than once.
+      - name: Free up disk space for the DMG build
+        run: |
+          sudo rm -rf /Users/runner/Library/Android \
+                      /Library/Developer/CoreSimulator/Profiles/Runtimes \
+                      /opt/ghc || true
+          df -h /
+
       # The relay targets net10; the patched DepotDownloader targets net9 (its
       # global.json rolls forward, but install both SDKs to be safe).
       - uses: actions/setup-dotnet@v4
