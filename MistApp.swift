@@ -4279,6 +4279,7 @@ struct SidebarSectionLabel: View {
             }
         }
         .buttonStyle(.plain)
+        .focusable(false)
         .font(.system(size: 10.5, weight: .semibold))
         .tracking(0.6)
         .foregroundColor(Fog.inkFaint)
