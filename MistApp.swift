@@ -6,6 +6,7 @@ import CoreImage.CIFilterBuiltins
 import GameController
 import UniformTypeIdentifiers
 import WebKit
+import Security
 
 // MARK: - Foglight design tokens
 //
@@ -905,8 +906,17 @@ final class SteamAuthManager: ObservableObject {
     @Published var qrStatusText: String = ""
     @Published var isPolling = false
     @Published var errorText: String?
+    // Username/password sign-in — for accounts without the Steam Mobile app to
+    // scan a QR code with. Non-nil while Steam is asking for a Guard code
+    // (email or mobile authenticator) before it'll confirm the session.
+    @Published var guardCodeType: Int?
+    @Published var isSubmittingCredentials = false
 
     private var pollTask: Task<Void, Never>?
+    private var pendingClientID: String?
+    private var pendingRequestID: String?
+    private var pendingInterval: Double = 5
+    private var pendingSteamID: String?
     private static let apiBase = "https://api.steampowered.com/IAuthenticationService"
     // Plain file, not Keychain: Keychain access is tied to the app's code signature,
     // and Mist is ad-hoc signed (no stable Developer ID identity). Every rebuild
@@ -1038,6 +1048,212 @@ final class SteamAuthManager: ObservableObject {
         let decoded = try JSONDecoder().decode(Resp.self, from: data)
         return QRBegin(clientID: decoded.response.client_id, challengeURL: decoded.response.challenge_url,
                        requestID: decoded.response.request_id, interval: decoded.response.interval)
+    }
+
+    // MARK: Username/password login (no phone required)
+    //
+    // Same underlying IAuthenticationService flow the QR path uses, just started
+    // a different way: encrypt the password with Steam's per-account RSA key,
+    // submit it, then — if Steam asks for a Guard code (email or mobile
+    // authenticator) — collect one and confirm, before falling into the exact
+    // same pollUntilConfirmed the QR flow already uses to pick up the resulting
+    // refresh token.
+
+    private struct CredentialsBegin {
+        let clientID: String
+        let requestID: String
+        let interval: Double
+        let steamID: String
+        let guardType: Int?   // nil = Steam needs no extra confirmation
+    }
+
+    // Form-urlencoded bodies need +, /, = escaped (they're part of base64, but
+    // are each meaningful in a form body — + means space, = and & are
+    // delimiters) — CharacterSet.urlQueryAllowed permits all three through
+    // unescaped since they're valid in a URL query, which silently corrupts an
+    // encrypted-password value. Encode against the RFC 3986 unreserved set
+    // instead, which is unambiguous both as a URL and inside a form body.
+    private static func formEncoded(_ s: String) -> String {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        return s.addingPercentEncoding(withAllowedCharacters: allowed) ?? s
+    }
+
+    private static func dataFromHex(_ hex: String) -> Data? {
+        var hex = hex
+        if hex.count % 2 != 0 { hex = "0" + hex }
+        var data = Data()
+        var idx = hex.startIndex
+        while idx < hex.endIndex {
+            let next = hex.index(idx, offsetBy: 2)
+            guard let byte = UInt8(hex[idx..<next], radix: 16) else { return nil }
+            data.append(byte)
+            idx = next
+        }
+        return data
+    }
+
+    // Steam hands back a raw RSA modulus/exponent pair (hex), not a certificate —
+    // SecKeyCreateWithData wants that as a DER-encoded PKCS#1 RSAPublicKey
+    // (SEQUENCE of two INTEGERs), so it has to be built by hand here.
+    private static func rsaPublicKey(modulusHex: String, exponentHex: String) -> SecKey? {
+        guard let modulus = dataFromHex(modulusHex), let exponent = dataFromHex(exponentHex) else { return nil }
+
+        func derLength(_ length: Int) -> Data {
+            if length < 0x80 { return Data([UInt8(length)]) }
+            var bytes = [UInt8](); var len = length
+            while len > 0 { bytes.insert(UInt8(len & 0xff), at: 0); len >>= 8 }
+            return Data([0x80 | UInt8(bytes.count)] + bytes)
+        }
+        func derInteger(_ raw: Data) -> Data {
+            var bytes = [UInt8](raw)
+            while bytes.count > 1 && bytes[0] == 0 && bytes[1] < 0x80 { bytes.removeFirst() }
+            if let first = bytes.first, first >= 0x80 { bytes.insert(0, at: 0) }  // stay a positive INTEGER
+            var out = Data([0x02]); out.append(derLength(bytes.count)); out.append(contentsOf: bytes)
+            return out
+        }
+
+        var body = Data()
+        body.append(derInteger(modulus))
+        body.append(derInteger(exponent))
+        var der = Data([0x30]); der.append(derLength(body.count)); der.append(body)
+
+        let attrs: [String: Any] = [
+            kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
+            kSecAttrKeyClass as String: kSecAttrKeyClassPublic,
+        ]
+        return SecKeyCreateWithData(der as CFData, attrs as CFDictionary, nil)
+    }
+
+    func startCredentialsLogin(username: String, password: String) {
+        stopPolling()
+        errorText = nil
+        guardCodeType = nil
+        isSubmittingCredentials = true
+        pollTask = Task {
+            do {
+                let begin = try await beginAuthSessionViaCredentials(username: username, password: password)
+                pendingClientID = begin.clientID
+                pendingRequestID = begin.requestID
+                pendingInterval = begin.interval
+                pendingSteamID = begin.steamID
+                if let guardType = begin.guardType {
+                    await MainActor.run {
+                        self.guardCodeType = guardType
+                        self.isSubmittingCredentials = false
+                    }
+                    return
+                }
+                await MainActor.run { self.isSubmittingCredentials = false }
+                try await pollUntilConfirmed(clientID: begin.clientID, requestID: begin.requestID, interval: begin.interval)
+            } catch is CancellationError {
+                // expected on stopPolling()/view teardown
+            } catch {
+                await MainActor.run {
+                    self.errorText = error.localizedDescription
+                    self.isSubmittingCredentials = false
+                }
+            }
+        }
+    }
+
+    func submitGuardCode(_ code: String) {
+        guard let clientID = pendingClientID, let steamID = pendingSteamID else { return }
+        let requestID = pendingRequestID ?? ""
+        let interval = pendingInterval
+        let codeType = guardCodeType ?? 2
+        isSubmittingCredentials = true
+        errorText = nil
+        pollTask = Task {
+            do {
+                try await updateAuthSessionWithGuardCode(clientID: clientID, steamID: steamID, code: code, codeType: codeType)
+                await MainActor.run {
+                    self.guardCodeType = nil
+                    self.isSubmittingCredentials = false
+                }
+                try await pollUntilConfirmed(clientID: clientID, requestID: requestID, interval: interval)
+            } catch is CancellationError {
+            } catch {
+                await MainActor.run {
+                    self.errorText = error.localizedDescription
+                    self.isSubmittingCredentials = false
+                }
+            }
+        }
+    }
+
+    private func beginAuthSessionViaCredentials(username: String, password: String) async throws -> CredentialsBegin {
+        let encodedUsername = username.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? username
+        guard let keyURL = URL(string: "\(Self.apiBase)/GetPasswordRSAPublicKey/v1/?account_name=\(encodedUsername)") else {
+            throw SteamAuthError(message: "Couldn't build a sign-in request.")
+        }
+        let (keyData, keyResponse) = try await URLSession.shared.data(from: keyURL)
+        guard let keyHTTP = keyResponse as? HTTPURLResponse, keyHTTP.statusCode == 200 else {
+            throw SteamAuthError(message: "Couldn't reach Steam to sign in.")
+        }
+        struct KeyResp: Decodable {
+            struct Inner: Decodable { let publickey_mod: String; let publickey_exp: String; let timestamp: String }
+            let response: Inner
+        }
+        guard let key = try? JSONDecoder().decode(KeyResp.self, from: keyData) else {
+            throw SteamAuthError(message: "That doesn't look like a valid Steam account.")
+        }
+        guard let secKey = Self.rsaPublicKey(modulusHex: key.response.publickey_mod, exponentHex: key.response.publickey_exp) else {
+            throw SteamAuthError(message: "Couldn't prepare a secure sign-in.")
+        }
+        guard let passwordData = password.data(using: .utf8),
+              let encrypted = SecKeyCreateEncryptedData(secKey, .rsaEncryptionPKCS1, passwordData as CFData, nil) as Data? else {
+            throw SteamAuthError(message: "Couldn't encrypt your password.")
+        }
+
+        var request = URLRequest(url: URL(string: "\(Self.apiBase)/BeginAuthSessionViaCredentials/v1/")!)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        let deviceName = Host.current().localizedName ?? "Mist"
+        let body = "account_name=\(Self.formEncoded(username))" +
+            "&encrypted_password=\(Self.formEncoded(encrypted.base64EncodedString()))" +
+            "&encryption_timestamp=\(key.response.timestamp)" +
+            "&remember_login=true&persistence=1&platform_type=1&website_id=Client" +
+            "&device_friendly_name=\(Self.formEncoded(deviceName))"
+        request.httpBody = body.data(using: .utf8)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw SteamAuthError(message: "Incorrect Steam username or password.")
+        }
+        struct Resp: Decodable {
+            struct Confirmation: Decodable { let confirmation_type: Int }
+            struct Inner: Decodable {
+                let client_id: String
+                let request_id: String
+                let interval: Double
+                let steamid: String
+                let allowed_confirmations: [Confirmation]?
+            }
+            let response: Inner
+        }
+        guard let decoded = try? JSONDecoder().decode(Resp.self, from: data) else {
+            throw SteamAuthError(message: "Steam's sign-in response was unreadable.")
+        }
+        // confirmation_type: 1=None, 2=EmailCode, 3=DeviceCode (mobile authenticator
+        // TOTP), 4=DeviceConfirmation (an app push, same shape as the QR flow) —
+        // only the two code-entry types need a follow-up from us here.
+        let guardType = decoded.response.allowed_confirmations?
+            .first { $0.confirmation_type == 2 || $0.confirmation_type == 3 }?.confirmation_type
+        return CredentialsBegin(clientID: decoded.response.client_id, requestID: decoded.response.request_id,
+                                interval: decoded.response.interval, steamID: decoded.response.steamid, guardType: guardType)
+    }
+
+    private func updateAuthSessionWithGuardCode(clientID: String, steamID: String, code: String, codeType: Int) async throws {
+        var request = URLRequest(url: URL(string: "\(Self.apiBase)/UpdateAuthSessionWithSteamGuardCode/v1/")!)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        let body = "client_id=\(clientID)&steamid=\(steamID)&code=\(Self.formEncoded(code))&code_type=\(codeType)"
+        request.httpBody = body.data(using: .utf8)
+        let (_, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw SteamAuthError(message: "That code didn't work. Try again.")
+        }
     }
 
     private func pollUntilConfirmed(clientID: String, requestID: String, interval: Double) async throws {
@@ -3705,6 +3921,7 @@ private struct AccountsStepView: View {
 
 private struct OnboardingSteamTile: View {
     @ObservedObject var auth: SteamAuthManager
+    @State private var showCredentialsForm = false
 
     var body: some View {
         VStack(spacing: 12) {
@@ -3723,6 +3940,9 @@ private struct OnboardingSteamTile: View {
                     Text(auth.accountName).font(.callout).foregroundColor(Fog.ink)
                 }
                 .frame(maxWidth: .infinity, minHeight: 130)
+            } else if showCredentialsForm {
+                SteamCredentialsForm(auth: auth, compact: true)
+                    .frame(maxWidth: .infinity, minHeight: 130, alignment: .top)
             } else if let url = auth.qrChallengeURL {
                 ZStack {
                     SteamQRCodeView(urlString: url)
@@ -3742,12 +3962,27 @@ private struct OnboardingSteamTile: View {
                 Text(err).font(.caption2).foregroundColor(.orange)
                 Button("Try Again") { auth.startQRLogin() }.font(.caption).buttonStyle(.bordered)
             }
+            if !auth.isLoggedIn {
+                Button(showCredentialsForm ? "Use QR code instead" : "No phone? Use password instead") {
+                    showCredentialsForm.toggle()
+                    auth.errorText = nil
+                    if showCredentialsForm {
+                        auth.stopPolling()
+                        auth.qrChallengeURL = nil
+                    } else {
+                        auth.startQRLogin()
+                    }
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 10.5))
+                .foregroundColor(Fog.inkFaint)
+            }
         }
         .padding(16)
         .frame(width: 200)
         .background(Fog.bgElevated, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Fog.hairline))
-        .onAppear { if auth.qrChallengeURL == nil && !auth.isPolling && !auth.isLoggedIn { auth.startQRLogin() } }
+        .onAppear { if auth.qrChallengeURL == nil && !auth.isPolling && !auth.isLoggedIn && !showCredentialsForm { auth.startQRLogin() } }
         .onDisappear { auth.stopPolling() }
     }
 }
@@ -5860,8 +6095,55 @@ struct SteamQRCodeView: View {
     }
 }
 
+// Username/password sign-in — for accounts without the Steam Mobile app to
+// scan a QR code with. Shows a Guard-code field instead of the form itself
+// once Steam asks for one (email code or mobile-authenticator TOTP).
+struct SteamCredentialsForm: View {
+    @ObservedObject var auth: SteamAuthManager
+    var compact: Bool = false
+    @State private var username = ""
+    @State private var password = ""
+    @State private var guardCode = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let guardType = auth.guardCodeType {
+                Text(guardType == 3 ? "Enter the code from your Steam Mobile authenticator"
+                                    : "Enter the code Steam emailed you")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                TextField("Code", text: $guardCode)
+                    .textFieldStyle(.roundedBorder)
+                    .disableAutocorrection(true)
+                    .frame(maxWidth: compact ? .infinity : 200)
+                Button("Submit Code") { auth.submitGuardCode(guardCode) }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(guardCode.trimmingCharacters(in: .whitespaces).isEmpty || auth.isSubmittingCredentials)
+            } else {
+                TextField("Steam username", text: $username)
+                    .textFieldStyle(.roundedBorder)
+                    .disableAutocorrection(true)
+                    .frame(maxWidth: compact ? .infinity : 200)
+                SecureField("Password", text: $password)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: compact ? .infinity : 200)
+                Button("Sign In") { auth.startCredentialsLogin(username: username, password: password) }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(username.isEmpty || password.isEmpty || auth.isSubmittingCredentials)
+            }
+            if auth.isSubmittingCredentials {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Signing in…").font(.caption2).foregroundColor(.secondary)
+                }
+            }
+        }
+    }
+}
+
 struct SteamLoginView: View {
     @ObservedObject var auth: SteamAuthManager
+    @State private var showCredentialsForm = false
 
     var body: some View {
         if auth.isLoggedIn {
@@ -5924,9 +6206,32 @@ struct SteamLoginView: View {
             }
             .padding(4)
             .onAppear {
-                if auth.qrChallengeURL == nil && !auth.isPolling { auth.startQRLogin() }
+                if auth.qrChallengeURL == nil && !auth.isPolling && !showCredentialsForm { auth.startQRLogin() }
             }
             .onDisappear { auth.stopPolling() }
+
+            Divider()
+            if showCredentialsForm {
+                SteamCredentialsForm(auth: auth)
+                Button("Use QR code instead") {
+                    showCredentialsForm = false
+                    auth.errorText = nil
+                    auth.startQRLogin()
+                }
+                .buttonStyle(.plain)
+                .font(.caption)
+                .foregroundColor(.secondary)
+            } else {
+                Button("No Steam Mobile app? Sign in with username & password") {
+                    auth.stopPolling()
+                    auth.qrChallengeURL = nil
+                    auth.errorText = nil
+                    showCredentialsForm = true
+                }
+                .buttonStyle(.plain)
+                .font(.caption)
+                .foregroundColor(.secondary)
+            }
         }
     }
 }
