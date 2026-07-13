@@ -54,14 +54,12 @@ Let the user add any `.exe` as a library entry — Wine-launchable software Mist
 
 Real queue view (speed/ETA/pause/resume/reorder), cover-art fill-as-it-installs, sidebar download meter, Play button on the install-finished toast.
 
-## Phase 4 — Discovery (expanded)
+## Phase 4 — Discovery (expanded) — shipped (partial)
 
-- **Store page has real content before you search** *(new)* — Steam's public, keyless `featuredcategories` endpoint (verified: Specials, Top Sellers, New Releases, Coming Soon, real cover art) populates the page by default; search narrows within/beyond it. No more a dead search bar as the entire page.
-- **In-app browser for store/community links** *(new)* — a `WKWebView`-backed sheet/window inside Mist, so clicking "View on Steam", a store listing, or a free-game claim link never bounces you to Safari.
-  - **Best-effort SSO**: Steam's QR/client-protocol login can, in principle, be bridged to a web session via the same `finalizelogin` cookie-transfer flow Steam's own clients use — this needs a feasibility spike at implementation time (untested so far; not guaranteed, since an earlier attempt to mint a Web-API access token from the same refresh token came back empty, which may or may not affect this different flow). If it works, links open already signed in; if not, they open logged-out inside the embedded browser — still strictly better than today's external-browser hop, and a documented fallback either way.
-  - Epic SSO is even less likely (legendary's stored tokens are launcher-API tokens, not storefront web cookies) — treat as logged-out-by-default for Epic links, revisit only if Steam's approach reveals a general pattern worth reapplying.
-  - Applied wherever the app currently opens a Steam/Epic URL externally (Store, Free Games, a game's "View store page", achievement pages).
-- Free-games countdown + claimed state, actionable wishlist, curated "runs great here" shelves (grounded in Mist's own renderer detection).
+- **Store page has real content before you search** — shipped. Steam's public, keyless `featuredcategories` endpoint populates Specials/Top Sellers/New Releases/Coming Soon shelves by default; search narrows within/beyond it.
+- **In-app browser for store/community links** — shipped. A `WKWebView`-backed sheet (`InAppBrowserView`) with back/forward/reload/"Open in Safari", applied to Store results, featured-shelf items, and Epic free-game claim links. Logged-out by default — the SSO cookie-bridging spike wasn't attempted (unverified feasibility, not worth the risk this round); still strictly better than the old external-browser hop.
+- **Free-games countdown** — already existed (relative-date label). **Claimed state** — shipped, a local-only "already claimed" marker (`ClaimedEpicPromos`, UserDefaults) so a claimed promo stops nagging you.
+- **Not done, deferred**: actionable wishlist and curated "runs great here" shelves — both need data Mist doesn't currently have (an authenticated wishlist scope; a track record of verified-working titles) and didn't fit this pass. Revisit if there's a cheap way to source either.
 
 ## Phase 5 — Navigation & presence
 

@@ -5,6 +5,7 @@ import CryptoKit
 import CoreImage.CIFilterBuiltins
 import GameController
 import UniformTypeIdentifiers
+import WebKit
 
 // MARK: - Foglight design tokens
 //
@@ -1286,6 +1287,20 @@ enum SteamLibraryService {
         return try JSONDecoder().decode(Resp.self, from: data).items
     }
 
+    // Keyless public endpoint the store's own front page uses to fill Specials/Top
+    // Sellers/New Releases/Coming Soon shelves — so the Store tab has real content
+    // before you type anything, instead of a dead search bar.
+    static func fetchFeaturedCategories() async throws -> [FeaturedCategory] {
+        var comps = URLComponents(string: "https://store.steampowered.com/api/featuredcategories")!
+        comps.queryItems = [URLQueryItem(name: "cc", value: "us"), URLQueryItem(name: "l", value: "english")]
+        let (data, response) = try await URLSession.shared.data(from: comps.url!)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw SteamAuthError(message: "Couldn't reach the Steam store.")
+        }
+        let decoded = try JSONDecoder().decode(FeaturedCategoriesResponse.self, from: data)
+        return [decoded.specials, decoded.top_sellers, decoded.new_releases, decoded.coming_soon].compactMap { $0 }
+    }
+
     // Public store metadata (description, tags) — no login needed, same endpoint
     // the store page itself uses.
     static func fetchAppDetails(appid: String) async throws -> SteamAppDetails {
@@ -1353,6 +1368,40 @@ struct SteamAppDetails: Decodable {
         return nil
     }
     var screenshotURLs: [String] { (screenshots ?? []).compactMap(\.path_full) }
+}
+
+struct FeaturedCategoriesResponse: Decodable {
+    let specials: FeaturedCategory?
+    let top_sellers: FeaturedCategory?
+    let new_releases: FeaturedCategory?
+    let coming_soon: FeaturedCategory?
+}
+
+struct FeaturedCategory: Decodable {
+    let id: String
+    let name: String
+    let items: [FeaturedItem]
+}
+
+struct FeaturedItem: Identifiable, Decodable {
+    let id: Int
+    let name: String
+    let large_capsule_image: String?
+    let small_capsule_image: String?
+    let discounted: Bool?
+    let discount_percent: Int?
+    let final_price: Int?
+
+    var appid: String { String(id) }
+    var imageURL: String? { large_capsule_image ?? small_capsule_image }
+    var priceLabel: String {
+        guard let final = final_price else { return "View on Steam" }
+        let dollars = Double(final) / 100
+        if discounted == true, let pct = discount_percent, pct > 0 {
+            return String(format: "-%d%% · $%.2f", pct, dollars)
+        }
+        return String(format: "$%.2f", dollars)
+    }
 }
 
 // One result from the public storesearch API — the wider Steam catalog, not
@@ -4232,6 +4281,96 @@ struct FogAtmosphere: View {
 // Browse the wider Steam catalog — games you don't own yet. Mist can't buy
 // anything (no checkout flow), so results link out to the real store page;
 // this is a discovery/wishlist surface, not a storefront.
+// A URL wrapper so it can drive `.sheet(item:)` — plain URL isn't Identifiable.
+struct IdentifiableURL: Identifiable, Equatable {
+    let url: URL
+    var id: String { url.absoluteString }
+}
+
+// WKWebView-backed sheet for store/community links, so clicking a listing never
+// bounces you out to Safari. Logged-out by default — bridging Mist's client-
+// protocol Steam session into a web cookie jar is a separate, unverified spike
+// (see roadmap Phase 4 notes), not attempted here.
+struct InAppBrowserView: View {
+    let url: URL
+    @State private var webView: WKWebView?
+    @State private var pageTitle = ""
+    @State private var canGoBack = false
+    @State private var canGoForward = false
+    @State private var isLoading = false
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 14) {
+                HStack(spacing: 10) {
+                    Button { webView?.goBack() } label: { Image(systemName: "chevron.left") }
+                        .disabled(!canGoBack)
+                    Button { webView?.goForward() } label: { Image(systemName: "chevron.right") }
+                        .disabled(!canGoForward)
+                    Button { webView?.reload() } label: { Image(systemName: "arrow.clockwise") }
+                }
+                Text(pageTitle.isEmpty ? (url.host ?? "") : pageTitle)
+                    .font(.callout).foregroundColor(Fog.inkDim).lineLimit(1)
+                Spacer()
+                if isLoading { ProgressView().controlSize(.small) }
+                Button {
+                    NSWorkspace.shared.open(webView?.url ?? url)
+                } label: {
+                    Label("Open in Safari", systemImage: "safari")
+                }
+                Button("Done") { dismiss() }
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(Fog.ink)
+            .padding(12)
+            .background(Fog.haze)
+            Divider().overlay(Fog.hairline)
+            WebViewRepresentable(url: url, webView: $webView, title: $pageTitle,
+                                  canGoBack: $canGoBack, canGoForward: $canGoForward, isLoading: $isLoading)
+        }
+        .frame(width: 920, height: 660)
+        .background(Fog.bg)
+    }
+}
+
+private struct WebViewRepresentable: NSViewRepresentable {
+    let url: URL
+    @Binding var webView: WKWebView?
+    @Binding var title: String
+    @Binding var canGoBack: Bool
+    @Binding var canGoForward: Bool
+    @Binding var isLoading: Bool
+
+    func makeNSView(context: Context) -> WKWebView {
+        let wv = WKWebView()
+        wv.navigationDelegate = context.coordinator
+        wv.load(URLRequest(url: url))
+        DispatchQueue.main.async { webView = wv }
+        return wv
+    }
+
+    func updateNSView(_ nsView: WKWebView, context: Context) {}
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    final class Coordinator: NSObject, WKNavigationDelegate {
+        let parent: WebViewRepresentable
+        init(_ parent: WebViewRepresentable) { self.parent = parent }
+        func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+            parent.isLoading = true
+        }
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            parent.isLoading = false
+            parent.title = webView.title ?? ""
+            parent.canGoBack = webView.canGoBack
+            parent.canGoForward = webView.canGoForward
+        }
+        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            parent.isLoading = false
+        }
+    }
+}
+
 struct SteamStoreBrowseView: View {
     let ownedAppIDs: Set<String>
 
@@ -4239,6 +4378,9 @@ struct SteamStoreBrowseView: View {
     @State private var results: [StoreSearchResult] = []
     @State private var isSearching = false
     @State private var searchTask: Task<Void, Never>?
+    @State private var featured: [FeaturedCategory] = []
+    @State private var isLoadingFeatured = true
+    @State private var browserURL: IdentifiableURL?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -4246,7 +4388,7 @@ struct SteamStoreBrowseView: View {
                 Text("Steam Store")
                     .font(Fog.display(24, weight: .medium))
                     .foregroundColor(Fog.ink)
-                Text("Browse games you don't own yet. Mist can't purchase for you — results open the real store page.")
+                Text("Browse games you don't own yet. Mist can't purchase for you — results open in an in-app browser.")
                     .font(.callout)
                     .foregroundColor(Fog.inkDim)
             }
@@ -4273,33 +4415,79 @@ struct SteamStoreBrowseView: View {
             .padding(.horizontal, 20)
             .padding(.bottom, 14)
 
-            if results.isEmpty {
+            if !query.trimmingCharacters(in: .whitespaces).isEmpty {
+                if results.isEmpty {
+                    Spacer()
+                    VStack(spacing: 10) {
+                        Image(systemName: "cloud.fill").font(.system(size: 30)).foregroundColor(Fog.inkFaint)
+                        Text("No results").foregroundColor(Fog.inkDim)
+                    }
+                    .frame(maxWidth: .infinity)
+                    Spacer()
+                } else {
+                    ScrollView {
+                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 220, maximum: 260), spacing: 12)], spacing: 12) {
+                            ForEach(results) { item in
+                                StoreResultCard(item: item, owned: ownedAppIDs.contains(item.appid)) {
+                                    browserURL = IdentifiableURL(url: URL(string: "https://store.steampowered.com/app/\(item.appid)")!)
+                                }
+                            }
+                        }
+                        .padding(20)
+                    }
+                }
+            } else if isLoadingFeatured {
+                Spacer()
+                ProgressView().controlSize(.small)
+                Spacer()
+            } else if featured.isEmpty {
                 Spacer()
                 VStack(spacing: 10) {
                     Image(systemName: "cloud.fill").font(.system(size: 30)).foregroundColor(Fog.inkFaint)
-                    Text(query.isEmpty ? "Search for a game" : "No results")
-                        .foregroundColor(Fog.inkDim)
+                    Text("Couldn't load the store right now").foregroundColor(Fog.inkDim)
                 }
                 .frame(maxWidth: .infinity)
                 Spacer()
             } else {
+                // Real content by default — Specials/Top Sellers/New Releases/Coming
+                // Soon shelves — instead of a search bar sitting over an empty page.
                 ScrollView {
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 220, maximum: 260), spacing: 12)], spacing: 12) {
-                        ForEach(results) { item in
-                            StoreResultCard(item: item, owned: ownedAppIDs.contains(item.appid))
+                    VStack(alignment: .leading, spacing: 22) {
+                        ForEach(featured, id: \.id) { category in
+                            VStack(alignment: .leading, spacing: 10) {
+                                Text(category.name)
+                                    .font(Fog.display(16, weight: .medium))
+                                    .foregroundColor(Fog.ink)
+                                    .padding(.horizontal, 20)
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    HStack(spacing: 12) {
+                                        ForEach(category.items) { item in
+                                            FeaturedItemCard(item: item, owned: ownedAppIDs.contains(item.appid)) {
+                                                browserURL = IdentifiableURL(url: URL(string: "https://store.steampowered.com/app/\(item.appid)")!)
+                                            }
+                                        }
+                                    }
+                                    .padding(.horizontal, 20)
+                                }
+                            }
                         }
                     }
-                    .padding(20)
+                    .padding(.vertical, 4)
                 }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Fog.bg)
+        .task {
+            featured = (try? await SteamLibraryService.fetchFeaturedCategories()) ?? []
+            isLoadingFeatured = false
+        }
+        .sheet(item: $browserURL) { iu in InAppBrowserView(url: iu.url) }
     }
 
     private func runSearch(_ text: String) async {
         guard !text.trimmingCharacters(in: .whitespaces).isEmpty else {
-            await MainActor.run { results = []; isSearching = false }
+            await MainActor.run { results = [] }
             return
         }
         await MainActor.run { isSearching = true }
@@ -4312,9 +4500,10 @@ struct SteamStoreBrowseView: View {
 struct StoreResultCard: View {
     let item: StoreSearchResult
     let owned: Bool
+    var onOpen: () -> Void = {}
 
     var body: some View {
-        Link(destination: URL(string: "https://store.steampowered.com/app/\(item.appid)")!) {
+        Button(action: onOpen) {
             HStack(spacing: 12) {
                 AsyncImage(url: item.tiny_image.flatMap(URL.init)) { phase in
                     if case .success(let image) = phase { image.resizable().scaledToFill() }
@@ -4344,13 +4533,62 @@ struct StoreResultCard: View {
     }
 }
 
+struct FeaturedItemCard: View {
+    let item: FeaturedItem
+    let owned: Bool
+    var onOpen: () -> Void = {}
+
+    var body: some View {
+        Button(action: onOpen) {
+            VStack(alignment: .leading, spacing: 6) {
+                AsyncImage(url: item.imageURL.flatMap(URL.init)) { phase in
+                    if case .success(let image) = phase { image.resizable().scaledToFill() }
+                    else { Fog.haze }
+                }
+                .frame(width: 180, height: 84)
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                Text(item.name)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(Fog.ink)
+                    .lineLimit(1)
+                if owned {
+                    Text("In your library").font(.system(size: 10.5)).foregroundColor(Fog.good)
+                } else {
+                    Text(item.priceLabel).font(.system(size: 10.5))
+                        .foregroundColor(item.discounted == true ? Fog.good : Fog.inkFaint)
+                }
+            }
+            .frame(width: 180, alignment: .leading)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
 // This week's (and next weeks') Epic Games Store free promotions. Mist can't
 // run Epic's authenticated checkout flow, so "unlock" here means: tell you
 // what's free before you forget, and get you one click from actually
 // claiming it on the real store.
+// Tracks which currently-free Epic promos the user has already clicked "Claim"
+// on — purely a local memory aid (Mist has no way to check Epic's own
+// entitlements), so the card can stop nagging you about something you already
+// went and claimed.
+enum ClaimedEpicPromos {
+    private static let key = "claimedEpicFreeGameIDs"
+    static func isClaimed(_ id: String) -> Bool {
+        (UserDefaults.standard.stringArray(forKey: key) ?? []).contains(id)
+    }
+    static func markClaimed(_ id: String) {
+        var ids = Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
+        ids.insert(id)
+        UserDefaults.standard.set(Array(ids), forKey: key)
+    }
+}
+
 struct EpicFreeGamesView: View {
     @State private var games: [EpicFreeGame] = []
     @State private var isLoading = true
+    @State private var browserURL: IdentifiableURL?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -4358,7 +4596,7 @@ struct EpicFreeGamesView: View {
                 Text("Epic Free Games")
                     .font(Fog.display(24, weight: .medium))
                     .foregroundColor(Fog.ink)
-                Text("Claim links open the real Epic Games Store — Mist doesn't run checkout itself.")
+                Text("Claim links open in an in-app browser — Mist doesn't run checkout itself.")
                     .font(.callout)
                     .foregroundColor(Fog.inkDim)
             }
@@ -4382,7 +4620,7 @@ struct EpicFreeGamesView: View {
                 ScrollView {
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 220, maximum: 260), spacing: 12)], spacing: 12) {
                         ForEach(games) { game in
-                            EpicFreeGameCard(game: game)
+                            EpicFreeGameCard(game: game) { url in browserURL = IdentifiableURL(url: url) }
                         }
                     }
                     .padding(20)
@@ -4395,11 +4633,21 @@ struct EpicFreeGamesView: View {
             games = await EpicPromotionsService.fetchFreeGames()
             isLoading = false
         }
+        .sheet(item: $browserURL) { iu in InAppBrowserView(url: iu.url) }
     }
 }
 
 struct EpicFreeGameCard: View {
     let game: EpicFreeGame
+    var onClaim: (URL) -> Void = { _ in }
+
+    @State private var claimed: Bool
+
+    init(game: EpicFreeGame, onClaim: @escaping (URL) -> Void = { _ in }) {
+        self.game = game
+        self.onClaim = onClaim
+        _claimed = State(initialValue: ClaimedEpicPromos.isClaimed(game.id))
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -4429,14 +4677,25 @@ struct EpicFreeGameCard: View {
             }
 
             if game.isCurrentlyFree, let url = game.claimURL {
-                Link(destination: url) {
-                    Label("Claim on Epic Games Store", systemImage: "arrow.up.right")
+                if claimed {
+                    Label("Claimed", systemImage: "checkmark.circle.fill")
                         .font(.system(size: 11.5, weight: .medium))
                         .frame(maxWidth: .infinity)
+                        .foregroundColor(Fog.good)
+                } else {
+                    Button {
+                        onClaim(url)
+                        ClaimedEpicPromos.markClaimed(game.id)
+                        claimed = true
+                    } label: {
+                        Label("Claim on Epic Games Store", systemImage: "arrow.up.right")
+                            .font(.system(size: 11.5, weight: .medium))
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(Fog.epic)
+                    .controlSize(.small)
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(Fog.epic)
-                .controlSize(.small)
             }
         }
         .padding(10)
