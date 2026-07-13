@@ -6630,6 +6630,186 @@ struct RunningGameView: View {
     }
 }
 
+// System-Settings-shaped: a left category list + right detail pane, instead of
+// every card stacked in one long scroll — matches the macOS Settings app users
+// already know, and keeps each category focused instead of a wall of cards.
+struct SettingsView: View {
+    @ObservedObject var steamAuth: SteamAuthManager
+    @ObservedObject var processManager: ProcessManager
+    @ObservedObject var updater: UpdateManager
+    @ObservedObject var library: GameLibrary
+    var onRescan: () -> Void
+
+    enum Category: String, CaseIterable, Identifiable {
+        case accounts = "Accounts"
+        case graphics = "Graphics"
+        case updates = "Updates"
+        case storage = "Storage & Engine"
+        var id: String { rawValue }
+        var icon: String {
+            switch self {
+            case .accounts: return "person.crop.circle.fill"
+            case .graphics: return "cpu"
+            case .updates: return "arrow.triangle.2.circlepath"
+            case .storage: return "internaldrive.fill"
+            }
+        }
+    }
+
+    @State private var selected: Category = .accounts
+    @State private var engineSizeBytes: Int64?
+    @State private var isComputingStorage = false
+
+    private var installedSizeBytes: Int64 {
+        library.games.filter(\.isInstalled).reduce(0) { $0 + $1.sizeBytes }
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Settings")
+                    .font(Fog.display(18, weight: .medium))
+                    .foregroundColor(Fog.ink)
+                    .padding(.horizontal, 14)
+                    .padding(.top, 16)
+                    .padding(.bottom, 10)
+                ForEach(Category.allCases) { cat in
+                    Button { selected = cat } label: {
+                        HStack(spacing: 9) {
+                            Image(systemName: cat.icon)
+                                .frame(width: 18)
+                                .foregroundColor(selected == cat ? Fog.accent : Fog.inkFaint)
+                            Text(cat.rawValue)
+                                .font(.system(size: 13))
+                                .foregroundColor(selected == cat ? Fog.ink : Fog.inkDim)
+                            Spacer()
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
+                        .background(selected == cat ? Fog.haze : .clear,
+                                    in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.horizontal, 8)
+                }
+                Spacer()
+            }
+            .frame(width: 190)
+            .background(Fog.bgElevated)
+
+            Divider().background(Fog.hairline)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    switch selected {
+                    case .accounts:
+                        SettingsCard(title: "Steam Account", systemImage: "cloud.fill", tint: .blue) {
+                            VStack(alignment: .leading, spacing: 8) {
+                                SteamLoginView(auth: steamAuth)
+                                if let err = library.lastError {
+                                    Label(err, systemImage: "exclamationmark.triangle.fill")
+                                        .font(.caption)
+                                        .foregroundColor(.red)
+                                }
+                                if steamAuth.isLoggedIn {
+                                    Divider()
+                                    Label("Your library, downloads, and achievements all use this one sign-in — no separate keys or logins needed.",
+                                          systemImage: "checkmark.seal")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                        }
+                        SettingsCard(title: "Epic Account", systemImage: "bolt.fill", tint: .purple) {
+                            EpicStoreView(processManager: processManager)
+                        }
+                    case .graphics:
+                        SettingsCard(title: "Graphics", systemImage: "cpu", tint: Fog.accent) {
+                            GraphicsSettingsView()
+                        }
+                    case .updates:
+                        SettingsCard(title: "Updates", systemImage: "arrow.triangle.2.circlepath", tint: .green) {
+                            UpdatesSettingsView(updater: updater)
+                        }
+                    case .storage:
+                        SettingsCard(title: "Storage & Engine", systemImage: "internaldrive.fill", tint: .gray) {
+                            VStack(alignment: .leading, spacing: 10) {
+                                if isComputingStorage {
+                                    HStack(spacing: 8) {
+                                        ProgressView().controlSize(.small)
+                                        Text("Measuring…").font(.caption).foregroundColor(.secondary)
+                                    }
+                                } else {
+                                    SettingsInfoRow(label: "Games", value: ByteCountFormatter.string(
+                                        fromByteCount: installedSizeBytes, countStyle: .file))
+                                    if let engineSizeBytes {
+                                        SettingsInfoRow(label: "Engine", value: ByteCountFormatter.string(
+                                            fromByteCount: engineSizeBytes, countStyle: .file))
+                                    }
+                                }
+                                Divider()
+                                SettingsInfoRow(label: "Wine", value: library.wineDir.path)
+                                SettingsInfoRow(label: "Prefix", value: library.supportDir.path)
+                                Divider()
+                                HStack {
+                                    Image(systemName: DepotDownloaderManager.isInstalled
+                                          ? "checkmark.circle.fill" : "circle.dashed")
+                                        .foregroundColor(DepotDownloaderManager.isInstalled ? .green : .secondary)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("DepotDownloader")
+                                            .font(.callout)
+                                        if !DepotDownloaderManager.isInstalled {
+                                            Text("Downloaded automatically the first time you install a Steam game.")
+                                                .font(.caption)
+                                                .foregroundColor(.secondary)
+                                        }
+                                    }
+                                    Spacer()
+                                }
+                            }
+                        }
+                        .task {
+                            // Real, unfamiliar-no-more numbers, not just paths — the
+                            // "transparency" half of this phase. Games' own sizes are
+                            // already tracked; the Wine engine isn't, so measure it
+                            // off the main thread (it's thousands of small files).
+                            guard engineSizeBytes == nil else { return }
+                            isComputingStorage = true
+                            let dir = library.wineDir
+                            let size: Int64 = await Task.detached(priority: .utility) {
+                                guard let en = FileManager.default.enumerator(
+                                    at: dir, includingPropertiesForKeys: [.fileSizeKey]) else { return 0 }
+                                var total: Int64 = 0
+                                for case let fileURL as URL in en {
+                                    total += Int64((try? fileURL.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+                                }
+                                return total
+                            }.value
+                            engineSizeBytes = size
+                            isComputingStorage = false
+                        }
+
+                        HStack {
+                            Button {
+                                onRescan()
+                            } label: {
+                                Label("Rescan Games", systemImage: "arrow.clockwise")
+                            }
+                            .buttonStyle(.bordered)
+                            Spacer()
+                        }
+                    }
+                }
+                .padding(20)
+                .frame(maxWidth: 700, alignment: .leading)
+            }
+            .frame(maxWidth: .infinity)
+        }
+        .background(Fog.bg)
+    }
+}
+
 struct SettingsCard<Content: View>: View {
     let title: String
     let systemImage: String
@@ -7155,7 +7335,19 @@ struct ContentView: View {
                 }
             } catch {
                 await MainActor.run {
-                    library.lastError = "Couldn't fetch your Steam library: \(error.localizedDescription)"
+                    // A hard "your refresh token no longer works" signal, not a
+                    // network hiccup — sign out so the Steam Account card in
+                    // Settings falls back to its normal QR sign-in flow right
+                    // there, instead of leaving isLoggedIn stuck true with a dead
+                    // session and no obvious way back in.
+                    if let authError = error as? SteamAuthError,
+                       authError.message.localizedCaseInsensitiveContains("expired")
+                       || authError.message.localizedCaseInsensitiveContains("log in again") {
+                        library.lastError = "Your Steam session expired — sign in again below."
+                        steamAuth.logOut()
+                    } else {
+                        library.lastError = "Couldn't fetch your Steam library: \(error.localizedDescription)"
+                    }
                 }
             }
             // Best-effort: most accounts aren't in a Steam Family, so an empty/failed
@@ -7374,85 +7566,8 @@ struct ContentView: View {
                         } else if sidebarSelection == "epicfree" {
                             EpicFreeGamesView()
                         } else if sidebarSelection == "settings" {
-                            ScrollView {
-                                VStack(alignment: .leading, spacing: 16) {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text("Settings")
-                                            .font(.system(size: 26, weight: .bold))
-                                        Text("Accounts, storage, and dependencies")
-                                            .font(.callout)
-                                            .foregroundColor(.secondary)
-                                    }
-                                    .padding(.bottom, 4)
-
-                                    SettingsCard(title: "Steam Account", systemImage: "cloud.fill", tint: .blue) {
-                                        VStack(alignment: .leading, spacing: 8) {
-                                            SteamLoginView(auth: steamAuth)
-                                            if let err = library.lastError {
-                                                Label(err, systemImage: "exclamationmark.triangle.fill")
-                                                    .font(.caption)
-                                                    .foregroundColor(.red)
-                                            }
-                                            if steamAuth.isLoggedIn {
-                                                Divider()
-                                                Label("Your library, downloads, and achievements all use this one sign-in — no separate keys or logins needed.",
-                                                      systemImage: "checkmark.seal")
-                                                    .font(.caption)
-                                                    .foregroundColor(.secondary)
-                                                    .fixedSize(horizontal: false, vertical: true)
-                                            }
-                                        }
-                                    }
-
-                                    SettingsCard(title: "Epic Account", systemImage: "bolt.fill", tint: .purple) {
-                                        EpicStoreView(processManager: processManager)
-                                    }
-
-                                    SettingsCard(title: "Graphics", systemImage: "cpu", tint: Fog.accent) {
-                                        GraphicsSettingsView()
-                                    }
-
-                                    SettingsCard(title: "Updates", systemImage: "arrow.triangle.2.circlepath", tint: .green) {
-                                        UpdatesSettingsView(updater: updater)
-                                    }
-
-                                    SettingsCard(title: "Storage & Engine", systemImage: "internaldrive.fill", tint: .gray) {
-                                        VStack(alignment: .leading, spacing: 10) {
-                                            SettingsInfoRow(label: "Wine", value: library.wineDir.path)
-                                            SettingsInfoRow(label: "Prefix", value: library.supportDir.path)
-                                            Divider()
-                                            HStack {
-                                                Image(systemName: DepotDownloaderManager.isInstalled
-                                                      ? "checkmark.circle.fill" : "circle.dashed")
-                                                    .foregroundColor(DepotDownloaderManager.isInstalled ? .green : .secondary)
-                                                VStack(alignment: .leading, spacing: 2) {
-                                                    Text("DepotDownloader")
-                                                        .font(.callout)
-                                                    if !DepotDownloaderManager.isInstalled {
-                                                        Text("Downloaded automatically the first time you install a Steam game.")
-                                                            .font(.caption)
-                                                            .foregroundColor(.secondary)
-                                                    }
-                                                }
-                                                Spacer()
-                                            }
-                                        }
-                                    }
-
-                                    HStack {
-                                        Button {
-                                            library.scan()
-                                        } label: {
-                                            Label("Rescan Games", systemImage: "arrow.clockwise")
-                                        }
-                                        .buttonStyle(.bordered)
-                                        Spacer()
-                                    }
-                                }
-                                .padding(20)
-                                .frame(maxWidth: 700, alignment: .leading)
-                            }
-                            .frame(maxWidth: .infinity)
+                            SettingsView(steamAuth: steamAuth, processManager: processManager, updater: updater,
+                                         library: library, onRescan: { library.scan() })
                         } else {
                             GameGridView(
                                 games: filteredGames,

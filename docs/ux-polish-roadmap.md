@@ -70,9 +70,12 @@ Real queue view (speed/ETA/pause/resume/reorder), cover-art fill-as-it-installs,
 - **Not done, deferred**: card-expands-into-page transition (matchedGeometryEffect from grid card to detail sheet) — didn't fit this pass; the detail view is a `.sheet` today rather than a push, which would need restructuring to support a shared-geometry animation.
 - **Bug found 2026-07-13**: `CommandPaletteView` (⌘K) has no keyboard navigation — up/down arrows and Return don't move through or select results, mouse-only right now. Needs a focused-index state + arrow-key handling + Return-to-select, matching the gamepad grid's existing focus-index pattern.
 
-## Phase 6 — Settings & transparency
+## Phase 6 — Settings & transparency — shipped (partial)
 
-Graphics-detected panel (trivial now — `D3DMetalProvider`/`DXVKManager` already exist, this is just surfacing them), inline re-sign-in on token expiry, storage & reclaim, System-Settings-shaped layout.
+- **System-Settings-shaped layout** — shipped. `SettingsView` is now a left category list (Accounts/Graphics/Updates/Storage & Engine) + right detail pane, matching macOS's own Settings app, instead of every card stacked in one long scroll.
+- **Graphics-detected panel** — already existed (idea 42), unchanged.
+- **Inline re-sign-in on token expiry** — shipped. When `mintAccessToken` hard-fails with an "expired"/"log in again" error (not just a network hiccup), Mist now signs the Steam session out itself so the Accounts card falls back to its normal QR sign-in flow right there, with an explanatory message, instead of leaving `isLoggedIn` stuck true against a dead session.
+- **Storage & reclaim** — partial. The Storage & Engine card now shows real numbers (installed games' total size, Wine engine size measured off the main thread) instead of just paths. **Not done**: no bulk-reclaim actions (e.g. clearing DepotDownloader's cache from the UI) — scoped down to transparency only this round; reclaim actions still go through each game's own Uninstall today.
 
 ## Phase 7 — Atmosphere & delights
 
