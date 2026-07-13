@@ -61,9 +61,12 @@ Real queue view (speed/ETA/pause/resume/reorder), cover-art fill-as-it-installs,
 - **Free-games countdown** — already existed (relative-date label). **Claimed state** — shipped, a local-only "already claimed" marker (`ClaimedEpicPromos`, UserDefaults) so a claimed promo stops nagging you.
 - **Not done, deferred**: actionable wishlist and curated "runs great here" shelves — both need data Mist doesn't currently have (an authenticated wishlist scope; a track record of verified-working titles) and didn't fit this pass. Revisit if there's a cheap way to source either.
 
-## Phase 5 — Navigation & presence
+## Phase 5 — Navigation & presence — shipped (partial)
 
-⌘K global search (library + store), Steam avatar/persona in the sidebar footer, collapsible sidebar sections, card-expands-into-page transitions.
+- **⌘K global search** — shipped. `CommandPaletteView` searches your library (local, instant) and the Steam store (live) at once; picking a library result opens its detail page, a store result opens in the Phase 4 in-app browser.
+- **Sidebar footer identity** — shipped, scoped down from "avatar" to account name + initials circle: Mist has no Steam Web API key to fetch a real profile photo, so it's a tinted-initial placeholder, not a fetched image. Revisit if a cheap way to get a real avatar shows up (the client-protocol relay could plausibly be extended to return persona+avatar, unverified).
+- **Collapsible sidebar sections** — shipped, state persisted in UserDefaults across launches.
+- **Not done, deferred**: card-expands-into-page transition (matchedGeometryEffect from grid card to detail sheet) — didn't fit this pass; the detail view is a `.sheet` today rather than a push, which would need restructuring to support a shared-geometry animation.
 
 ## Phase 6 — Settings & transparency
 

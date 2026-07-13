@@ -3829,13 +3829,23 @@ struct SidebarRow: View {
 
 struct SidebarSectionLabel: View {
     let title: String
+    var isExpanded: Bool = true
+    var onToggle: () -> Void = {}
     var body: some View {
-        Text(title.uppercased())
-            .font(.system(size: 10.5, weight: .semibold))
-            .tracking(0.6)
-            .foregroundColor(Fog.inkFaint)
-            .padding(.horizontal, 16)
-            .padding(.top, 14)
+        Button(action: onToggle) {
+            HStack(spacing: 4) {
+                Text(title.uppercased())
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 8, weight: .bold))
+                    .rotationEffect(.degrees(isExpanded ? 90 : 0))
+            }
+        }
+        .buttonStyle(.plain)
+        .font(.system(size: 10.5, weight: .semibold))
+        .tracking(0.6)
+        .foregroundColor(Fog.inkFaint)
+        .padding(.horizontal, 16)
+        .padding(.top, 14)
             .padding(.bottom, 2)
     }
 }
@@ -3847,10 +3857,18 @@ struct SidebarView: View {
     let customCount: Int
     let epicLoggedIn: Bool
     let steamLoggedIn: Bool
+    var steamAccountName: String = ""
     var focusedRow: String? = nil
     var downloadQueueCount: Int = 0
     var activeDownloadProgress: Double? = nil   // nil while nothing is actively downloading
     var onOpenDownloads: () -> Void = {}
+
+    // Persisted so collapsing a section sticks across launches, like the rest
+    // of the app's remembered UI state (onboarding-dismissed, auto-check, etc).
+    @State private var libraryExpanded = UserDefaults.standard.object(forKey: "sidebarLibraryExpanded") == nil
+        || UserDefaults.standard.bool(forKey: "sidebarLibraryExpanded")
+    @State private var discoverExpanded = UserDefaults.standard.object(forKey: "sidebarDiscoverExpanded") == nil
+        || UserDefaults.standard.bool(forKey: "sidebarDiscoverExpanded")
 
     private let navOrder = sidebarNavOrder
 
@@ -3878,37 +3896,52 @@ struct SidebarView: View {
             .padding(.top, 10)
             .padding(.bottom, 4)
 
-            SidebarSectionLabel(title: "Library")
-            VStack(spacing: 2) {
-                SidebarRow(title: "All Games", systemImage: "square.grid.2x2.fill", tint: Fog.accent,
-                          isSelected: selection == "all", action: { selection = "all" },
-                          isFocused: focusedRow == "all")
-                SidebarRow(title: "Steam", systemImage: "cloud.fill", tint: Fog.steam, count: steamCount,
-                          isSelected: selection == "steam", action: { selection = "steam" },
-                          isFocused: focusedRow == "steam")
-                SidebarRow(title: "Epic", systemImage: "bolt.fill", tint: Fog.epic, count: epicCount,
-                          needsAttention: !epicLoggedIn, isSelected: selection == "epic",
-                          action: { selection = "epic" }, isFocused: focusedRow == "epic")
-                SidebarRow(title: "My Apps", systemImage: "app.badge.checkmark", tint: Fog.custom, count: customCount,
-                          isSelected: selection == "custom", action: { selection = "custom" },
-                          isFocused: focusedRow == "custom")
+            SidebarSectionLabel(title: "Library", isExpanded: libraryExpanded) {
+                libraryExpanded.toggle()
+                UserDefaults.standard.set(libraryExpanded, forKey: "sidebarLibraryExpanded")
             }
-            .padding(.horizontal, 8)
+            if libraryExpanded {
+                VStack(spacing: 2) {
+                    SidebarRow(title: "All Games", systemImage: "square.grid.2x2.fill", tint: Fog.accent,
+                              isSelected: selection == "all", action: { selection = "all" },
+                              isFocused: focusedRow == "all")
+                    SidebarRow(title: "Steam", systemImage: "cloud.fill", tint: Fog.steam, count: steamCount,
+                              isSelected: selection == "steam", action: { selection = "steam" },
+                              isFocused: focusedRow == "steam")
+                    SidebarRow(title: "Epic", systemImage: "bolt.fill", tint: Fog.epic, count: epicCount,
+                              needsAttention: !epicLoggedIn, isSelected: selection == "epic",
+                              action: { selection = "epic" }, isFocused: focusedRow == "epic")
+                    SidebarRow(title: "My Apps", systemImage: "app.badge.checkmark", tint: Fog.custom, count: customCount,
+                              isSelected: selection == "custom", action: { selection = "custom" },
+                              isFocused: focusedRow == "custom")
+                }
+                .padding(.horizontal, 8)
+            }
 
-            SidebarSectionLabel(title: "Discover")
-            VStack(spacing: 2) {
-                SidebarRow(title: "Steam Store", systemImage: "magnifyingglass", tint: Fog.steam,
-                          isSelected: selection == "store", action: { selection = "store" },
-                          isFocused: focusedRow == "store")
-                SidebarRow(title: "Epic Free Games", systemImage: "gift.fill", tint: Fog.epic,
-                          isSelected: selection == "epicfree", action: { selection = "epicfree" },
-                          isFocused: focusedRow == "epicfree")
+            SidebarSectionLabel(title: "Discover", isExpanded: discoverExpanded) {
+                discoverExpanded.toggle()
+                UserDefaults.standard.set(discoverExpanded, forKey: "sidebarDiscoverExpanded")
             }
-            .padding(.horizontal, 8)
+            if discoverExpanded {
+                VStack(spacing: 2) {
+                    SidebarRow(title: "Steam Store", systemImage: "magnifyingglass", tint: Fog.steam,
+                              isSelected: selection == "store", action: { selection = "store" },
+                              isFocused: focusedRow == "store")
+                    SidebarRow(title: "Epic Free Games", systemImage: "gift.fill", tint: Fog.epic,
+                              isSelected: selection == "epicfree", action: { selection = "epicfree" },
+                              isFocused: focusedRow == "epicfree")
+                }
+                .padding(.horizontal, 8)
+            }
 
             Spacer()
             if downloadQueueCount > 0 {
                 downloadMeter
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 6)
+            }
+            if steamLoggedIn {
+                accountFooter
                     .padding(.horizontal, 8)
                     .padding(.bottom, 6)
             }
@@ -3923,6 +3956,31 @@ struct SidebarView: View {
             .padding(.vertical, 8)
         }
         .background(LinearGradient(colors: [Fog.bgElevated, Fog.bg], startPoint: .top, endPoint: .bottom))
+    }
+
+    // Presence: who you're signed in as, right where you'll notice it, instead
+    // of only visible by digging into Settings. No Steam Web API key on hand to
+    // fetch a real avatar image, so this is initials-on-a-tinted-circle, not a
+    // fetched photo — a real avatar is a small follow-up if that ever changes.
+    private var accountFooter: some View {
+        HStack(spacing: 9) {
+            ZStack {
+                Circle().fill(Fog.steam.opacity(0.22)).frame(width: 26, height: 26)
+                Text(String(steamAccountName.prefix(1)).uppercased())
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(Fog.steam)
+            }
+            VStack(alignment: .leading, spacing: 0) {
+                Text(steamAccountName.isEmpty ? "Steam" : steamAccountName)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(Fog.ink)
+                    .lineLimit(1)
+                Text("Signed in").font(.system(size: 10)).foregroundColor(Fog.inkFaint)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
     }
 
     private var downloadMeter: some View {
@@ -4368,6 +4426,124 @@ private struct WebViewRepresentable: NSViewRepresentable {
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
             parent.isLoading = false
         }
+    }
+}
+
+// ⌘K global search — your library and the wider Steam catalog in one place,
+// instead of only being able to search whichever one you're currently looking
+// at (the grid's own search bar is library-only, Store's is catalog-only).
+struct CommandPaletteView: View {
+    let libraryGames: [Game]
+    var onSelectGame: (Game) -> Void
+    var onSelectStoreResult: (StoreSearchResult) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var query = ""
+    @State private var storeResults: [StoreSearchResult] = []
+    @State private var isSearchingStore = false
+    @State private var searchTask: Task<Void, Never>?
+    @FocusState private var focused: Bool
+
+    private var libraryMatches: [Game] {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return [] }
+        return Array(libraryGames.filter { $0.name.localizedCaseInsensitiveContains(q) }.prefix(8))
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Image(systemName: "magnifyingglass").foregroundColor(Fog.inkFaint)
+                TextField("Search your library and the Steam store", text: $query)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 15))
+                    .focused($focused)
+                    .onChange(of: query) { _, newValue in
+                        searchTask?.cancel()
+                        searchTask = Task {
+                            try? await Task.sleep(nanoseconds: 300_000_000)
+                            guard !Task.isCancelled else { return }
+                            let q = newValue.trimmingCharacters(in: .whitespaces)
+                            guard !q.isEmpty else { await MainActor.run { storeResults = [] }; return }
+                            await MainActor.run { isSearchingStore = true }
+                            let found = (try? await SteamLibraryService.searchStore(query: q)) ?? []
+                            guard !Task.isCancelled else { return }
+                            await MainActor.run { storeResults = found; isSearchingStore = false }
+                        }
+                    }
+                if isSearchingStore { ProgressView().controlSize(.small) }
+            }
+            .padding(14)
+            Divider().overlay(Fog.hairline)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    if query.trimmingCharacters(in: .whitespaces).isEmpty {
+                        Text("Type to search your library and the Steam store")
+                            .font(.callout).foregroundColor(Fog.inkFaint)
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .padding(.top, 30)
+                    } else {
+                        if !libraryMatches.isEmpty {
+                            paletteSection("Your Library") {
+                                ForEach(libraryMatches) { game in
+                                    Button { onSelectGame(game); dismiss() } label: {
+                                        paletteRow(icon: game.source == .steam ? "cloud.fill"
+                                                        : (game.source == .epic ? "bolt.fill" : "app.badge.checkmark"),
+                                                   tint: game.source == .steam ? Fog.steam
+                                                        : (game.source == .epic ? Fog.epic : Fog.custom),
+                                                   title: game.name,
+                                                   subtitle: game.isInstalled ? "Installed" : "Not installed")
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                        }
+                        if !storeResults.isEmpty {
+                            paletteSection("Steam Store") {
+                                ForEach(storeResults.prefix(8)) { item in
+                                    Button { onSelectStoreResult(item); dismiss() } label: {
+                                        paletteRow(icon: "cart.fill", tint: Fog.inkFaint,
+                                                   title: item.name, subtitle: item.priceLabel)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                        }
+                        if libraryMatches.isEmpty && storeResults.isEmpty && !isSearchingStore {
+                            Text("No results").font(.callout).foregroundColor(Fog.inkFaint)
+                                .frame(maxWidth: .infinity, alignment: .center)
+                                .padding(.top, 30)
+                        }
+                    }
+                }
+                .padding(14)
+            }
+        }
+        .frame(width: 560, height: 420)
+        .background(Fog.bg)
+        .onAppear { focused = true }
+    }
+
+    @ViewBuilder
+    private func paletteSection<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title.uppercased())
+                .font(.system(size: 10.5, weight: .semibold)).tracking(0.6)
+                .foregroundColor(Fog.inkFaint)
+            VStack(spacing: 3) { content() }
+        }
+    }
+
+    private func paletteRow(icon: String, tint: Color, title: String, subtitle: String) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon).foregroundColor(tint).frame(width: 18)
+            Text(title).foregroundColor(Fog.ink).lineLimit(1)
+            Spacer()
+            Text(subtitle).font(.caption).foregroundColor(Fog.inkFaint)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(Fog.haze, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }
 
@@ -6930,6 +7106,8 @@ struct ContentView: View {
     @State private var libraryFilter: LibraryFilter = .all
     @State private var gridColumns = 1
     @State private var showingDownloadsQueue = false
+    @State private var showingCommandPalette = false
+    @State private var commandPaletteBrowserURL: IdentifiableURL?
     // The game that just finished installing — drives a transient "Play" toast,
     // auto-dismissed a few seconds after it appears (see the toast's .onAppear).
     @State private var installToast: Game?
@@ -7179,6 +7357,7 @@ struct ContentView: View {
                         customCount: library.games.filter { $0.source == .custom }.count,
                         epicLoggedIn: processManager.epicLoggedIn,
                         steamLoggedIn: steamAuth.isLoggedIn,
+                        steamAccountName: steamAuth.accountName,
                         downloadQueueCount: downloadManager.queue.count,
                         activeDownloadProgress: downloadManager.queue.first(where: { $0.state == .downloading })?.progress,
                         onOpenDownloads: { showingDownloadsQueue = true }
@@ -7441,6 +7620,15 @@ struct ContentView: View {
             sidebarSelection = "settings"
             Task { await updater.check(userInitiated: true) }
         })
+        .focusedSceneValue(\.openCommandPaletteAction, { showingCommandPalette = true })
+        .sheet(isPresented: $showingCommandPalette) {
+            CommandPaletteView(libraryGames: library.games, onSelectGame: { game in
+                gameForDetail = game
+            }, onSelectStoreResult: { item in
+                commandPaletteBrowserURL = IdentifiableURL(url: URL(string: "https://store.steampowered.com/app/\(item.appid)")!)
+            })
+        }
+        .sheet(item: $commandPaletteBrowserURL) { iu in InAppBrowserView(url: iu.url) }
         .onAppear {
             configureGamepad()
             updater.checkOnLaunchIfEnabled()
@@ -7463,6 +7651,9 @@ private struct ShowSettingsActionKey: FocusedValueKey {
 private struct CheckUpdatesActionKey: FocusedValueKey {
     typealias Value = () -> Void
 }
+private struct OpenCommandPaletteActionKey: FocusedValueKey {
+    typealias Value = () -> Void
+}
 extension FocusedValues {
     var rescanAction: (() -> Void)? {
         get { self[RescanActionKey.self] }
@@ -7476,6 +7667,10 @@ extension FocusedValues {
         get { self[CheckUpdatesActionKey.self] }
         set { self[CheckUpdatesActionKey.self] = newValue }
     }
+    var openCommandPaletteAction: (() -> Void)? {
+        get { self[OpenCommandPaletteActionKey.self] }
+        set { self[OpenCommandPaletteActionKey.self] = newValue }
+    }
 }
 
 // MARK: - App Entry Point
@@ -7485,6 +7680,7 @@ struct MistApp: App {
     @FocusedValue(\.rescanAction) private var rescanAction
     @FocusedValue(\.showSettingsAction) private var showSettingsAction
     @FocusedValue(\.checkUpdatesAction) private var checkUpdatesAction
+    @FocusedValue(\.openCommandPaletteAction) private var openCommandPaletteAction
 
     var body: some Scene {
         WindowGroup {
@@ -7496,6 +7692,10 @@ struct MistApp: App {
         .commands {
             CommandGroup(replacing: .newItem) { }
             CommandMenu("Library") {
+                Button("Find…") { openCommandPaletteAction?() }
+                    .keyboardShortcut("k", modifiers: .command)
+                    .disabled(openCommandPaletteAction == nil)
+                Divider()
                 Button("Rescan Games") { rescanAction?() }
                     .keyboardShortcut("r", modifiers: .command)
                     .disabled(rescanAction == nil)
