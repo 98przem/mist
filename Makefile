@@ -6,7 +6,7 @@
 # from the git tag (see .github/workflows/release.yml) so releases get a clean
 # number; this default only labels local dev builds, hence the "-preview" suffix.
 # Bump it to the next target release when starting work toward one.
-VERSION ?= 0.9.0-preview
+VERSION ?= 0.9.1-preview
 
 PREFIX ?= $(HOME)/Library/Application Support/Mist
 CEF_DIR = $(PREFIX)/drive_c/Program Files (x86)/Steam/bin/cef/cef.win64
@@ -43,7 +43,7 @@ $(TOOLS_SENTINEL):
 
 Mist.app/Contents/MacOS/Mist: MistApp.swift $(TOOLS_SENTINEL) Mist.icns
 	@mkdir -p Mist.app/Contents/MacOS Mist.app/Contents/Resources
-	swiftc -O -parse-as-library -o $@ $<
+	swiftc -O -parse-as-library -target arm64-apple-macos14 -o $@ $<
 	@cp Mist.icns Mist.app/Contents/Resources/Mist.icns
 	@echo '<?xml version="1.0" encoding="UTF-8"?>' > Mist.app/Contents/Info.plist
 	@echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' >> Mist.app/Contents/Info.plist
@@ -54,6 +54,7 @@ Mist.app/Contents/MacOS/Mist: MistApp.swift $(TOOLS_SENTINEL) Mist.icns
 	@echo '<key>CFBundleVersion</key><string>2.0</string>' >> Mist.app/Contents/Info.plist
 	@echo '<key>CFBundleShortVersionString</key><string>$(VERSION)</string>' >> Mist.app/Contents/Info.plist
 	@echo '<key>CFBundleIconFile</key><string>Mist.icns</string>' >> Mist.app/Contents/Info.plist
+	@echo '<key>LSMinimumSystemVersion</key><string>14.0</string>' >> Mist.app/Contents/Info.plist
 	@echo '</dict></plist>' >> Mist.app/Contents/Info.plist
 	codesign --force --deep -s - Mist.app
 
@@ -68,7 +69,7 @@ bundle: Mist.icns
 	rm -rf dist/
 	mkdir -p "$(BUNDLE_MACOS)" "$(BUNDLE_RESOURCES)"
 	# Compile Swift app
-	swiftc -O -parse-as-library -o "$(BUNDLE_MACOS)/Mist" MistApp.swift
+	swiftc -O -parse-as-library -target arm64-apple-macos14 -o "$(BUNDLE_MACOS)/Mist" MistApp.swift
 	# Info.plist
 	@echo '<?xml version="1.0" encoding="UTF-8"?>' > "$(BUNDLE_CONTENTS)/Info.plist"
 	@echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' >> "$(BUNDLE_CONTENTS)/Info.plist"
@@ -79,6 +80,7 @@ bundle: Mist.icns
 	@echo '<key>CFBundleVersion</key><string>2.0</string>' >> "$(BUNDLE_CONTENTS)/Info.plist"
 	@echo '<key>CFBundleShortVersionString</key><string>$(VERSION)</string>' >> "$(BUNDLE_CONTENTS)/Info.plist"
 	@echo '<key>CFBundleIconFile</key><string>Mist.icns</string>' >> "$(BUNDLE_CONTENTS)/Info.plist"
+	@echo '<key>LSMinimumSystemVersion</key><string>14.0</string>' >> "$(BUNDLE_CONTENTS)/Info.plist"
 	@echo '</dict></plist>' >> "$(BUNDLE_CONTENTS)/Info.plist"
 	# App icon
 	@cp Mist.icns "$(BUNDLE_RESOURCES)/Mist.icns" 2>/dev/null || echo "(no Mist.icns yet)"
