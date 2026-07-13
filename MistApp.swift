@@ -32,6 +32,28 @@ enum Fog {
     static func display(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
         .system(size: size, weight: weight, design: .serif)
     }
+
+    // A little character on genre tags instead of every one being the same flat
+    // gray chip — a coarse, hand-picked mapping (not a real taxonomy), falling
+    // back to neutral ink for anything unrecognized so an odd/rare genre string
+    // never looks broken, just plain.
+    private static let genreTints: [(match: String, color: Color)] = [
+        ("action", Color(red: 0xe0/255, green: 0x6c/255, blue: 0x5a/255)),
+        ("adventure", Color(red: 0xe0/255, green: 0xb0/255, blue: 0x5a/255)),
+        ("rpg", Color(red: 0xb9/255, green: 0x8a/255, blue: 0xf0/255)),
+        ("strategy", Color(red: 0x5a/255, green: 0xb0/255, blue: 0xe0/255)),
+        ("simulation", Color(red: 0x6b/255, green: 0xcf/255, blue: 0x9a/255)),
+        ("sport", Color(red: 0x5a/255, green: 0xd0/255, blue: 0xc0/255)),
+        ("racing", Color(red: 0xe0/255, green: 0x8a/255, blue: 0x3a/255)),
+        ("horror", Color(red: 0x9a/255, green: 0x4a/255, blue: 0x4a/255)),
+        ("puzzle", Color(red: 0x7c/255, green: 0x9c/255, blue: 1.0)),
+        ("indie", Color(red: 0xe0/255, green: 0x8a/255, blue: 0xc0/255)),
+        ("casual", Color(red: 0x9a/255, green: 0xd0/255, blue: 0x7a/255)),
+    ]
+    static func genreTint(_ genre: String) -> Color {
+        let lower = genre.lowercased()
+        return genreTints.first { lower.contains($0.match) }?.color ?? Fog.inkDim
+    }
 }
 
 // MARK: - Data Models
@@ -1345,6 +1367,13 @@ struct SteamAchievement: Identifiable, Decodable {
         if p < 5 { return "Ultra Rare" }
         if p < 15 { return "Rare" }
         return nil
+    }
+
+    // Inferred, not tracked (no persisted "last seen" store) — good enough to
+    // flag "you just unlocked this in-game" when tabbing back into Mist.
+    var isRecentlyUnlocked: Bool {
+        guard achieved == 1, let t = unlocktime, t > 0 else { return false }
+        return Date().timeIntervalSince1970 - Double(t) < 600
     }
 }
 
@@ -4279,7 +4308,7 @@ struct GameGridView: View {
         case .installed: return "Nothing installed yet"
         case .shared: return "No family-shared games"
         case .notInstalled: return "Everything's installed"
-        case .all: return "No games here"
+        case .all: return "Quiet in here"
         }
     }
     private var emptySubtitle: String {
@@ -4293,7 +4322,7 @@ struct GameGridView: View {
         case .installed: return "Install a game to see it here."
         case .shared: return "Games shared into your Steam Family will appear here."
         case .notInstalled: return "Nice — your whole library is downloaded."
-        case .all: return "No games match."
+        case .all: return "Nothing matches that filter — the fog's just empty here, not broken."
         }
     }
 }
@@ -5094,12 +5123,13 @@ struct GameDetailView: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
                 ForEach(tags.prefix(8), id: \.self) { tag in
+                    let tint = Fog.genreTint(tag)
                     Text(tag)
                         .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(Fog.inkDim)
+                        .foregroundColor(tint)
                         .padding(.horizontal, 9)
                         .padding(.vertical, 4)
-                        .background(Fog.haze, in: Capsule())
+                        .background(tint.opacity(0.14), in: Capsule())
                 }
             }
         }
@@ -5223,6 +5253,14 @@ struct GameDetailView: View {
                                             .padding(.vertical, 1)
                                             .background(Fog.accentSoft, in: Capsule())
                                             .foregroundColor(Fog.accent)
+                                    }
+                                    if ach.isRecentlyUnlocked {
+                                        Text("NEW")
+                                            .font(.system(size: 9, weight: .heavy)).tracking(0.4)
+                                            .padding(.horizontal, 5)
+                                            .padding(.vertical, 1)
+                                            .background(Fog.good, in: Capsule())
+                                            .foregroundColor(Color(red: 0x0b/255, green: 0x10/255, blue: 0x20/255))
                                     }
                                 }
                                 if let desc = ach.description, !desc.isEmpty {
@@ -5353,6 +5391,16 @@ struct GameDetailView: View {
                 return (a.globalPercent ?? 101) < (b.globalPercent ?? 101)
             }
             achievements = list
+
+            // "Just unlocked" is inferred, not tracked — no persisted "last seen
+            // unlock time" store exists, so treat anything Steam reports unlocked
+            // within the last 10 minutes as fresh. Good enough for "you unlocked
+            // something in-game, then tabbed back to Mist," the actual use case.
+            let chimeEnabled = UserDefaults.standard.object(forKey: "achievementChimeEnabled") == nil
+                || UserDefaults.standard.bool(forKey: "achievementChimeEnabled")
+            if chimeEnabled && list.contains(where: \.isRecentlyUnlocked) {
+                NSSound(named: "Glass")?.play()
+            }
         } catch {
             achievementsError = (error as? SteamAuthError)?.errorDescription
                 ?? "No achievement data available for this game."
@@ -6658,6 +6706,8 @@ struct SettingsView: View {
 
     @State private var selected: Category = .accounts
     @State private var engineSizeBytes: Int64?
+    @State private var achievementChimeEnabled = UserDefaults.standard.object(forKey: "achievementChimeEnabled") == nil
+        || UserDefaults.standard.bool(forKey: "achievementChimeEnabled")
     @State private var isComputingStorage = false
 
     private var installedSizeBytes: Int64 {
@@ -6718,6 +6768,11 @@ struct SettingsView: View {
                                         .font(.caption)
                                         .foregroundColor(.secondary)
                                         .fixedSize(horizontal: false, vertical: true)
+                                    Toggle("Play a chime for achievements unlocked just now", isOn: $achievementChimeEnabled)
+                                        .font(.caption)
+                                        .onChange(of: achievementChimeEnabled) { _, newValue in
+                                            UserDefaults.standard.set(newValue, forKey: "achievementChimeEnabled")
+                                        }
                                 }
                             }
                         }

@@ -77,9 +77,13 @@ Real queue view (speed/ETA/pause/resume/reorder), cover-art fill-as-it-installs,
 - **Inline re-sign-in on token expiry** — shipped. When `mintAccessToken` hard-fails with an "expired"/"log in again" error (not just a network hiccup), Mist now signs the Steam session out itself so the Accounts card falls back to its normal QR sign-in flow right there, with an explanatory message, instead of leaving `isLoggedIn` stuck true against a dead session.
 - **Storage & reclaim** — partial. The Storage & Engine card now shows real numbers (installed games' total size, Wine engine size measured off the main thread) instead of just paths. **Not done**: no bulk-reclaim actions (e.g. clearing DepotDownloader's cache from the UI) — scoped down to transparency only this round; reclaim actions still go through each game's own Uninstall today.
 
-## Phase 7 — Atmosphere & delights
+## Phase 7 — Atmosphere & delights — shipped (partial)
 
-Ambient fog behind the library, matched-geometry transitions, trophy-case view, living app icon, optional unlock chime, genre-aware tints, characterful empty states.
+- **Ambient fog behind the library** — already existed (idea 46), unchanged.
+- **Genre-aware tints** — shipped. Each genre tag on a game's detail page now gets its own hand-picked tint (`Fog.genreTint`) instead of every tag being the same flat gray chip.
+- **Optional unlock chime** — shipped. `SteamAchievement.isRecentlyUnlocked` infers "unlocked in the last 10 minutes" (no persisted "last seen" store exists, so this is the practical proxy) — plays a system chime and shows a "NEW" badge on the achievement row. Toggle lives in Settings → Accounts, on by default.
+- **Characterful empty states** — light touch: punched up the flattest "no games match any filter" copy; the rest already had personality from earlier phases.
+- **Not done, deferred**: card-expands-into-page transition (already deferred from Phase 5, same underlying blocker — detail is a `.sheet`, not a push). **Trophy-case view** (a dedicated cross-game achievement browser) — needs per-game achievement fetches for the whole library, which is expensive without a caching layer that doesn't exist yet. **Living app icon** — skipped outright: it would conflict with the just-fixed "icon shouldn't glow outside the app" bug (item 6 above); revisit only with a design that's animated/alive without adding a glow back to the static Dock/Finder icon.
 
 ---
 
