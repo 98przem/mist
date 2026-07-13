@@ -16,6 +16,7 @@ using SteamKit2.Internal;
 //   relay <session.json> <appid> --unlock <name> → unlock one achievement
 //   relay <session.json> <appid> --unlock-auto   → unlock first currently-locked one
 //   relay <session.json> --family                → print Family-shared library as JSON
+//   relay <session.json> --persona                → print {personaName, avatarHash} as JSON
 //
 // session.json is Mist's steam_session.json (accountName, steamID, refreshToken).
 // Exit 0 = success. All human status goes to stderr; stdout is JSON only.
@@ -25,11 +26,12 @@ class Program
     static SteamClient steamClient = null!;
     static CallbackManager manager = null!;
     static SteamUser steamUser = null!;
+    static SteamFriends steamFriends = null!;
 
     static string accountName = "", refreshToken = "";
     static ulong steamId = 0;
     static uint appId = 0;
-    static string mode = "view";      // view | unlock | schema | family
+    static string mode = "view";      // view | unlock | schema | family | owned | persona
     static string? unlockName = null;  // specific name, or null for --unlock-auto
     static bool running = true;
     static int exitCode = 1;
@@ -43,6 +45,7 @@ class Program
         steamId = ulong.TryParse(Extract(json, "steamID"), out var s) ? s : 0;
         if (args[1] == "--family") { mode = "family"; }
         else if (args[1] == "--owned") { mode = "owned"; }
+        else if (args[1] == "--persona") { mode = "persona"; }
         else
         {
             appId = uint.Parse(args[1]);
@@ -56,6 +59,7 @@ class Program
         steamClient = new SteamClient();
         manager = new CallbackManager(steamClient);
         steamUser = steamClient.GetHandler<SteamUser>()!;
+        steamFriends = steamClient.GetHandler<SteamFriends>()!;
         steamClient.AddHandler(new StatsHandler());
 
         manager.Subscribe<SteamClient.ConnectedCallback>(OnConnected);
@@ -64,8 +68,10 @@ class Program
         {
             if (mode == "family") _ = OnLoggedOnFamily(cb);
             else if (mode == "owned") _ = OnLoggedOnOwned(cb);
+            else if (mode == "persona") OnLoggedOnPersona(cb);
             else OnLoggedOn(cb);
         });
+        manager.Subscribe<SteamFriends.PersonaStateCallback>(OnPersonaState);
 
         Err($"connecting as {accountName} ({mode})…");
         steamClient.Connect();
@@ -189,6 +195,33 @@ class Program
         {
             running = false;
         }
+    }
+
+    // Persona name + avatar for the SIGNED-IN account's own sidebar footer —
+    // over the same client-protocol session as everything else, so Mist never
+    // needs a separate Steam Web API key just to show who's logged in.
+    // RequestFriendInfo works for your own SteamID too, not just friends; the
+    // response comes back as an ordinary PersonaStateCallback.
+    static void OnLoggedOnPersona(SteamUser.LoggedOnCallback cb)
+    {
+        if (cb.Result != EResult.OK) { Err($"logon failed: {cb.Result}/{cb.ExtendedResult}"); exitCode = 1; running = false; return; }
+        steamFriends.RequestFriendInfo(new SteamID(steamId),
+            EClientPersonaStateFlag.PlayerName | EClientPersonaStateFlag.Presence);
+    }
+
+    static void OnPersonaState(SteamFriends.PersonaStateCallback cb)
+    {
+        if (mode != "persona" || cb.FriendID.ConvertToUInt64() != steamId) return;
+        var hashHex = cb.AvatarHash != null && cb.AvatarHash.Length > 0
+            ? string.Concat(cb.AvatarHash.Select(b => b.ToString("x2")))
+            : "";
+        var sb = new StringBuilder("{");
+        sb.Append("\"personaName\":").Append(JStr(cb.Name ?? "")).Append(',');
+        sb.Append("\"avatarHash\":").Append(JStr(hashHex));
+        sb.Append('}');
+        Console.Out.Write(sb.ToString());
+        exitCode = 0;
+        running = false;
     }
 
     static void OnConnected(SteamClient.ConnectedCallback cb) =>

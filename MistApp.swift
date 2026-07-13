@@ -946,6 +946,12 @@ final class SteamAuthManager: ObservableObject {
     @Published var isLoggedIn = false
     @Published var accountName: String = ""
     @Published var steamID: String = ""
+    // Real persona name + avatar for the sidebar footer, fetched over the relay
+    // (see RelayManager.persona()) — best-effort, so these silently stay empty
+    // on failure rather than showing an error; the initials-circle placeholder
+    // already covers that case.
+    @Published var personaName: String = ""
+    @Published var avatarURL: URL?
     @Published var qrChallengeURL: String?
     // When the current QR challenge will proactively refresh (see
     // qrLifetimeSeconds) — drives a countdown border around the code itself,
@@ -1006,6 +1012,8 @@ final class SteamAuthManager: ObservableObject {
         isLoggedIn = false
         accountName = ""
         steamID = ""
+        personaName = ""
+        avatarURL = nil
     }
 
     // MARK: QR login
@@ -1916,6 +1924,26 @@ enum RelayManager {
     static func ownedLibrary() async throws -> [RelayOwnedGame] {
         let data = try await run(["--owned"])
         return try JSONDecoder().decode([RelayOwnedGame].self, from: data)
+    }
+
+    // Persona name + avatar for the sidebar footer — over the same
+    // client-protocol session as everything else, so a real avatar doesn't
+    // need a separately-obtained Steam Web API key (which the one-QR-login
+    // design deliberately avoids everywhere else too).
+    static func persona() async throws -> RelayPersona {
+        let data = try await run(["--persona"])
+        return try JSONDecoder().decode(RelayPersona.self, from: data)
+    }
+}
+
+struct RelayPersona: Decodable {
+    let personaName: String
+    let avatarHash: String
+    // Steam's own CDN URL shape for avatar images — stable, unauthenticated,
+    // the same one steamcommunity.com itself serves avatars from.
+    var avatarURL: URL? {
+        guard !avatarHash.isEmpty else { return nil }
+        return URL(string: "https://avatars.steamstatic.com/\(avatarHash)_full.jpg")
     }
 }
 
@@ -4216,6 +4244,8 @@ struct SidebarView: View {
     let epicLoggedIn: Bool
     let steamLoggedIn: Bool
     var steamAccountName: String = ""
+    var steamPersonaName: String = ""
+    var avatarURL: URL? = nil
     var focusedRow: String? = nil
     var downloadQueueCount: Int = 0
     var activeDownloadProgress: Double? = nil   // nil while nothing is actively downloading
@@ -4326,13 +4356,22 @@ struct SidebarView: View {
     private var accountFooter: some View {
         HStack(spacing: 9) {
             ZStack {
-                Circle().fill(Fog.steam.opacity(0.22)).frame(width: 26, height: 26)
-                Text(String(steamAccountName.prefix(1)).uppercased())
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(Fog.steam)
+                if let avatarURL {
+                    AsyncImage(url: avatarURL) { phase in
+                        if case .success(let image) = phase {
+                            image.resizable().scaledToFill()
+                        } else {
+                            initialsAvatar
+                        }
+                    }
+                    .frame(width: 26, height: 26)
+                    .clipShape(Circle())
+                } else {
+                    initialsAvatar
+                }
             }
             VStack(alignment: .leading, spacing: 0) {
-                Text(steamAccountName.isEmpty ? "Steam" : steamAccountName)
+                Text(steamPersonaName.isEmpty ? (steamAccountName.isEmpty ? "Steam" : steamAccountName) : steamPersonaName)
                     .font(.system(size: 12, weight: .medium))
                     .foregroundColor(Fog.ink)
                     .lineLimit(1)
@@ -4342,6 +4381,17 @@ struct SidebarView: View {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
+    }
+
+    // Real photo when the relay's persona fetch succeeded; the tinted-initial
+    // placeholder otherwise — no error shown either way, this is best-effort.
+    private var initialsAvatar: some View {
+        ZStack {
+            Circle().fill(Fog.steam.opacity(0.22)).frame(width: 26, height: 26)
+            Text(String(steamAccountName.prefix(1)).uppercased())
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(Fog.steam)
+        }
     }
 
     private var downloadMeter: some View {
@@ -7947,6 +7997,17 @@ struct ContentView: View {
             if let shared = try? await RelayManager.familyLibrary() {
                 await MainActor.run { library.applyFamilyLibraryGames(shared) }
             }
+            // Persona name + avatar for the sidebar footer — sequential with the
+            // two fetches above for the same reason noted up top (concurrent relay
+            // CM connections sharing one refresh token get one kicked by Steam).
+            // Best-effort: a real avatar is a nice-to-have, the initials-circle
+            // fallback already covers "this failed."
+            if let persona = try? await RelayManager.persona() {
+                await MainActor.run {
+                    steamAuth.personaName = persona.personaName
+                    steamAuth.avatarURL = persona.avatarURL
+                }
+            }
         }
     }
 
@@ -8151,6 +8212,8 @@ struct ContentView: View {
                         epicLoggedIn: processManager.epicLoggedIn,
                         steamLoggedIn: steamAuth.isLoggedIn,
                         steamAccountName: steamAuth.accountName,
+                        steamPersonaName: steamAuth.personaName,
+                        avatarURL: steamAuth.avatarURL,
                         downloadQueueCount: downloadManager.queue.count,
                         activeDownloadProgress: downloadManager.queue.first(where: { $0.state == .downloading })?.progress,
                         onOpenDownloads: { showingDownloadsQueue = true }
