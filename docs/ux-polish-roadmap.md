@@ -23,7 +23,8 @@ Both arms are implemented and verified (see memory `mist-graphics-stack`): D3DMe
 ## Small UX asks for later (not bugs, filed 2026-07-13)
 
 4. **A "My Library" (or similar) filter chip**, sitting between "Not Installed" and "Family Shared" in the library filter bar. Right now there's no way to see just what you actually own, excluding Family-shared titles — "All" mixes both, and "Family Shared" only isolates the borrowed side. Add the inverse chip so both halves of the library are independently filterable.
-5. **CI release runner keeps running out of disk space during DMG creation** (`hdiutil: create failed - No space left on device`) — recurring, not a one-off, first re-noticed 2026-07-13 while releasing v0.7.1. GitHub's macOS runners ship with limited free space and Xcode/simulator junk already on disk; worth adding a `rm -rf` of unneeded preinstalled SDKs/simulators (or switching the DMG step to a leaner temp/work volume) to `.github/workflows/release.yml` before the `hdiutil create` step.
+5. ~~**CI release runner keeps running out of disk space during DMG creation**~~ — fixed in the v0.8.0 release (freed Android SDK/simulator runtimes/GHC before the `hdiutil create` step).
+6. **App icon glows in Launchpad/Finder/Dock, not just inside the app.** `tools/make_icon.swift` bakes the periwinkle bloom/halo straight into the 1024px icon image itself, so the glow shows up everywhere the icon renders (Dock, Finder, Launchpad, Spotlight) — it should only be the Foglight *in-app* look (sidebar mark, running-state pulse). Real fix: render the system app icon flat/non-glowing (dark squircle + cloud glyph, no halo), keep the glow exclusively in the in-app brand mark that already exists in the sidebar header.
 
 ---
 
@@ -67,6 +68,7 @@ Real queue view (speed/ETA/pause/resume/reorder), cover-art fill-as-it-installs,
 - **Sidebar footer identity** — shipped, scoped down from "avatar" to account name + initials circle: Mist has no Steam Web API key to fetch a real profile photo, so it's a tinted-initial placeholder, not a fetched image. Revisit if a cheap way to get a real avatar shows up (the client-protocol relay could plausibly be extended to return persona+avatar, unverified).
 - **Collapsible sidebar sections** — shipped, state persisted in UserDefaults across launches.
 - **Not done, deferred**: card-expands-into-page transition (matchedGeometryEffect from grid card to detail sheet) — didn't fit this pass; the detail view is a `.sheet` today rather than a push, which would need restructuring to support a shared-geometry animation.
+- **Bug found 2026-07-13**: `CommandPaletteView` (⌘K) has no keyboard navigation — up/down arrows and Return don't move through or select results, mouse-only right now. Needs a focused-index state + arrow-key handling + Return-to-select, matching the gamepad grid's existing focus-index pattern.
 
 ## Phase 6 — Settings & transparency
 
