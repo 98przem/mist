@@ -6438,6 +6438,56 @@ final class GamepadNavigator: ObservableObject {
 // and unsandboxed, so a small detached shell helper (waits for us to quit, moves
 // the new bundle over the old, relaunches) is enough — no Sparkle, no privileged
 // helper. Auto-check is opt-in and stored in UserDefaults.
+// Delegate-based download so progress comes straight from the OS (didWriteData
+// per chunk) instead of a manual byte-by-byte read loop.
+private final class UpdateDownloader: NSObject, URLSessionDownloadDelegate {
+    private var continuation: CheckedContinuation<Void, Error>?
+    private var destination: URL!
+    private let onProgress: (Double) -> Void
+    private var session: URLSession!
+
+    init(onProgress: @escaping (Double) -> Void) {
+        self.onProgress = onProgress
+        super.init()
+        session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+    }
+
+    func download(_ url: URL, to destination: URL) async throws {
+        self.destination = destination
+        try await withCheckedThrowingContinuation { cont in
+            self.continuation = cont
+            session.downloadTask(with: url).resume()
+        }
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                     didWriteData bytesWritten: Int64, totalBytesWritten: Int64,
+                     totalBytesExpectedToWrite: Int64) {
+        guard totalBytesExpectedToWrite > 0 else { return }
+        onProgress(Double(totalBytesWritten) / Double(totalBytesExpectedToWrite))
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                     didFinishDownloadingTo location: URL) {
+        // Foundation deletes `location` as soon as this method returns, so the
+        // move to our own destination has to happen synchronously, right here.
+        do {
+            try FileManager.default.moveItem(at: location, to: destination)
+            continuation?.resume()
+        } catch {
+            continuation?.resume(throwing: error)
+        }
+        continuation = nil
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error {
+            continuation?.resume(throwing: error)
+            continuation = nil
+        }
+    }
+}
+
 @MainActor
 final class UpdateManager: ObservableObject {
     enum State: Equatable {
@@ -6527,21 +6577,17 @@ final class UpdateManager: ObservableObject {
                 try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
                 let zipDest = tmp.appendingPathComponent("Mist.zip")
 
-                // Stream the download so we can show progress.
-                let (bytes, resp) = try await URLSession.shared.bytes(from: zipURL)
-                let total = resp.expectedContentLength
-                var received: Int64 = 0
-                var buffer = Data()
-                buffer.reserveCapacity(1 << 20)
-                for try await byte in bytes {
-                    buffer.append(byte)
-                    received += 1
-                    if total > 0, received % (1 << 18) == 0 {
-                        let f = Double(received) / Double(total)
-                        await MainActor.run { self.state = .downloading(f) }
-                    }
+                // A real URLSessionDownloadTask, not a hand-rolled byte loop: the
+                // previous version iterated `URLSession.bytes(from:)` one UInt8 at a
+                // time (`for try await byte in bytes`), which suspends and resumes
+                // Swift concurrency once per byte — for a multi-tens-of-MB zip that's
+                // tens of millions of suspensions, slow enough to look hung and to
+                // blow past any reasonable timeout. The download task hands buffering
+                // to the OS and only calls back per chunk.
+                let downloader = UpdateDownloader { [weak self] progress in
+                    Task { @MainActor in self?.state = .downloading(progress) }
                 }
-                try buffer.write(to: zipDest)
+                try await downloader.download(zipURL, to: zipDest)
 
                 // Unzip and locate the new Mist.app.
                 try Self.run("/usr/bin/ditto", ["-xk", zipDest.path, tmp.path])
