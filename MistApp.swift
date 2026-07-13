@@ -1249,10 +1249,14 @@ final class SteamAuthManager: ObservableObject {
         pollTask = Task {
             do {
                 try await updateAuthSessionWithGuardCode(clientID: clientID, steamID: steamID, code: code, codeType: codeType)
-                await MainActor.run {
-                    self.guardCodeType = nil
-                    self.isSubmittingCredentials = false
-                }
+                // Submitting the code only hands it to Steam for verification —
+                // the login isn't actually confirmed until polling below succeeds
+                // (which sets isLoggedIn and switches the view away on its own).
+                // Clearing guardCodeType/isSubmittingCredentials here, before that
+                // happens, flips SteamCredentialsForm back to a blank username/
+                // password prompt while confirmation is still in flight — if
+                // polling then fails, the user is left looking at an empty form
+                // with no visible error, indistinguishable from "it just didn't work".
                 try await pollUntilConfirmed(clientID: clientID, requestID: requestID, interval: interval)
             } catch is CancellationError {
             } catch {
@@ -1377,6 +1381,8 @@ final class SteamAuthManager: ObservableObject {
                     self.qrChallengeURL = nil
                     self.qrExpiresAt = nil
                     self.qrStatusText = "Logged in as \(name)!"
+                    self.guardCodeType = nil
+                    self.isSubmittingCredentials = false
                 }
                 return
             }
@@ -1934,6 +1940,53 @@ enum RelayManager {
         let data = try await run(["--persona"])
         return try JSONDecoder().decode(RelayPersona.self, from: data)
     }
+
+    // Steam Cloud: read-only for now. Upload (writing new saves back to the
+    // cloud) is implemented in the relay and protocol-correct — verified
+    // against a real Steam client's own captured traffic — but every upload
+    // attempt gets issued a CDN URL whose signature never validates, for
+    // reasons that trace to Steam's backend rather than anything client-side
+    // (confirmed the same failure against the exact bucket a real client
+    // uploaded to successfully). Not wired into the UI until that's resolved.
+    static func cloudQuota(appid: String) async throws -> CloudQuota {
+        let data = try await run(["--cloud-quota", appid])
+        return try JSONDecoder().decode(CloudQuota.self, from: data)
+    }
+
+    static func cloudFiles(appid: String) async throws -> [CloudFile] {
+        let data = try await run(["--cloud-list", appid])
+        return try JSONDecoder().decode([CloudFile].self, from: data)
+    }
+
+    // Downloads one cloud file to `localPath`, overwriting it. Returns the
+    // byte count actually written.
+    @discardableResult
+    static func cloudDownload(appid: String, path: String, localPath: URL) async throws -> Int {
+        let data = try await run(["--cloud-download", appid, path, localPath.path])
+        struct R: Decodable { let bytes: Int }
+        let r = try JSONDecoder().decode(R.self, from: data)
+        return r.bytes
+    }
+}
+
+struct CloudQuota: Decodable {
+    let existingFiles: Int
+    let existingBytes: Int
+    let maxNumFiles: Int
+    let maxNumBytes: Int
+}
+
+// `path` is the fully path-prefixed name (e.g. "cfg/config.cfg") Cloud's
+// download/upload/delete RPCs actually need — `fileName` is just the bare
+// display name a user would recognize.
+struct CloudFile: Decodable, Identifiable {
+    let fileName: String
+    let path: String
+    let sha: String
+    let timeStamp: Int
+    let rawFileSize: Int
+    let persistState: Int
+    var id: String { path }
 }
 
 struct RelayPersona: Decodable {
@@ -5399,6 +5452,13 @@ struct GameDetailView: View {
     @State private var isLoadingAchievements = false
     @State private var workshopItems: [WorkshopItem] = []
     @State private var showingWorkshopBrowse = false
+    @State private var cloudQuota: CloudQuota?
+    @State private var cloudFiles: [CloudFile] = []
+    @State private var cloudError: String?
+    @State private var isLoadingCloud = false
+    @State private var isRestoringCloud = false
+    @State private var pendingCloudRestore = false
+    @State private var cloudDownloadMessage: String?
 
     private var d3dMetalAvailable: Bool { D3DMetalProvider.detect() != nil }
 
@@ -5446,6 +5506,10 @@ struct GameDetailView: View {
                         if !(details?.screenshotURLs ?? []).isEmpty {
                             Divider().overlay(Fog.hairline)
                             screenshotStrip
+                        }
+                        if !cloudFiles.isEmpty {
+                            Divider().overlay(Fog.hairline)
+                            cloudSavesSection
                         }
                         Divider().overlay(Fog.hairline)
                         workshopSection
@@ -5749,6 +5813,138 @@ struct GameDetailView: View {
         }
     }
 
+    // Read-only: compares the newest local save against the newest cloud save
+    // and offers one button to restore every cloud file to its real location
+    // in the Wine prefix. Upload (writing changed saves back) is implemented
+    // relay-side and verified protocol-correct, but Steam's backend issues
+    // CDN URLs that never validate for it regardless — not wired in here
+    // until that's resolved.
+    private var cloudSavesSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Label("Cloud Saves", systemImage: "icloud.fill")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(Fog.ink)
+                Spacer()
+                if isLoadingCloud { ProgressView().controlSize(.small) }
+            }
+
+            if let quota = cloudQuota {
+                let usedFrac = quota.maxNumBytes > 0
+                    ? Double(quota.existingBytes) / Double(quota.maxNumBytes) : 0
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("\(ByteCountFormatter.string(fromByteCount: Int64(quota.existingBytes), countStyle: .file)) of \(ByteCountFormatter.string(fromByteCount: Int64(quota.maxNumBytes), countStyle: .file)) used · \(quota.existingFiles) files")
+                        .font(.system(size: 11.5))
+                        .foregroundColor(Fog.inkFaint)
+                    RoundedRectangle(cornerRadius: 3).fill(Fog.haze).frame(height: 5).frame(maxWidth: 220)
+                        .overlay(alignment: .leading) {
+                            RoundedRectangle(cornerRadius: 3).fill(Fog.accent)
+                                .frame(width: 220 * min(usedFrac, 1), height: 5)
+                        }
+                }
+            }
+
+            let localAge = newestLocalSaveDate()
+            let cloudAge = cloudFiles.map { Date(timeIntervalSince1970: TimeInterval($0.timeStamp)) }.max()
+
+            HStack(spacing: 20) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Local save").font(.system(size: 10.5)).foregroundColor(Fog.inkFaint)
+                    if let localAge {
+                        Text(localAge, style: .relative).font(.system(size: 12.5, weight: .medium)).foregroundColor(Fog.ink)
+                    } else {
+                        Text("None found").font(.system(size: 12.5, weight: .medium)).foregroundColor(Fog.inkFaint)
+                    }
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Cloud save").font(.system(size: 10.5)).foregroundColor(Fog.inkFaint)
+                    if let cloudAge {
+                        Text(cloudAge, style: .relative).font(.system(size: 12.5, weight: .medium)).foregroundColor(Fog.ink)
+                    } else {
+                        Text("None found").font(.system(size: 12.5, weight: .medium)).foregroundColor(Fog.inkFaint)
+                    }
+                }
+                Spacer()
+                if isRestoringCloud {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Button("Restore from Cloud") { pendingCloudRestore = true }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .disabled(cloudFiles.isEmpty)
+                }
+            }
+
+            if let msg = cloudDownloadMessage {
+                Text(msg).font(.caption).foregroundColor(Fog.good)
+            } else if let err = cloudError {
+                Text(err).font(.caption).foregroundColor(.secondary)
+            }
+        }
+        .alert("Restore from Cloud?", isPresented: $pendingCloudRestore) {
+            Button("Restore", role: .destructive) { restoreAllCloudFiles() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This overwrites your local save\(cloudFiles.count == 1 ? "" : "s") for this game with the \(cloudFiles.count) file\(cloudFiles.count == 1 ? "" : "s") stored in Steam Cloud.")
+        }
+    }
+
+    // Steamworks path placeholders resolved against this Wine prefix — mirrors
+    // what a real Steam client does relative to drive_c, since Mist runs
+    // Windows games through Wine rather than natively.
+    private func resolveCloudPath(_ path: String) -> URL? {
+        let usersDir = MistEnv.winePrefix.appendingPathComponent("drive_c/users/crossover")
+        let placeholders: [String: URL] = [
+            "%GameInstall%": URL(fileURLWithPath: game.installDir),
+            "%WinAppDataRoaming%": usersDir.appendingPathComponent("AppData/Roaming"),
+            "%WinAppDataLocal%": usersDir.appendingPathComponent("AppData/Local"),
+            "%WinDocuments%": usersDir.appendingPathComponent("Documents"),
+            "%WinSavedGames%": usersDir.appendingPathComponent("Saved Games"),
+        ]
+        for (placeholder, base) in placeholders {
+            if path.hasPrefix(placeholder) {
+                return base.appendingPathComponent(String(path.dropFirst(placeholder.count)))
+            }
+        }
+        // No placeholder prefix (e.g. "cfg/config.cfg") — legacy Source-engine
+        // convention, relative to the game's own install directory.
+        return URL(fileURLWithPath: game.installDir).appendingPathComponent(path)
+    }
+
+    private func newestLocalSaveDate() -> Date? {
+        let fm = FileManager.default
+        return cloudFiles.compactMap { file -> Date? in
+            guard let url = resolveCloudPath(file.path) else { return nil }
+            return (try? fm.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+        }.max()
+    }
+
+    private func restoreAllCloudFiles() {
+        isRestoringCloud = true
+        cloudDownloadMessage = nil
+        cloudError = nil
+        Task {
+            var restored = 0
+            for file in cloudFiles {
+                guard let dest = resolveCloudPath(file.path) else { continue }
+                do {
+                    try FileManager.default.createDirectory(
+                        at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    _ = try await RelayManager.cloudDownload(appid: game.id, path: file.path, localPath: dest)
+                    restored += 1
+                } catch {
+                    await MainActor.run { cloudError = "Restored \(restored) of \(cloudFiles.count) — stopped: \(error.localizedDescription)" }
+                    await MainActor.run { isRestoringCloud = false }
+                    return
+                }
+            }
+            await MainActor.run {
+                cloudDownloadMessage = "Restored \(restored) file\(restored == 1 ? "" : "s") from Steam Cloud."
+                isRestoringCloud = false
+            }
+        }
+    }
+
     // The real Steam icon (see SteamLibraryService.fetchAchievementIcons), desaturated
     // while locked so the same real art still reads as "locked" without Valve's
     // separate gray asset. Falls back to a generic seal/lock glyph if the icon never
@@ -5868,6 +6064,21 @@ struct GameDetailView: View {
                 ?? "No achievement data available for this game."
         }
         isLoadingAchievements = false
+
+        isLoadingCloud = true
+        do {
+            // Sequential, not concurrent (async let) — two relay connections
+            // racing on the same refresh token can collide mid-handshake.
+            cloudQuota = try await RelayManager.cloudQuota(appid: game.id)
+            cloudFiles = try await RelayManager.cloudFiles(appid: game.id)
+                .sorted { $0.timeStamp > $1.timeStamp }
+        } catch {
+            // Most games never use Cloud saves at all — a failure here just
+            // means "nothing to show," not an error worth surfacing.
+            cloudQuota = nil
+            cloudFiles = []
+        }
+        isLoadingCloud = false
     }
 }
 
@@ -6380,8 +6591,13 @@ struct SteamLoginView: View {
                             .foregroundColor(.red)
                             .font(.caption)
                             .frame(maxWidth: 240, alignment: .leading)
-                        Button("Try Again") { auth.startQRLogin() }
-                            .buttonStyle(.bordered)
+                        // A failure while signing in with username/password should
+                        // let the user retry that same form, not silently bounce
+                        // them to the QR flow they didn't choose.
+                        if !showCredentialsForm {
+                            Button("Try Again") { auth.startQRLogin() }
+                                .buttonStyle(.bordered)
+                        }
                     }
                 }
                 Spacer()
