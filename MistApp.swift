@@ -4246,10 +4246,12 @@ struct SidebarView: View {
     var steamAccountName: String = ""
     var steamPersonaName: String = ""
     var avatarURL: URL? = nil
+    var epicUsername: String = ""
     var focusedRow: String? = nil
     var downloadQueueCount: Int = 0
     var activeDownloadProgress: Double? = nil   // nil while nothing is actively downloading
     var onOpenDownloads: () -> Void = {}
+    var onOpenSteamProfile: () -> Void = {}
 
     // Persisted so collapsing a section sticks across launches, like the rest
     // of the app's remembered UI state (onboarding-dismissed, auto-check, etc).
@@ -4331,11 +4333,9 @@ struct SidebarView: View {
                     .padding(.horizontal, 8)
                     .padding(.bottom, 6)
             }
-            if steamLoggedIn {
-                accountFooter
-                    .padding(.horizontal, 8)
-                    .padding(.bottom, 6)
-            }
+            identityFooter
+                .padding(.horizontal, 8)
+                .padding(.bottom, 6)
             Divider().background(Fog.hairline)
             VStack(spacing: 2) {
                 SidebarRow(title: "Settings", systemImage: "gearshape.fill", tint: Fog.inkFaint,
@@ -4349,42 +4349,80 @@ struct SidebarView: View {
         .background(LinearGradient(colors: [Fog.bgElevated, Fog.bg], startPoint: .top, endPoint: .bottom))
     }
 
-    // Presence: who you're signed in as, right where you'll notice it, instead
-    // of only visible by digging into Settings. No Steam Web API key on hand to
-    // fetch a real avatar image, so this is initials-on-a-tinted-circle, not a
-    // fetched photo — a real avatar is a small follow-up if that ever changes.
-    private var accountFooter: some View {
-        HStack(spacing: 9) {
-            ZStack {
-                if let avatarURL {
-                    AsyncImage(url: avatarURL) { phase in
-                        if case .success(let image) = phase {
-                            image.resizable().scaledToFill()
-                        } else {
-                            initialsAvatar
-                        }
-                    }
-                    .frame(width: 26, height: 26)
-                    .clipShape(Circle())
-                } else {
-                    initialsAvatar
+    // Presence for BOTH services at once, right where you'll notice it, instead
+    // of only visible by digging into Settings — dimmed rather than hidden when
+    // a service isn't signed in, so it reads as "not connected yet" rather than
+    // disappearing entirely. Steam's row opens the account's real public
+    // Community profile (steamcommunity.com works whether or not the in-app
+    // browser has a live Steam web session, since profiles are public by
+    // default) — Epic has no equivalent public-by-username profile page at
+    // all, so its row is presence-only, not tappable.
+    private var identityFooter: some View {
+        VStack(spacing: 2) {
+            Button(action: onOpenSteamProfile) {
+                identityRow(
+                    name: steamLoggedIn ? (steamPersonaName.isEmpty ? steamAccountName : steamPersonaName) : "Steam",
+                    status: steamLoggedIn ? "Signed in" : "Not signed in",
+                    dimmed: !steamLoggedIn
+                ) { steamAvatar }
+            }
+            .buttonStyle(.plain)
+            .disabled(!steamLoggedIn)
+
+            identityRow(
+                name: epicLoggedIn ? epicUsername : "Epic",
+                status: epicLoggedIn ? "Signed in" : "Not signed in",
+                dimmed: !epicLoggedIn
+            ) {
+                ZStack {
+                    Circle().fill(Fog.epic.opacity(0.22)).frame(width: 26, height: 26)
+                    Image(systemName: "bolt.fill")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(Fog.epic)
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private func identityRow<Avatar: View>(name: String, status: String, dimmed: Bool,
+                                            @ViewBuilder avatar: () -> Avatar) -> some View {
+        HStack(spacing: 9) {
+            avatar()
             VStack(alignment: .leading, spacing: 0) {
-                Text(steamPersonaName.isEmpty ? (steamAccountName.isEmpty ? "Steam" : steamAccountName) : steamPersonaName)
+                Text(name)
                     .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(Fog.ink)
+                    .foregroundColor(dimmed ? Fog.inkFaint : Fog.ink)
                     .lineLimit(1)
-                Text("Signed in").font(.system(size: 10)).foregroundColor(Fog.inkFaint)
+                Text(status).font(.system(size: 10)).foregroundColor(Fog.inkFaint)
             }
             Spacer()
         }
         .padding(.horizontal, 8)
-        .padding(.vertical, 6)
+        .padding(.vertical, 4)
+        .opacity(dimmed ? 0.55 : 1)
     }
 
     // Real photo when the relay's persona fetch succeeded; the tinted-initial
     // placeholder otherwise — no error shown either way, this is best-effort.
+    private var steamAvatar: some View {
+        ZStack {
+            if let avatarURL {
+                AsyncImage(url: avatarURL) { phase in
+                    if case .success(let image) = phase {
+                        image.resizable().scaledToFill()
+                    } else {
+                        initialsAvatar
+                    }
+                }
+                .frame(width: 26, height: 26)
+                .clipShape(Circle())
+            } else {
+                initialsAvatar
+            }
+        }
+    }
+
     private var initialsAvatar: some View {
         ZStack {
             Circle().fill(Fog.steam.opacity(0.22)).frame(width: 26, height: 26)
@@ -7835,6 +7873,7 @@ struct ContentView: View {
     @State private var showingDownloadsQueue = false
     @State private var showingCommandPalette = false
     @State private var commandPaletteBrowserURL: IdentifiableURL?
+    @State private var sidebarProfileURL: IdentifiableURL?
     // The game that just finished installing — drives a transient "Play" toast,
     // auto-dismissed a few seconds after it appears (see the toast's .onAppear).
     @State private var installToast: Game?
@@ -8119,9 +8158,14 @@ struct ContentView: View {
                         steamAccountName: steamAuth.accountName,
                         steamPersonaName: steamAuth.personaName,
                         avatarURL: steamAuth.avatarURL,
+                        epicUsername: processManager.epicUsername,
                         downloadQueueCount: downloadManager.queue.count,
                         activeDownloadProgress: downloadManager.queue.first(where: { $0.state == .downloading })?.progress,
-                        onOpenDownloads: { showingDownloadsQueue = true }
+                        onOpenDownloads: { showingDownloadsQueue = true },
+                        onOpenSteamProfile: {
+                            guard !steamAuth.steamID.isEmpty else { return }
+                            sidebarProfileURL = IdentifiableURL(url: URL(string: "https://steamcommunity.com/profiles/\(steamAuth.steamID)")!)
+                        }
                     )
                     .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 280)
                 } detail: {
@@ -8311,6 +8355,7 @@ struct ContentView: View {
             })
         }
         .sheet(item: $commandPaletteBrowserURL) { iu in InAppBrowserView(url: iu.url) }
+        .sheet(item: $sidebarProfileURL) { iu in InAppBrowserView(url: iu.url) }
         .onAppear {
             configureGamepad()
             updater.checkOnLaunchIfEnabled()
