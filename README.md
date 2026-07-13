@@ -11,6 +11,7 @@
 
 <p align="center">
   <a href="../../releases/latest"><img src="https://img.shields.io/badge/download-Mist.dmg-8b5cf6?style=for-the-badge" alt="Download Mist.dmg"></a>
+  <a href="https://ko-fi.com/przem84383"><img src="https://img.shields.io/badge/support-Ko--fi-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white" alt="Support on Ko-fi"></a>
 </p>
 
 <p align="center">
@@ -91,6 +92,10 @@ Pushing a `v*` tag builds and publishes a DMG automatically (`.github/workflows/
 ## Credits
 
 Built on [Wine](https://www.winehq.org/) · [CrossOver / Sikarugir](https://github.com/Sikarugir-App/Sikarugir) engine · Apple **Game Porting Toolkit** · [DepotDownloader](https://github.com/SteamRE/DepotDownloader) & [SteamKit2](https://github.com/SteamRE/SteamKit) · [gbe_fork](https://github.com/Detanup01/gbe_fork) · [legendary](https://github.com/derrod/legendary) · [MoltenVK](https://github.com/KhronosGroup/MoltenVK) / [DXVK](https://github.com/doitsujin/dxvk).
+
+## Support
+
+Mist is free and always will be. If it's useful to you, you can support development on [Ko-fi](https://ko-fi.com/przem84383).
 
 ## Disclaimer
 
