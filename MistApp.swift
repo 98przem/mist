@@ -263,6 +263,42 @@ enum MistEnv {
     }
 }
 
+// The in-app equivalent of the dev-only `make reset-steam`/`make reset-all`
+// targets — a real user installed via Homebrew has no other way to fully
+// start over. Two tiers, matching the Makefile split: the lighter one wipes
+// installed games/logins/settings but keeps the downloaded Wine engine (no
+// ~200MB re-download); the full one wipes everything, back to true
+// first-launch state. Both quit the app afterward — it can't keep running
+// with its own prefix/session pulled out from under it.
+enum MistReset {
+    static func resetLibraryAndLogins() {
+        MistEnv.killWineserver()
+        MistEnv.waitWineserver()
+        let fm = FileManager.default
+        let dir = MistEnv.supportDir
+        try? fm.removeItem(at: dir.appendingPathComponent("drive_c"))
+        for name in ["system.reg", "user.reg", "userdef.reg", ".update-timestamp",
+                     "mist_manifest.json", "steam_session.json", "game_settings.json", "custom_apps.json"] {
+            try? fm.removeItem(at: dir.appendingPathComponent(name))
+        }
+        try? fm.removeItem(at: dir.appendingPathComponent("tools"))
+        clearDefaults()
+    }
+
+    static func fullReset() {
+        MistEnv.killWineserver()
+        MistEnv.waitWineserver()
+        try? FileManager.default.removeItem(at: MistEnv.supportDir)
+        clearDefaults()
+    }
+
+    private static func clearDefaults() {
+        if let bundleID = Bundle.main.bundleIdentifier {
+            UserDefaults.standard.removePersistentDomain(forName: bundleID)
+        }
+    }
+}
+
 struct SetupError: LocalizedError {
     let message: String
     var errorDescription: String? { message }
@@ -4168,6 +4204,7 @@ struct SidebarView: View {
     let steamCount: Int
     let epicCount: Int
     let customCount: Int
+    let installedCount: Int
     let epicLoggedIn: Bool
     let steamLoggedIn: Bool
     var steamAccountName: String = ""
@@ -4218,6 +4255,9 @@ struct SidebarView: View {
                     SidebarRow(title: "All Games", systemImage: "square.grid.2x2.fill", tint: Fog.accent,
                               isSelected: selection == "all", action: { selection = "all" },
                               isFocused: focusedRow == "all")
+                    SidebarRow(title: "Installed", systemImage: "arrow.down.circle.fill", tint: Fog.good, count: installedCount,
+                              isSelected: selection == "installed", action: { selection = "installed" },
+                              isFocused: focusedRow == "installed")
                     SidebarRow(title: "Steam", systemImage: "cloud.fill", tint: Fog.steam, count: steamCount,
                               isSelected: selection == "steam", action: { selection = "steam" },
                               isFocused: focusedRow == "steam")
@@ -7128,6 +7168,7 @@ struct SettingsView: View {
     @State private var achievementChimeEnabled = UserDefaults.standard.object(forKey: "achievementChimeEnabled") == nil
         || UserDefaults.standard.bool(forKey: "achievementChimeEnabled")
     @State private var isComputingStorage = false
+    @State private var pendingReset: PendingReset?
 
     private var installedSizeBytes: Int64 {
         library.games.filter(\.isInstalled).reduce(0) { $0 + $1.sizeBytes }
@@ -7273,6 +7314,21 @@ struct SettingsView: View {
                             .buttonStyle(.bordered)
                             Spacer()
                         }
+
+                        SettingsCard(title: "Reset", systemImage: "exclamationmark.arrow.triangle.2.circlepath", tint: .red) {
+                            VStack(alignment: .leading, spacing: 10) {
+                                Text("Starting over — both quit Mist immediately, so relaunch it afterward.")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                HStack {
+                                    Button("Reset Library & Logins…") { pendingReset = .libraryAndLogins }
+                                        .buttonStyle(.bordered).tint(.red)
+                                    Button("Full Reset…") { pendingReset = .full }
+                                        .buttonStyle(.bordered).tint(.red)
+                                    Spacer()
+                                }
+                            }
+                        }
                     }
                 }
                 .padding(20)
@@ -7281,6 +7337,42 @@ struct SettingsView: View {
             .frame(maxWidth: .infinity)
         }
         .background(Fog.bg)
+        .alert(pendingReset?.title ?? "", isPresented: Binding(
+            get: { pendingReset != nil },
+            set: { if !$0 { pendingReset = nil } }
+        )) {
+            Button("Cancel", role: .cancel) { pendingReset = nil }
+            Button("Reset & Quit", role: .destructive) {
+                switch pendingReset {
+                case .libraryAndLogins: MistReset.resetLibraryAndLogins()
+                case .full: MistReset.fullReset()
+                case nil: break
+                }
+                NSApp.terminate(nil)
+            }
+        } message: {
+            Text(pendingReset?.message ?? "")
+        }
+    }
+}
+
+private enum PendingReset {
+    case libraryAndLogins
+    case full
+
+    var title: String {
+        switch self {
+        case .libraryAndLogins: return "Reset Library & Logins?"
+        case .full: return "Full Reset?"
+        }
+    }
+    var message: String {
+        switch self {
+        case .libraryAndLogins:
+            return "Removes every installed game, your Steam and Epic sign-ins, custom apps, and per-game settings. The downloaded Wine engine is kept, so Mist won't need to re-download it. This can't be undone."
+        case .full:
+            return "Removes everything — installed games, logins, custom apps, settings, and the downloaded Wine engine (~200MB to fetch again). Puts Mist back to its first-launch state. This can't be undone."
+        }
     }
 }
 
@@ -7445,7 +7537,7 @@ struct UpdatesSettingsView: View {
     }
 }
 
-let sidebarNavOrder = ["all", "steam", "epic", "custom", "epicfree", "store", "settings"]
+let sidebarNavOrder = ["all", "installed", "steam", "epic", "custom", "epicfree", "store", "settings"]
 
 // MARK: - Gamepad navigation
 //
@@ -7918,6 +8010,7 @@ struct ContentView: View {
         case "steam": games = games.filter { $0.source == .steam }
         case "epic": games = games.filter { $0.source == .epic }
         case "custom": games = games.filter { $0.source == .custom }
+        case "installed": games = games.filter(\.isInstalled)
         default: break
         }
 
@@ -7948,6 +8041,7 @@ struct ContentView: View {
         case "steam": return library.games.filter { $0.source == .steam }
         case "epic": return library.games.filter { $0.source == .epic }
         case "custom": return library.games.filter { $0.source == .custom }
+        case "installed": return library.games.filter(\.isInstalled)
         default: return library.games
         }
     }
@@ -7957,6 +8051,7 @@ struct ContentView: View {
         case "steam": return "Steam"
         case "epic": return "Epic"
         case "custom": return "My Apps"
+        case "installed": return "installed"
         default: return "your"
         }
     }
@@ -7978,7 +8073,11 @@ struct ContentView: View {
     private var availableFilters: [LibraryFilter] {
         let hasShared = library.games.contains { $0.isFamilyShared &&
             (sidebarSelection != "epic" && sidebarSelection != "custom") }
-        return LibraryFilter.allCases.filter { ($0 != .shared && $0 != .myLibrary) || hasShared }
+        // The "Installed" chip is redundant on the Installed sidebar row itself —
+        // everything shown there already is installed.
+        return LibraryFilter.allCases.filter {
+            ($0 != .shared && $0 != .myLibrary || hasShared) && !($0 == .installed && sidebarSelection == "installed")
+        }
     }
 
     // The exact order GameGridView renders — computing focus over this (rather
@@ -8040,6 +8139,7 @@ struct ContentView: View {
                         steamCount: library.games.filter { $0.source == .steam }.count,
                         epicCount: library.games.filter { $0.source == .epic }.count,
                         customCount: library.games.filter { $0.source == .custom }.count,
+                        installedCount: library.games.filter(\.isInstalled).count,
                         epicLoggedIn: processManager.epicLoggedIn,
                         steamLoggedIn: steamAuth.isLoggedIn,
                         steamAccountName: steamAuth.accountName,
