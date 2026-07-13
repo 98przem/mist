@@ -103,7 +103,17 @@ dmg: bundle
 	rm -rf dist/dmg && mkdir -p dist/dmg
 	cp -R "$(BUNDLE)" dist/dmg/Mist.app
 	ln -s /Applications dist/dmg/Applications
-	hdiutil create -volname "Mist" -srcfolder dist/dmg -ov -format UDZO dist/Mist.dmg >/dev/null
+	# hdiutil intermittently fails on GitHub's shared macOS runners with
+	# "No space left on device" even with tens of GB genuinely free (confirmed via
+	# df — not a real space issue, a known flaky runner behavior) — retry instead
+	# of chasing free space further.
+	@for i in 1 2 3; do \
+		if hdiutil create -volname "Mist" -srcfolder dist/dmg -ov -format UDZO dist/Mist.dmg >/dev/null; then \
+			exit 0; \
+		fi; \
+		echo "hdiutil attempt $$i failed, retrying…"; sleep 5; \
+	done; \
+	echo "hdiutil failed after 3 attempts"; exit 1
 	rm -rf dist/dmg
 	@echo "DMG ready at dist/Mist.dmg"
 
