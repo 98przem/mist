@@ -60,3 +60,25 @@ jobs:
         with:
           name: Mist-dmg
           path: dist/Mist.dmg
+
+      # Bump the Homebrew cask's version + sha256 in the separate tap repo so
+      # `brew upgrade` actually detects new releases — the cask used to pin
+      # `version :latest`, which never looks outdated to Homebrew no matter how
+      # many releases ship. Requires a HOMEBREW_TAP_TOKEN secret (a PAT with
+      # write access to 98przem/homebrew-mist): the default GITHUB_TOKEN is
+      # scoped to this repo only and can't push to a different one.
+      - name: Bump Homebrew cask
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          SHA256=$(shasum -a 256 dist/Mist.dmg | cut -d' ' -f1)
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/98przem/homebrew-mist.git" tap
+          cd tap
+          sed -i '' "s/version \".*\"/version \"${VERSION}\"/" Casks/mist.rb
+          sed -i '' "s/sha256 \".*\"/sha256 \"${SHA256}\"/" Casks/mist.rb
+          git config user.name "mist-release-bot"
+          git config user.email "actions@github.com"
+          git commit -am "Bump to v${VERSION}" || exit 0
+          git push origin main
