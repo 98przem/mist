@@ -1,0 +1,6 @@
+# legendary-gl/legendary — Epic Games Store CLI (GPL-3.0), used for Epic sign-in
+# and installs/launches. Prebuilt macOS release, downloaded + extracted at build
+# time (not committed). x86_64 (no arm64 build published) — fine, Mist already
+# requires Rosetta 2 for its Wine engine regardless.
+url=https://github.com/legendary-gl/legendary/releases/download/0.20.34/legendary_macOS.zip
+sha256=875e5977697d1fe1bc49ae5fe4a38d904bf62b01eead42f21538c68dc5e0409c

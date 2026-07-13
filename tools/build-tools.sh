@@ -2,6 +2,7 @@
 # Builds/fetches Mist's helper tools into <outdir>:
 #   AchievementRelay  — our SteamKit2 relay (built from tools/AchievementRelay/)
 #   DepotDownloader   — SteamRE's downloader + our token-reuse patch (cloned + patched)
+#   legendary         — Epic Games Store CLI (prebuilt, downloaded)
 #   gbe/*.dll         — gbe_fork Steamworks-emulator DLLs (prebuilt, downloaded)
 #
 # Requires: dotnet SDK (net10), git, curl, tar (libarchive w/ 7z), shasum.
@@ -46,6 +47,16 @@ git -C "$DD_TMP/src" apply "$HERE/depotdownloader.patch"
 pub "$DD_TMP/src/DepotDownloader/DepotDownloader.csproj" "$DD_TMP/out"
 install -m 0755 "$DD_TMP/out/DepotDownloader" "$OUT/DepotDownloader"
 rm -rf "$DD_TMP"
+
+echo "[tools] fetching legendary (Epic Games CLI)…"
+LEG_URL="$(sed -n 's/^url=//p' "$HERE/legendary.pin")"
+LEG_SHA="$(sed -n 's/^sha256=//p' "$HERE/legendary.pin")"
+LEG_TMP="$(mktemp -d)"
+curl -fsSL -o "$LEG_TMP/legendary.zip" "$LEG_URL"
+echo "$LEG_SHA  $LEG_TMP/legendary.zip" | shasum -a 256 -c - >/dev/null
+unzip -o -q "$LEG_TMP/legendary.zip" -d "$LEG_TMP/extracted"
+install -m 0755 "$LEG_TMP/extracted/legendary" "$OUT/legendary"
+rm -rf "$LEG_TMP"
 
 echo "[tools] fetching gbe_fork DLLs…"
 GBE_URL="$(sed -n 's/^url=//p' "$HERE/gbe_fork.pin")"

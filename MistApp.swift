@@ -533,6 +533,14 @@ final class SetupManager: NSObject, ObservableObject, URLSessionDownloadDelegate
 class LegendaryLocator {
     static let shared = LegendaryLocator()
     lazy var path: String = {
+        // Bundled first (see tools/build-tools.sh) — matches AchievementRelay/
+        // DepotDownloader, so Epic sign-in works with zero manual setup instead
+        // of depending on the user having installed legendary themselves via
+        // Homebrew/pip. Falls back to searching the system the same way as
+        // before, in case a bundled build somehow doesn't have it.
+        let bundled = MistEnv.toolsDir.appendingPathComponent("legendary").path
+        if FileManager.default.isExecutableFile(atPath: bundled) { return bundled }
+
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let candidates = [
             "/Library/Frameworks/Python.framework/Versions/3.9/bin/legendary",
