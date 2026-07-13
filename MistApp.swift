@@ -903,6 +903,11 @@ final class SteamAuthManager: ObservableObject {
     @Published var accountName: String = ""
     @Published var steamID: String = ""
     @Published var qrChallengeURL: String?
+    // When the current QR challenge will proactively refresh (see
+    // qrLifetimeSeconds) — drives a countdown border around the code itself,
+    // so it's visible that a fresh scan is coming rather than the code just
+    // silently swapping out.
+    @Published var qrExpiresAt: Date?
     @Published var qrStatusText: String = ""
     @Published var isPolling = false
     @Published var errorText: String?
@@ -983,19 +988,21 @@ final class SteamAuthManager: ObservableObject {
     // failure (network down, etc.) doesn't loop forever silently.
     private var autoRestartCount = 0
     private static let maxAutoRestarts = 5
-    private static let qrLifetimeSeconds: UInt64 = 110
+    static let qrLifetimeSeconds: UInt64 = 110
 
     func startQRLogin(isAutoRestart: Bool = false) {
         stopPolling()
         if !isAutoRestart { autoRestartCount = 0 }
         errorText = nil
         qrChallengeURL = nil
+        qrExpiresAt = nil
         qrStatusText = "Generating QR code…"
         pollTask = Task {
             do {
                 let begin = try await beginAuthSessionViaQR()
                 await MainActor.run {
                     self.qrChallengeURL = begin.challengeURL
+                    self.qrExpiresAt = Date().addingTimeInterval(TimeInterval(Self.qrLifetimeSeconds))
                     self.qrStatusText = "Scan with the Steam Mobile app"
                 }
                 try await pollUntilConfirmedOrQRExpiry(clientID: begin.clientID, requestID: begin.requestID,
@@ -1316,6 +1323,7 @@ final class SteamAuthManager: ObservableObject {
                     self.steamID = sid
                     self.isLoggedIn = true
                     self.qrChallengeURL = nil
+                    self.qrExpiresAt = nil
                     self.qrStatusText = "Logged in as \(name)!"
                 }
                 return
@@ -3972,8 +3980,7 @@ private struct OnboardingSteamTile: View {
                         .frame(width: 116, height: 116)
                         .padding(9)
                         .background(Color.white, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .strokeBorder(Fog.accent.opacity(0.6), lineWidth: 2)
+                    QRExpiryBorder(expiresAt: auth.qrExpiresAt, cornerRadius: 14, lineWidth: 2.5)
                         .frame(width: 134, height: 134)
                 }
                 Text(auth.isPolling ? "Waiting for your phone…" : auth.qrStatusText)
@@ -3992,6 +3999,7 @@ private struct OnboardingSteamTile: View {
                     if showCredentialsForm {
                         auth.stopPolling()
                         auth.qrChallengeURL = nil
+                        auth.qrExpiresAt = nil
                     } else {
                         auth.startQRLogin()
                     }
@@ -6118,6 +6126,41 @@ struct SteamQRCodeView: View {
     }
 }
 
+// A depleting border around the QR code showing time left before it
+// proactively refreshes (see SteamAuthManager.qrLifetimeSeconds) — makes the
+// otherwise-invisible countdown visible instead of the code just silently
+// swapping out from under you.
+struct QRExpiryBorder: View {
+    let expiresAt: Date?
+    var cornerRadius: CGFloat = 8
+    var lineWidth: CGFloat = 3
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1.0 / 20)) { context in
+            let remaining = remainingFraction(at: context.date)
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .trim(from: 0, to: remaining)
+                .stroke(color(for: remaining), style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+                .animation(.linear(duration: 0.2), value: remaining)
+        }
+    }
+
+    private func remainingFraction(at date: Date) -> Double {
+        guard let expiresAt else { return 0 }
+        let remaining = expiresAt.timeIntervalSince(date)
+        return max(0, min(1, remaining / Double(SteamAuthManager.qrLifetimeSeconds)))
+    }
+
+    // Green for most of the window, amber in the last third, red in the last
+    // tenth — an at-a-glance "still fresh / about to refresh" read.
+    private func color(for fraction: Double) -> Color {
+        if fraction > 1.0 / 3 { return Fog.good }
+        if fraction > 0.1 { return Fog.warn }
+        return .red
+    }
+}
+
 // Username/password sign-in — for accounts without the Steam Mobile app to
 // scan a QR code with. Shows a Guard-code field instead of the form itself
 // once Steam asks for one (email code or mobile-authenticator TOTP).
@@ -6208,11 +6251,15 @@ struct SteamLoginView: View {
                 Spacer()
                 VStack(spacing: 8) {
                     if let url = auth.qrChallengeURL {
-                        SteamQRCodeView(urlString: url)
-                            .frame(width: 100, height: 100)
-                            .padding(8)
-                            .background(Color.white)
-                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                        ZStack {
+                            SteamQRCodeView(urlString: url)
+                                .frame(width: 100, height: 100)
+                                .padding(8)
+                                .background(Color.white)
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                            QRExpiryBorder(expiresAt: auth.qrExpiresAt, cornerRadius: 10, lineWidth: 2.5)
+                                .frame(width: 116, height: 116)
+                        }
                         if auth.isPolling {
                             HStack(spacing: 6) {
                                 ProgressView().controlSize(.small)
@@ -6248,6 +6295,7 @@ struct SteamLoginView: View {
                 Button("No Steam Mobile app? Sign in with username & password") {
                     auth.stopPolling()
                     auth.qrChallengeURL = nil
+                    auth.qrExpiresAt = nil
                     auth.errorText = nil
                     showCredentialsForm = true
                 }
