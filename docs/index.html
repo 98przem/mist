@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mist — Play Windows Steam &amp; Epic games on macOS</title>
+<meta name="description" content="Mist is a native macOS launcher that downloads and runs Windows Steam and Epic games through Wine — without ever running the Steam client.">
+<link rel="icon" href="mist-icon.png">
+<style>
+  :root {
+    --bg: #0b0b10;
+    --bg-elevated: #14141b;
+    --bg-card: #17171f;
+    --ink: #f2f2f5;
+    --ink-dim: #b8b8c4;
+    --ink-faint: #7a7a88;
+    --hairline: rgba(255,255,255,0.08);
+    --accent: #8b6cf6;
+    --accent-soft: rgba(139,108,246,0.15);
+    --good: #4ade80;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+  a { color: inherit; }
+
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 0 24px; }
+
+  /* Ambient glow background, matching the app's own dark "fog" aesthetic */
+  .glow {
+    position: fixed; inset: 0; z-index: -1;
+    background:
+      radial-gradient(ellipse 900px 500px at 20% -10%, rgba(139,108,246,0.20), transparent 60%),
+      radial-gradient(ellipse 700px 500px at 90% 10%, rgba(90,160,255,0.12), transparent 60%),
+      var(--bg);
+  }
+
+  header.hero {
+    padding: 96px 0 56px;
+    text-align: center;
+  }
+  .icon {
+    width: 104px; height: 104px;
+    border-radius: 24px;
+    box-shadow: 0 20px 60px rgba(139,108,246,0.35), 0 2px 8px rgba(0,0,0,0.4);
+    margin-bottom: 28px;
+  }
+  h1.title {
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    font-size: 56px;
+    font-weight: 600;
+    margin: 0 0 14px;
+    letter-spacing: -0.01em;
+  }
+  .tagline {
+    font-size: 19px;
+    color: var(--ink-dim);
+    line-height: 1.5;
+    max-width: 560px;
+    margin: 0 auto 36px;
+  }
+  .tagline b { color: var(--ink); font-weight: 600; }
+
+  .cta-row { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 13px 26px;
+    border-radius: 12px;
+    font-size: 15px; font-weight: 600;
+    text-decoration: none;
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
+  }
+  .btn:hover { transform: translateY(-1px); }
+  .btn-primary {
+    background: linear-gradient(180deg, #9b7dff, #8b6cf6);
+    color: white;
+    box-shadow: 0 8px 24px rgba(139,108,246,0.4);
+  }
+  .btn-secondary {
+    background: var(--bg-elevated);
+    color: var(--ink);
+    border: 1px solid var(--hairline);
+  }
+
+  .screenshot-frame {
+    margin: 56px auto 0;
+    max-width: 900px;
+    border-radius: 16px;
+    overflow: hidden;
+    border: 1px solid var(--hairline);
+    box-shadow: 0 40px 100px rgba(0,0,0,0.55);
+  }
+  .screenshot-frame img { display: block; width: 100%; height: auto; }
+
+  section { padding: 72px 0; }
+  h2.section-title {
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+    text-align: center;
+    margin: 0 0 40px;
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 20px;
+  }
+  @media (max-width: 760px) {
+    .grid { grid-template-columns: 1fr; }
+    h1.title { font-size: 40px; }
+    header.hero { padding: 64px 0 40px; }
+  }
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--hairline);
+    border-radius: 16px;
+    padding: 24px;
+  }
+  .card .emoji { font-size: 26px; margin-bottom: 12px; display: block; }
+  .card h3 { font-size: 15.5px; margin: 0 0 8px; font-weight: 600; }
+  .card p { font-size: 13.5px; color: var(--ink-dim); line-height: 1.55; margin: 0; }
+
+  .caveat {
+    max-width: 720px;
+    margin: 32px auto 0;
+    padding: 16px 20px;
+    background: var(--bg-card);
+    border: 1px solid var(--hairline);
+    border-left: 3px solid var(--accent);
+    border-radius: 10px;
+    font-size: 13px;
+    color: var(--ink-dim);
+    line-height: 1.6;
+  }
+  .caveat b { color: var(--ink); }
+
+  .install {
+    max-width: 620px;
+    margin: 0 auto;
+    text-align: center;
+  }
+  .install pre {
+    background: #000;
+    border: 1px solid var(--hairline);
+    border-radius: 10px;
+    padding: 16px 20px;
+    text-align: left;
+    font-size: 13.5px;
+    overflow-x: auto;
+    color: #d4d4e0;
+  }
+  .install p.note { font-size: 13px; color: var(--ink-faint); margin-top: 16px; }
+
+  footer {
+    padding: 48px 0 64px;
+    text-align: center;
+    border-top: 1px solid var(--hairline);
+  }
+  footer p { font-size: 12.5px; color: var(--ink-faint); line-height: 1.7; max-width: 640px; margin: 0 auto 8px; }
+  footer a.gh { color: var(--ink-dim); text-decoration: none; font-weight: 600; }
+  footer a.gh:hover { color: var(--ink); }
+</style>
+</head>
+<body>
+  <div class="glow"></div>
+
+  <header class="hero">
+    <div class="wrap">
+      <img class="icon" src="mist-icon.png" alt="Mist">
+      <h1 class="title">Mist</h1>
+      <p class="tagline">
+        Play Windows Steam &amp; Epic games on macOS.<br>
+        <b>One login</b> covers your library, downloads, achievements, and Cloud saves —
+        no Steam client, nothing to install by hand.
+      </p>
+      <div class="cta-row">
+        <a class="btn btn-primary" href="https://github.com/98przem/mist/releases/latest">⬇ Download Mist.dmg</a>
+        <a class="btn btn-secondary" href="https://github.com/98przem/mist">View on GitHub</a>
+      </div>
+    </div>
+    <div class="wrap">
+      <div class="screenshot-frame">
+        <img src="screenshot-library.png" alt="Mist's game library, showing installed and available Steam and Epic games">
+      </div>
+    </div>
+  </header>
+
+  <section>
+    <div class="wrap">
+      <h2 class="section-title">Why Mist</h2>
+      <div class="grid">
+        <div class="card">
+          <span class="emoji">🔑</span>
+          <h3>One login, really</h3>
+          <p>A single Steam QR scan (or username/password) covers your whole library, game downloads, achievements, and Cloud saves. There's no second sign-in, ever.</p>
+        </div>
+        <div class="card">
+          <span class="emoji">🏆</span>
+          <h3>Real achievements</h3>
+          <p>Browse them in-app with global rarity, and unlock them in-game — synced to your actual Steam profile. Mist only syncs what you genuinely earn.</p>
+        </div>
+        <div class="card">
+          <span class="emoji">☁️</span>
+          <h3>Steam Cloud saves</h3>
+          <p>See your Cloud quota and restore any synced save straight into the right spot in your Wine prefix, one click — verified against a real Steam client's own traffic.</p>
+        </div>
+        <div class="card">
+          <span class="emoji">🚫</span>
+          <h3>No Steam client, no fuss</h3>
+          <p>Mist talks to Steam's APIs directly — no flaky Chromium-based Steam UI under Wine, no black screens, no Accessibility permissions to grant.</p>
+        </div>
+        <div class="card">
+          <span class="emoji">📦</span>
+          <h3>Self-contained</h3>
+          <p>Helper tools ship inside the app; the Wine engine (~200 MB) downloads itself on first launch. Nothing to install with Homebrew.</p>
+        </div>
+        <div class="card">
+          <span class="emoji">🎮</span>
+          <h3>DirectX via Metal</h3>
+          <p>Runs games through the CrossOver Wine engine, using Apple's Game Porting Toolkit (D3DMetal) when available, with DXVK/MoltenVK as a fallback.</p>
+        </div>
+      </div>
+      <div class="caveat">
+        <b>Steam Cloud saves are read/restore only, for now.</b> Uploading changed saves back to the Cloud isn't supported yet —
+        Mist's write requests are protocol-correct (verified against a real Steam client's own captured traffic), but Steam's
+        backend issues signed upload URLs that never validate for a non-official client, for reasons that trace below the
+        protocol layer. Restoring existing cloud saves works; syncing new progress up doesn't, yet.
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap install">
+      <h2 class="section-title">Install</h2>
+      <pre>brew install --cask 98przem/tap/mist</pre>
+      <p class="note">Or download <b>Mist.dmg</b> from the <a href="https://github.com/98przem/mist/releases/latest">latest release</a> and drag it to Applications.<br>
+      Mist isn't notarized — right-click the app → Open on first launch to get past Gatekeeper.</p>
+    </div>
+  </section>
+
+  <footer>
+    <div class="wrap">
+      <p>Built on Wine · CrossOver/Sikarugir engine · Apple Game Porting Toolkit · DepotDownloader &amp; SteamKit2 · gbe_fork · legendary · MoltenVK / DXVK.</p>
+      <p>Steam and Epic Games are trademarks of their respective owners; this project is not affiliated with or endorsed by either. Use at your own risk, with games you own.</p>
+      <p><a class="gh" href="https://github.com/98przem/mist">github.com/98przem/mist</a></p>
+    </div>
+  </footer>
+</body>
+</html>

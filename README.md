@@ -13,14 +13,19 @@
   <a href="../../releases/latest"><img src="https://img.shields.io/badge/download-Mist.dmg-8b5cf6?style=for-the-badge" alt="Download Mist.dmg"></a>
 </p>
 
+<p align="center">
+  <img src="docs/screenshot-library.png" width="820" alt="Mist's game library">
+</p>
+
 ---
 
 Mist is a native macOS launcher that downloads and runs Windows Steam and Epic games through [Wine](https://www.winehq.org/) — **without ever running the Steam client**. You sign in once, and it handles your library, downloads, and achievements directly.
 
 ## Features
 
-- **One login.** A single Steam QR scan covers your whole library, game downloads, *and* achievements. There's no second sign-in, ever.
+- **One login.** A single Steam QR scan (or username/password) covers your whole library, game downloads, achievements, *and* Cloud saves. There's no second sign-in, ever.
 - **Real achievements.** Browse them in-app with global rarity, and unlock them *in-game* — synced to your actual Steam profile. Mist only ever syncs achievements you genuinely earn; it never fabricates them.
+- **Steam Cloud saves.** View your Cloud quota and restore any synced save straight into the right spot in your Wine prefix, one click — Mist speaks Steam's real Cloud protocol, verified against a real Steam client's own traffic.
 - **No Steam client, no fuss.** Mist talks to Steam's APIs directly and downloads with [DepotDownloader](https://github.com/SteamRE/DepotDownloader) — so there's no flaky Chromium-based Steam UI under Wine, no black screens, and no Accessibility permissions to grant.
 - **Self-contained.** Helper tools ship inside the app; the Wine engine (~200 MB) downloads itself on first launch. Nothing to install with Homebrew.
 - **DirectX via Metal.** Runs games through the CrossOver Wine engine, using Apple's **Game Porting Toolkit** (D3DMetal) when available and DXVK/MoltenVK as a fallback.
@@ -58,6 +63,12 @@ Epic games work via [legendary](https://github.com/derrod/legendary) — see the
 Mist reads and writes your real Steam achievements over Steam's client protocol using your one login — no Steam client, no Web API key. When you launch a Steam game, it runs through an open-source Steamworks shim ([gbe_fork](https://github.com/Detanup01/gbe_fork)) that lets the game unlock achievements as you play; on exit, anything you earned syncs to your profile.
 
 > Experimental. The in-game overlay (Shift+Tab) doesn't work under Wine yet — a known gap.
+
+## Cloud Saves
+
+Each game's detail page shows its Steam Cloud quota and how old your local save is versus what's synced — a one-click **Restore from Cloud** downloads every cloud file to its real location in the Wine prefix (resolving Steamworks path placeholders like `%WinAppDataRoaming%` automatically), verified byte-for-byte against Steam's own records.
+
+> Read-only for now. Uploading changed saves *back* to the Cloud isn't supported — Mist's write requests are protocol-correct (verified against a real Steam client's own captured traffic) but Steam's backend issues signed upload URLs that never validate for a non-official client, for reasons that trace below the protocol layer. Restoring works; syncing new progress up doesn't, yet.
 
 ## Compatibility
 
