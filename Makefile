@@ -107,13 +107,13 @@ dmg: bundle
 	# "No space left on device" even with tens of GB genuinely free (confirmed via
 	# df — not a real space issue, a known flaky runner behavior) — retry instead
 	# of chasing free space further.
-	@for i in 1 2 3; do \
+	@for i in 1 2 3 4 5 6; do \
 		if hdiutil create -volname "Mist" -srcfolder dist/dmg -ov -format UDZO dist/Mist.dmg >/dev/null; then \
 			exit 0; \
 		fi; \
-		echo "hdiutil attempt $$i failed, retrying…"; sleep 5; \
+		echo "hdiutil attempt $$i failed, retrying…"; sleep 10; \
 	done; \
-	echo "hdiutil failed after 3 attempts"; exit 1
+	echo "hdiutil failed after 6 attempts"; exit 1
 	rm -rf dist/dmg
 	@echo "DMG ready at dist/Mist.dmg"
 
