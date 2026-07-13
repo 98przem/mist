@@ -970,12 +970,20 @@ final class SteamAuthManager: ObservableObject {
 
     // Steam's QR challenge has its own server-side TTL well under our ~15-minute
     // polling ceiling — the code visibly goes stale (Steam Mobile rejects it with
-    // "failed to load QR info") before pollUntilConfirmed ever times out on its
-    // own. Auto-restarting on expiry (rather than just showing a dead code with
-    // an error) matches how Steam's own QR login UIs behave. Capped so a
-    // persistent failure (network down, etc.) doesn't loop forever silently.
+    // "failed to load QR info") long before that. Worse, PollAuthSessionStatus
+    // doesn't reliably surface that expiry as an error either — a poll against an
+    // expired challenge just quietly keeps returning "still pending" — so relying
+    // on pollUntilConfirmed to *notice* expiry doesn't actually work in practice;
+    // it would only ever time out after the full 900s ceiling, long after the
+    // code was already visibly dead. Instead, race the poll against our own
+    // client-side timer set well under Steam's real TTL, and treat that timer
+    // firing as "expired" ourselves — a proactive refresh instead of a reactive
+    // one. Auto-restarting (rather than just showing a dead code with an error)
+    // matches how Steam's own QR login UIs behave. Capped so a persistent
+    // failure (network down, etc.) doesn't loop forever silently.
     private var autoRestartCount = 0
     private static let maxAutoRestarts = 5
+    private static let qrLifetimeSeconds: UInt64 = 110
 
     func startQRLogin(isAutoRestart: Bool = false) {
         stopPolling()
@@ -990,8 +998,8 @@ final class SteamAuthManager: ObservableObject {
                     self.qrChallengeURL = begin.challengeURL
                     self.qrStatusText = "Scan with the Steam Mobile app"
                 }
-                try await pollUntilConfirmed(clientID: begin.clientID, requestID: begin.requestID,
-                                             interval: begin.interval)
+                try await pollUntilConfirmedOrQRExpiry(clientID: begin.clientID, requestID: begin.requestID,
+                                                       interval: begin.interval)
                 self.autoRestartCount = 0
             } catch is CancellationError {
                 // expected on stopPolling()/view teardown
@@ -1008,6 +1016,21 @@ final class SteamAuthManager: ObservableObject {
                     }
                 }
             }
+        }
+    }
+
+    // Whichever finishes first wins: a real confirmation (pollUntilConfirmed
+    // returns), a real failure (it throws), or our own proactive expiry timer.
+    // Exiting the task group cancels whichever side didn't win.
+    private func pollUntilConfirmedOrQRExpiry(clientID: String, requestID: String, interval: Double) async throws {
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask { try await self.pollUntilConfirmed(clientID: clientID, requestID: requestID, interval: interval) }
+            group.addTask {
+                try await Task.sleep(nanoseconds: Self.qrLifetimeSeconds * 1_000_000_000)
+                throw SteamAuthError(message: "QR code expired. Try again.")
+            }
+            defer { group.cancelAll() }
+            try await group.next()
         }
     }
 
@@ -6451,8 +6474,6 @@ struct PendingCustomAppPick: Identifiable {
 // expression in reasonable time"); as a single struct it type-checks fine.
 struct LibraryMutationModifiers: ViewModifier {
     @Binding var pendingUninstall: Game?
-    @Binding var showingAddCustomApp: Bool
-    @Binding var relocatingCustomAppID: String?
     @Binding var pendingCustomAppPick: (exePath: String, suggestedName: String, relocatingID: String?)?
     var onUninstallSteam: (Game) -> Void
     var onUninstallEpic: (Game) -> Void
@@ -6483,21 +6504,6 @@ struct LibraryMutationModifiers: ViewModifier {
                 Text(pendingUninstall?.source == .custom
                      ? "Mist will forget this app. Its file on disk is never touched."
                      : "This deletes the game's installed files from disk. You can reinstall it later.")
-            }
-            .fileImporter(isPresented: $showingAddCustomApp,
-                          allowedContentTypes: [UTType(filenameExtension: "exe") ?? .item]) { result in
-                guard let url = try? result.get() else { return }
-                let name = url.deletingPathExtension().lastPathComponent
-                pendingCustomAppPick = (exePath: url.path, suggestedName: name, relocatingID: nil)
-            }
-            .fileImporter(isPresented: Binding(
-                get: { relocatingCustomAppID != nil },
-                set: { if !$0 { relocatingCustomAppID = nil } }
-            ), allowedContentTypes: [UTType(filenameExtension: "exe") ?? .item]) { result in
-                guard let url = try? result.get(), let id = relocatingCustomAppID else { return }
-                let name = url.deletingPathExtension().lastPathComponent
-                pendingCustomAppPick = (exePath: url.path, suggestedName: name, relocatingID: id)
-                relocatingCustomAppID = nil
             }
             .sheet(item: Binding(
                 get: { pendingCustomAppPick.map { PendingCustomAppPick($0) } },
@@ -7697,11 +7703,29 @@ struct ContentView: View {
     @State private var gameForLaunchOptions: Game?
     @State private var gameForWorkshopInstall: Game?
     @State private var gameForDetail: Game?
-    @State private var showingAddCustomApp = false
-    @State private var relocatingCustomAppID: String?   // non-nil while a "Locate…" file pick is in flight
     // A file was just picked (either adding new or relocating) — opens the naming
     // confirmation sheet. relocatingID nil = adding a new entry.
     @State private var pendingCustomAppPick: (exePath: String, suggestedName: String, relocatingID: String?)?
+
+    // Drives the Add App/Locate… flow directly via NSOpenPanel instead of
+    // SwiftUI's .fileImporter — with this many .sheet/.fileImporter modifiers
+    // already stacked on this view, .fileImporter(isPresented:) stopped
+    // reliably presenting anything (confirmed live: the isPresented binding
+    // really did flip to true, SwiftUI just never opened the panel). Driving
+    // NSOpenPanel imperatively sidesteps that entirely.
+    private func presentExePicker(relocatingID: String?) {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [UTType(filenameExtension: "exe") ?? .item]
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        NSApp.activate(ignoringOtherApps: true)
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            let name = url.deletingPathExtension().lastPathComponent
+            pendingCustomAppPick = (exePath: url.path, suggestedName: name, relocatingID: relocatingID)
+        }
+    }
     @State private var focusedGameIndex = 0
     @State private var libraryFilter: LibraryFilter = .all
     @State private var gridColumns = 1
@@ -8001,10 +8025,7 @@ struct ContentView: View {
                                 onLaunchOptions: { game in gameForLaunchOptions = game },
                                 onInstallWorkshopItem: { game in gameForWorkshopInstall = game },
                                 onSelect: { game in gameForDetail = game },
-                                onLocate: { game in
-                                    NSApp.activate(ignoringOtherApps: true)
-                                    relocatingCustomAppID = game.id
-                                },
+                                onLocate: { game in presentExePicker(relocatingID: game.id) },
                                 focusedGameID: (gamepad.isConnected && displayedGames.indices.contains(focusedGameIndex))
                                     ? displayedGames[focusedGameIndex].id : nil,
                                 filter: $libraryFilter,
@@ -8013,19 +8034,7 @@ struct ContentView: View {
                                 needsSignIn: sourceNeedsSignIn,
                                 sourceLabel: sourceLabel,
                                 isCustomSource: sidebarSelection == "custom",
-                                onAddCustomApp: {
-                                    // A background/system dialog can leave Mist not
-                                    // "active" from the window server's point of view
-                                    // right when this fires — confirmed via Console:
-                                    // the resulting NSOpenPanel logs "ordered front
-                                    // from a non-active application and may order
-                                    // beneath the active application's windows," which
-                                    // makes the picker look like it silently did
-                                    // nothing (it's just rendering behind Mist's own
-                                    // window). Force activation first so it can't.
-                                    NSApp.activate(ignoringOtherApps: true)
-                                    showingAddCustomApp = true
-                                },
+                                onAddCustomApp: { presentExePicker(relocatingID: nil) },
                                 downloadStates: downloadStates,
                                 onPauseDownload: { id in downloadManager.pause(id: id) },
                                 onResumeDownload: { id in downloadManager.resume(id: id) },
@@ -8107,8 +8116,6 @@ struct ContentView: View {
         // limit ("unable to type-check in reasonable time").
         .modifier(LibraryMutationModifiers(
             pendingUninstall: $pendingUninstall,
-            showingAddCustomApp: $showingAddCustomApp,
-            relocatingCustomAppID: $relocatingCustomAppID,
             pendingCustomAppPick: $pendingCustomAppPick,
             onUninstallSteam: { library.uninstallSteamGame($0) },
             onUninstallEpic: { processManager.epicUninstall(appName: $0.id) },
@@ -8157,10 +8164,7 @@ struct ContentView: View {
                     gameForDetail = nil
                     sidebarSelection = "settings"
                 },
-                onLocate: {
-                    NSApp.activate(ignoringOtherApps: true)
-                    relocatingCustomAppID = game.id
-                },
+                onLocate: { presentExePicker(relocatingID: game.id) },
                 downloadItem: downloadStates[game.id],
                 onPauseDownload: { downloadManager.pause(id: game.id) },
                 onResumeDownload: { downloadManager.resume(id: game.id) },
