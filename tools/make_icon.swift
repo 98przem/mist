@@ -15,15 +15,11 @@ let rect = CGRect(x: inset, y: inset, width: CGFloat(px) - inset*2, height: CGFl
 let radius = rect.width * 0.235
 let path = CGPath(roundedRect: rect, cornerWidth: radius, cornerHeight: radius, transform: nil)
 
-// Outer halo — a real bloom that bleeds past the squircle's edges, visible as a
-// soft blue glow against any Dock background (light or dark), the way the app's
-// own accent color glows behind the sidebar mark and running-state pulse.
-ctx.saveGState()
-ctx.setShadow(offset: .zero, blur: 130, color: NSColor(calibratedRed: 0.49, green: 0.61, blue: 1.0, alpha: 0.7).cgColor)
-ctx.addPath(path)
-ctx.setFillColor(NSColor(calibratedRed: 0.03, green: 0.04, blue: 0.06, alpha: 1).cgColor)
-ctx.fillPath()
-ctx.restoreGState()
+// No outer halo: a shadow-based bleed here would show up everywhere the icon
+// renders (Dock, Finder, Launchpad, Spotlight), not just inside the app — the
+// Foglight glow is an in-app brand detail (sidebar mark, running-state pulse),
+// not something the system icon itself should carry. Flat/contained instead:
+// just the squircle fill below, no blur past its own edges.
 
 // Squircle fill: dark Foglight ground (near the app's own bg/haze tones) — NOT
 // flooded with the bright accent, so it stays moody up close and lets the glow
@@ -69,9 +65,8 @@ if let sym = NSImage(systemSymbolName: "cloud.fog.fill", accessibilityDescriptio
     .withSymbolConfiguration(cfg) {
     let s = sym.size
     let gx = rect.midX - s.width/2, gy = rect.midY - s.height/2
-    // A soft periwinkle glow under the glyph (not a black shadow, which would be
-    // invisible on the dark ground) so the cloud reads as lit from the bloom.
-    ctx.setShadow(offset: .zero, blur: 30, color: NSColor(calibratedRed: 0.55, green: 0.65, blue: 1.0, alpha: 0.6).cgColor)
+    // Flat — no glow behind the glyph either (see the note above the outer-halo
+    // removal). The inner bloom gradient already gives it something to sit on.
     NSColor.white.set()
     let tinted = NSImage(size: s); tinted.lockFocus()
     sym.draw(at: .zero, from: CGRect(origin: .zero, size: s), operation: .sourceOver, fraction: 1)

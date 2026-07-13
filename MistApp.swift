@@ -958,8 +958,18 @@ final class SteamAuthManager: ObservableObject {
         let interval: Double
     }
 
-    func startQRLogin() {
+    // Steam's QR challenge has its own server-side TTL well under our ~15-minute
+    // polling ceiling — the code visibly goes stale (Steam Mobile rejects it with
+    // "failed to load QR info") before pollUntilConfirmed ever times out on its
+    // own. Auto-restarting on expiry (rather than just showing a dead code with
+    // an error) matches how Steam's own QR login UIs behave. Capped so a
+    // persistent failure (network down, etc.) doesn't loop forever silently.
+    private var autoRestartCount = 0
+    private static let maxAutoRestarts = 5
+
+    func startQRLogin(isAutoRestart: Bool = false) {
         stopPolling()
+        if !isAutoRestart { autoRestartCount = 0 }
         errorText = nil
         qrChallengeURL = nil
         qrStatusText = "Generating QR code…"
@@ -972,12 +982,20 @@ final class SteamAuthManager: ObservableObject {
                 }
                 try await pollUntilConfirmed(clientID: begin.clientID, requestID: begin.requestID,
                                              interval: begin.interval)
+                self.autoRestartCount = 0
             } catch is CancellationError {
                 // expected on stopPolling()/view teardown
             } catch {
-                await MainActor.run {
-                    self.errorText = error.localizedDescription
-                    self.qrStatusText = ""
+                let expired = (error as? SteamAuthError)?.message.localizedCaseInsensitiveContains("expired") == true
+                if expired && self.autoRestartCount < Self.maxAutoRestarts {
+                    self.autoRestartCount += 1
+                    await MainActor.run { self.qrStatusText = "Code expired — refreshing…" }
+                    self.startQRLogin(isAutoRestart: true)
+                } else {
+                    await MainActor.run {
+                        self.errorText = error.localizedDescription
+                        self.qrStatusText = ""
+                    }
                 }
             }
         }
@@ -4047,6 +4065,7 @@ enum LibraryFilter: String, CaseIterable, Identifiable {
     case all = "All"
     case installed = "Installed"
     case notInstalled = "Not Installed"
+    case myLibrary = "My Library"
     case shared = "Family Shared"
     var id: String { rawValue }
     var systemImage: String {
@@ -4054,6 +4073,7 @@ enum LibraryFilter: String, CaseIterable, Identifiable {
         case .all: return "square.grid.2x2"
         case .installed: return "arrow.down.circle.fill"
         case .notInstalled: return "icloud"
+        case .myLibrary: return "person.crop.circle"
         case .shared: return "person.2.fill"
         }
     }
@@ -4297,6 +4317,7 @@ struct GameGridView: View {
         switch filter {
         case .installed: return "arrow.down.circle"
         case .shared: return "person.2"
+        case .myLibrary: return "person.crop.circle"
         case .notInstalled: return "checkmark.circle"
         case .all: return "tray"
         }
@@ -4307,6 +4328,7 @@ struct GameGridView: View {
         switch filter {
         case .installed: return "Nothing installed yet"
         case .shared: return "No family-shared games"
+        case .myLibrary: return "No games of your own yet"
         case .notInstalled: return "Everything's installed"
         case .all: return "Quiet in here"
         }
@@ -4321,6 +4343,7 @@ struct GameGridView: View {
         switch filter {
         case .installed: return "Install a game to see it here."
         case .shared: return "Games shared into your Steam Family will appear here."
+        case .myLibrary: return "Everything here is Family Shared — games you actually own will show up in this tab."
         case .notInstalled: return "Nice — your whole library is downloaded."
         case .all: return "Nothing matches that filter — the fog's just empty here, not broken."
         }
@@ -4471,12 +4494,29 @@ struct CommandPaletteView: View {
     @State private var storeResults: [StoreSearchResult] = []
     @State private var isSearchingStore = false
     @State private var searchTask: Task<Void, Never>?
+    @State private var focusedIndex = 0
     @FocusState private var focused: Bool
+
+    private enum Result { case game(Game), store(StoreSearchResult) }
 
     private var libraryMatches: [Game] {
         let q = query.trimmingCharacters(in: .whitespaces)
         guard !q.isEmpty else { return [] }
         return Array(libraryGames.filter { $0.name.localizedCaseInsensitiveContains(q) }.prefix(8))
+    }
+
+    // A single flat list backs keyboard navigation regardless of which section
+    // (library vs. store) a row belongs to — arrow keys just walk this array.
+    private var allResults: [Result] {
+        libraryMatches.map { .game($0) } + storeResults.prefix(8).map { .store($0) }
+    }
+
+    private func activate(_ result: Result) {
+        switch result {
+        case .game(let g): onSelectGame(g)
+        case .store(let s): onSelectStoreResult(s)
+        }
+        dismiss()
     }
 
     var body: some View {
@@ -4488,6 +4528,7 @@ struct CommandPaletteView: View {
                     .font(.system(size: 15))
                     .focused($focused)
                     .onChange(of: query) { _, newValue in
+                        focusedIndex = 0
                         searchTask?.cancel()
                         searchTask = Task {
                             try? await Task.sleep(nanoseconds: 300_000_000)
@@ -4497,7 +4538,7 @@ struct CommandPaletteView: View {
                             await MainActor.run { isSearchingStore = true }
                             let found = (try? await SteamLibraryService.searchStore(query: q)) ?? []
                             guard !Task.isCancelled else { return }
-                            await MainActor.run { storeResults = found; isSearchingStore = false }
+                            await MainActor.run { storeResults = found; isSearchingStore = false; focusedIndex = 0 }
                         }
                     }
                 if isSearchingStore { ProgressView().controlSize(.small) }
@@ -4514,14 +4555,15 @@ struct CommandPaletteView: View {
                     } else {
                         if !libraryMatches.isEmpty {
                             paletteSection("Your Library") {
-                                ForEach(libraryMatches) { game in
-                                    Button { onSelectGame(game); dismiss() } label: {
+                                ForEach(Array(libraryMatches.enumerated()), id: \.element.id) { i, game in
+                                    Button { activate(.game(game)) } label: {
                                         paletteRow(icon: game.source == .steam ? "cloud.fill"
                                                         : (game.source == .epic ? "bolt.fill" : "app.badge.checkmark"),
                                                    tint: game.source == .steam ? Fog.steam
                                                         : (game.source == .epic ? Fog.epic : Fog.custom),
                                                    title: game.name,
-                                                   subtitle: game.isInstalled ? "Installed" : "Not installed")
+                                                   subtitle: game.isInstalled ? "Installed" : "Not installed",
+                                                   isFocused: i == focusedIndex)
                                     }
                                     .buttonStyle(.plain)
                                 }
@@ -4529,10 +4571,11 @@ struct CommandPaletteView: View {
                         }
                         if !storeResults.isEmpty {
                             paletteSection("Steam Store") {
-                                ForEach(storeResults.prefix(8)) { item in
-                                    Button { onSelectStoreResult(item); dismiss() } label: {
+                                ForEach(Array(storeResults.prefix(8).enumerated()), id: \.element.id) { i, item in
+                                    Button { activate(.store(item)) } label: {
                                         paletteRow(icon: "cart.fill", tint: Fog.inkFaint,
-                                                   title: item.name, subtitle: item.priceLabel)
+                                                   title: item.name, subtitle: item.priceLabel,
+                                                   isFocused: libraryMatches.count + i == focusedIndex)
                                     }
                                     .buttonStyle(.plain)
                                 }
@@ -4551,6 +4594,21 @@ struct CommandPaletteView: View {
         .frame(width: 560, height: 420)
         .background(Fog.bg)
         .onAppear { focused = true }
+        .onKeyPress(.downArrow) {
+            guard !allResults.isEmpty else { return .ignored }
+            focusedIndex = min(focusedIndex + 1, allResults.count - 1)
+            return .handled
+        }
+        .onKeyPress(.upArrow) {
+            guard !allResults.isEmpty else { return .ignored }
+            focusedIndex = max(focusedIndex - 1, 0)
+            return .handled
+        }
+        .onKeyPress(.return) {
+            guard allResults.indices.contains(focusedIndex) else { return .ignored }
+            activate(allResults[focusedIndex])
+            return .handled
+        }
     }
 
     @ViewBuilder
@@ -4563,7 +4621,7 @@ struct CommandPaletteView: View {
         }
     }
 
-    private func paletteRow(icon: String, tint: Color, title: String, subtitle: String) -> some View {
+    private func paletteRow(icon: String, tint: Color, title: String, subtitle: String, isFocused: Bool) -> some View {
         HStack(spacing: 10) {
             Image(systemName: icon).foregroundColor(tint).frame(width: 18)
             Text(title).foregroundColor(Fog.ink).lineLimit(1)
@@ -4572,7 +4630,9 @@ struct CommandPaletteView: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
-        .background(Fog.haze, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .background(isFocused ? Fog.accentSoft : Fog.haze, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
+            .strokeBorder(isFocused ? Fog.accent.opacity(0.6) : .clear, lineWidth: 1.5))
     }
 }
 
@@ -7489,6 +7549,7 @@ struct ContentView: View {
         case .all: break
         case .installed: games = games.filter(\.isInstalled)
         case .notInstalled: games = games.filter { !$0.isInstalled }
+        case .myLibrary: games = games.filter { !$0.isFamilyShared }
         case .shared: games = games.filter(\.isFamilyShared)
         }
 
@@ -7540,7 +7601,7 @@ struct ContentView: View {
     private var availableFilters: [LibraryFilter] {
         let hasShared = library.games.contains { $0.isFamilyShared &&
             (sidebarSelection != "epic" && sidebarSelection != "custom") }
-        return LibraryFilter.allCases.filter { $0 != .shared || hasShared }
+        return LibraryFilter.allCases.filter { ($0 != .shared && $0 != .myLibrary) || hasShared }
     }
 
     // The exact order GameGridView renders — computing focus over this (rather
@@ -7635,7 +7696,10 @@ struct ContentView: View {
                                 onLaunchOptions: { game in gameForLaunchOptions = game },
                                 onInstallWorkshopItem: { game in gameForWorkshopInstall = game },
                                 onSelect: { game in gameForDetail = game },
-                                onLocate: { game in relocatingCustomAppID = game.id },
+                                onLocate: { game in
+                                    NSApp.activate(ignoringOtherApps: true)
+                                    relocatingCustomAppID = game.id
+                                },
                                 focusedGameID: (gamepad.isConnected && displayedGames.indices.contains(focusedGameIndex))
                                     ? displayedGames[focusedGameIndex].id : nil,
                                 filter: $libraryFilter,
@@ -7644,7 +7708,19 @@ struct ContentView: View {
                                 needsSignIn: sourceNeedsSignIn,
                                 sourceLabel: sourceLabel,
                                 isCustomSource: sidebarSelection == "custom",
-                                onAddCustomApp: { showingAddCustomApp = true },
+                                onAddCustomApp: {
+                                    // A background/system dialog can leave Mist not
+                                    // "active" from the window server's point of view
+                                    // right when this fires — confirmed via Console:
+                                    // the resulting NSOpenPanel logs "ordered front
+                                    // from a non-active application and may order
+                                    // beneath the active application's windows," which
+                                    // makes the picker look like it silently did
+                                    // nothing (it's just rendering behind Mist's own
+                                    // window). Force activation first so it can't.
+                                    NSApp.activate(ignoringOtherApps: true)
+                                    showingAddCustomApp = true
+                                },
                                 downloadStates: downloadStates,
                                 onPauseDownload: { id in downloadManager.pause(id: id) },
                                 onResumeDownload: { id in downloadManager.resume(id: id) },
@@ -7776,7 +7852,10 @@ struct ContentView: View {
                     gameForDetail = nil
                     sidebarSelection = "settings"
                 },
-                onLocate: { relocatingCustomAppID = game.id },
+                onLocate: {
+                    NSApp.activate(ignoringOtherApps: true)
+                    relocatingCustomAppID = game.id
+                },
                 downloadItem: downloadStates[game.id],
                 onPauseDownload: { downloadManager.pause(id: game.id) },
                 onResumeDownload: { downloadManager.resume(id: game.id) },
